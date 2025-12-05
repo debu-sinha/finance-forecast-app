@@ -241,10 +241,29 @@ export const trainBatchOnBackend = async (
             // Find best model from response
             const bestModel = backendResponse.models?.find((m: any) => m.is_best) || backendResponse.models?.[0];
 
+            // Transform backend response to ForecastResult format for comparison
+            const forecastResult: any = {
+                history: [],
+                results: backendResponse.models?.map((m: any) => ({
+                    modelType: m.model_type,
+                    modelName: m.model_name,
+                    isBest: m.is_best,
+                    metrics: m.metrics,
+                    hyperparameters: m.hyperparameters || {},
+                    validation: m.validation || [],
+                    forecast: m.forecast || [],
+                    experimentUrl: m.experiment_url,
+                    runUrl: m.run_url
+                })) || [],
+                explanation: '',
+                pythonCode: ''
+            };
+
             results.push({
                 segmentId,
                 filters: req.filters,
                 status: 'success',
+                result: forecastResult,  // Store full forecast result for comparison
                 bestModel: bestModel?.model_name || backendResponse.best_model,
                 metrics: bestModel ? {
                     mape: bestModel.metrics.mape,
@@ -252,7 +271,8 @@ export const trainBatchOnBackend = async (
                     r2: bestModel.metrics.r2,
                     cv_mape: bestModel.metrics.cv_mape
                 } : undefined,
-                runId: bestModel?.run_id
+                runId: bestModel?.run_id,
+                experimentUrl: bestModel?.experiment_url  // Store experiment URL for linking
             });
             successful++;
 

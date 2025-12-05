@@ -181,7 +181,8 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
         const segmentActuals = actualsMap.get(segmentKey);
 
         if (!segmentActuals || segmentActuals.size === 0) {
-          // No actuals for this segment
+          // No actuals for this segment - still include with training metrics
+          console.log(`No actuals found for segment: ${segmentKey}`);
           return;
         }
 
@@ -189,6 +190,9 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
         const forecastMAPE = result.metrics?.mape || '0';
         const bestModelResult = result.result?.results?.find(r => r.isBest);
         const forecastData = bestModelResult?.forecast || [];
+
+        // Debug logging
+        console.log(`Segment ${segmentKey}: has result=${!!result.result}, results count=${result.result?.results?.length || 0}, forecast count=${forecastData.length}`);
 
         // Build forecast map: date -> predicted value
         const forecastMap = new Map<string, number>();

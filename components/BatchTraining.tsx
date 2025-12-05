@@ -474,6 +474,17 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
                     <span className="text-blue-600 ml-2">
                       — All {trainingSummary.totalSegments} segments are grouped in a single MLflow experiment for easy tracking
                     </span>
+                    {/* Show link to first successful result's experiment */}
+                    {trainingSummary.results.find(r => r.experimentUrl) && (
+                      <a
+                        href={trainingSummary.results.find(r => r.experimentUrl)?.experimentUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-3 text-blue-700 underline hover:text-blue-900"
+                      >
+                        View in MLflow
+                      </a>
+                    )}
                   </div>
                 )}
 
@@ -568,6 +579,7 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
                           <th className="px-3 py-2 text-right font-semibold text-gray-600">MAPE</th>
                           <th className="px-3 py-2 text-right font-semibold text-gray-600">RMSE</th>
                           <th className="px-3 py-2 text-right font-semibold text-gray-600">CV MAPE</th>
+                          <th className="px-3 py-2 text-center font-semibold text-gray-600">MLflow</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100">
@@ -603,6 +615,19 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
                               </td>
                               <td className="px-3 py-2 text-right text-gray-600">
                                 {result.metrics?.cv_mape ? `${result.metrics.cv_mape}%` : '-'}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {result.experimentUrl ? (
+                                  <a
+                                    href={result.experimentUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-blue-600 hover:text-blue-800 underline"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    View
+                                  </a>
+                                ) : '-'}
                               </td>
                             </tr>
                           );

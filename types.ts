@@ -142,6 +142,7 @@ export interface BatchTrainingResult {
     cv_mape?: string;
   };
   runId?: string;
+  experimentUrl?: string;               // MLflow experiment URL for tracking
   error?: string;
 }
 
