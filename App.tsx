@@ -306,6 +306,8 @@ const App = () => {
   const [trainingProgress, setTrainingProgress] = useState<number>(0);
   const [tuningLogs, setTuningLogs] = useState<TuningLog[]>([]);
   const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [trainingError, setTrainingError] = useState<string | null>(null);
+  const [validationErrors, setValidationErrors] = useState<string[]>([]);
 
   // Model Training Progress State
   interface ModelTrainingProgress {
@@ -1290,8 +1292,72 @@ const App = () => {
     setStep(AppStep.CONFIG);
   };
 
+  // Validate data before training
+  const validateTrainingData = (): string[] => {
+    const errors: string[] = [];
+
+    // Check if models are selected
+    if (selectedModels.length === 0) {
+      errors.push('Please select at least one model to train.');
+    }
+
+    // Check if time column is selected
+    if (!timeCol) {
+      errors.push('Please select a time column.');
+    }
+
+    // Check if target column is selected
+    if (!targetCol) {
+      errors.push('Please select a target column.');
+    }
+
+    // Check if we have data
+    if (aggregatedData.length === 0) {
+      errors.push('No data available. Please upload a CSV file first.');
+    }
+
+    // Check minimum data points (at least 2x horizon for proper validation)
+    if (aggregatedData.length > 0 && aggregatedData.length < horizon * 2) {
+      errors.push(`Insufficient data: ${aggregatedData.length} rows available, but at least ${horizon * 2} rows recommended for ${horizon}-period forecast.`);
+    }
+
+    // Check for missing values in target column
+    if (targetCol && aggregatedData.length > 0) {
+      const missingTargetCount = aggregatedData.filter(row =>
+        row[targetCol] === null || row[targetCol] === undefined || row[targetCol] === ''
+      ).length;
+      if (missingTargetCount > 0) {
+        errors.push(`Target column "${targetCol}" has ${missingTargetCount} missing values.`);
+      }
+    }
+
+    // Check for valid date values
+    if (timeCol && aggregatedData.length > 0) {
+      const invalidDateCount = aggregatedData.filter(row => {
+        const dateVal = row[timeCol];
+        if (!dateVal) return true;
+        const d = new Date(String(dateVal));
+        return isNaN(d.getTime());
+      }).length;
+      if (invalidDateCount > 0) {
+        errors.push(`Time column "${timeCol}" has ${invalidDateCount} invalid date values.`);
+      }
+    }
+
+    return errors;
+  };
+
   const handleTrainModel = async () => {
-    if (selectedModels.length === 0) return;
+    // Clear previous errors
+    setTrainingError(null);
+    setValidationErrors([]);
+
+    // Validate before training
+    const errors = validateTrainingData();
+    if (errors.length > 0) {
+      setValidationErrors(errors);
+      return;
+    }
 
     setStep(AppStep.TRAINING);
     setIsTraining(true);
@@ -1528,7 +1594,17 @@ const App = () => {
       }, 500);
 
     } catch (error: any) {
-      alert("Training Failed: " + error.message);
+      // Set detailed error message for display
+      let errorMessage = error.message || 'Training failed due to an unknown error.';
+
+      // Add helpful context for common errors
+      if (errorMessage.includes('timeout') || errorMessage.includes('504') || errorMessage.includes('502')) {
+        errorMessage = 'Training timed out. Try reducing the number of models or data size, or increase server timeout settings.';
+      } else if (errorMessage.includes('CORS') || errorMessage.includes('network')) {
+        errorMessage = 'Network error. Please check your connection and ensure the backend server is running.';
+      }
+
+      setTrainingError(errorMessage);
       setIsTraining(false);
       setStep(AppStep.CONFIG);
     }
@@ -1623,13 +1699,28 @@ const App = () => {
 
           {step === AppStep.CONFIG && (
             <div className="flex items-center space-x-2">
-              <button
-                onClick={() => setShowBatchTraining(true)}
-                className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-1.5 rounded text-sm font-medium flex items-center transition-colors"
-              >
-                <Layers className="w-4 h-4 mr-2" />
-                Batch Training
-              </button>
+              <div className="relative group">
+                <button
+                  onClick={() => setShowBatchTraining(true)}
+                  className={`px-4 py-1.5 rounded text-sm font-medium flex items-center transition-colors ${
+                    groupCols.length > 0
+                      ? 'bg-purple-600 hover:bg-purple-700 text-white ring-2 ring-purple-300 ring-offset-1'
+                      : 'bg-purple-600 hover:bg-purple-700 text-white'
+                  }`}
+                >
+                  <Layers className="w-4 h-4 mr-2" />
+                  Batch Training
+                  {groupCols.length > 0 && (
+                    <span className="ml-2 bg-purple-400 text-white text-[10px] px-1.5 py-0.5 rounded-full">
+                      Recommended
+                    </span>
+                  )}
+                </button>
+                <div className="absolute top-full left-0 mt-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-50 shadow-lg">
+                  Train separate models for each segment (region, product, etc.)
+                  <div className="absolute bottom-full left-4 border-4 border-transparent border-b-gray-900"></div>
+                </div>
+              </div>
               <button
                 onClick={handleTrainModel}
                 className="bg-[#1b57b1] hover:bg-[#164fa0] text-white px-4 py-1.5 rounded text-sm font-medium flex items-center transition-colors"
@@ -1760,6 +1851,50 @@ from prophet import Prophet
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
               >
+                {/* Validation Errors Display */}
+                {validationErrors.length > 0 && (
+                  <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                    <div className="flex items-start space-x-3">
+                      <AlertTriangle className="w-5 h-5 text-yellow-600 flex-shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <h4 className="text-sm font-semibold text-yellow-800 mb-2">Please fix the following issues before training:</h4>
+                        <ul className="text-sm text-yellow-700 space-y-1">
+                          {validationErrors.map((error, idx) => (
+                            <li key={idx} className="flex items-start">
+                              <span className="mr-2">-</span>
+                              <span>{error}</span>
+                            </li>
+                          ))}
+                        </ul>
+                        <button
+                          onClick={() => setValidationErrors([])}
+                          className="mt-3 text-xs text-yellow-600 hover:text-yellow-800 underline"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Training Error Display */}
+                {trainingError && (
+                  <div className="mb-4 bg-red-50 border border-red-200 rounded-lg p-4">
+                    <div className="flex items-start space-x-3">
+                      <XCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <h4 className="text-sm font-semibold text-red-800 mb-1">Training Failed</h4>
+                        <p className="text-sm text-red-700">{trainingError}</p>
+                        <button
+                          onClick={() => setTrainingError(null)}
+                          className="mt-3 text-xs text-red-600 hover:text-red-800 underline"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                   <div className="lg:col-span-4 space-y-5">
                     {/* Basic Selectors */}
@@ -2176,6 +2311,44 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         </div>
                       )}
                     </div>
+
+                    {/* Preprocessing Applied Section */}
+                    {covariates.length > 0 && (
+                      <div className="mt-4 pt-4 border-t border-gray-200">
+                        <div className="flex items-center space-x-2 mb-2">
+                          <BrainCircuit className="w-4 h-4 text-blue-600" />
+                          <span className="text-xs font-semibold text-gray-700">Automatic Preprocessing Applied</span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+                          <div className="bg-blue-50 p-2 rounded border border-blue-100">
+                            <div className="text-blue-600 font-semibold">YoY Lag Features</div>
+                            <div className="text-gray-600">
+                              {frequency === 'daily' ? 'lag_364, lag_365' : frequency === 'weekly' ? 'lag_52' : 'lag_12'}
+                              <span className="text-gray-400 ml-1">(same-period-last-year)</span>
+                            </div>
+                          </div>
+                          {covariates.some(c => c.toLowerCase().includes('promo') || c.toLowerCase().includes('holiday') || c.toLowerCase().includes('event')) && (
+                            <div className="bg-purple-50 p-2 rounded border border-purple-100">
+                              <div className="text-purple-600 font-semibold">Promo-Derived Features</div>
+                              <div className="text-gray-600">
+                                promo_window, any_promo_active
+                                <span className="text-gray-400 ml-1">(enhanced promo effects)</span>
+                              </div>
+                            </div>
+                          )}
+                          <div className="bg-green-50 p-2 rounded border border-green-100">
+                            <div className="text-green-600 font-semibold">Calendar Features</div>
+                            <div className="text-gray-600">
+                              day_of_week, is_weekend, is_month_end
+                              <span className="text-gray-400 ml-1">(pattern detection)</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="mt-2 text-[10px] text-gray-500 italic">
+                          Preprocessing logged to MLflow for 100% reproducibility
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Model Comparison Summary - Always Show */}
@@ -2963,24 +3136,64 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                     )}
                   </div>
 
-                  {/* Evaluation Grid */}
+                  {/* Evaluation Grid with Tooltips */}
                   <div className="grid grid-cols-3 gap-4">
-                    <div className="p-4 bg-white border rounded text-center">
-                      <div className="text-xs text-gray-500 uppercase">RMSE</div>
+                    <div className="p-4 bg-white border rounded text-center relative group cursor-help">
+                      <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
+                        RMSE
+                        <Info className="w-3 h-3 ml-1 text-gray-400" />
+                      </div>
                       <div className="text-xl font-bold text-gray-800">{activeResult.metrics.rmse}</div>
+                      <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
+                        <strong>Root Mean Square Error</strong><br/>
+                        Measures average prediction error in the same units as your target. Lower is better. Compare to the scale of your data.
+                        <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
+                      </div>
                     </div>
-                    <div className="p-4 bg-white border rounded text-center">
-                      <div className="text-xs text-gray-500 uppercase">Validation MAPE</div>
-                      <div className="text-xl font-bold text-gray-800">{activeResult.metrics.mape}%</div>
+                    <div className="p-4 bg-white border rounded text-center relative group cursor-help">
+                      <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
+                        Validation MAPE
+                        <Info className="w-3 h-3 ml-1 text-gray-400" />
+                      </div>
+                      <div className={`text-xl font-bold ${
+                        parseFloat(activeResult.metrics.mape) <= 5 ? 'text-green-600' :
+                        parseFloat(activeResult.metrics.mape) <= 10 ? 'text-blue-600' :
+                        parseFloat(activeResult.metrics.mape) <= 15 ? 'text-yellow-600' :
+                        parseFloat(activeResult.metrics.mape) <= 25 ? 'text-orange-600' : 'text-red-600'
+                      }`}>{activeResult.metrics.mape}%</div>
                       {activeResult.metrics.cv_mape && (
                         <div className="text-xs text-gray-500 mt-1">
-                          CV: {activeResult.metrics.cv_mape}% (±{activeResult.metrics.cv_mape_std || '0'}%)
+                          CV: {activeResult.metrics.cv_mape}% (+/-{activeResult.metrics.cv_mape_std || '0'}%)
                         </div>
                       )}
+                      <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
+                        <strong>Mean Absolute Percentage Error</strong><br/>
+                        Average % error. Finance thresholds:<br/>
+                        - Excellent: 5% or less<br/>
+                        - Good: 5-10%<br/>
+                        - Acceptable: 10-15%<br/>
+                        - Needs Review: 15-25%
+                        <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
+                      </div>
                     </div>
-                    <div className="p-4 bg-white border rounded text-center">
-                      <div className="text-xs text-gray-500 uppercase">R2 Score</div>
-                      <div className="text-xl font-bold text-gray-800">{activeResult.metrics.r2}</div>
+                    <div className="p-4 bg-white border rounded text-center relative group cursor-help">
+                      <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
+                        R2 Score
+                        <Info className="w-3 h-3 ml-1 text-gray-400" />
+                      </div>
+                      <div className={`text-xl font-bold ${
+                        parseFloat(activeResult.metrics.r2) >= 0.9 ? 'text-green-600' :
+                        parseFloat(activeResult.metrics.r2) >= 0.7 ? 'text-blue-600' :
+                        parseFloat(activeResult.metrics.r2) >= 0.5 ? 'text-yellow-600' : 'text-red-600'
+                      }`}>{activeResult.metrics.r2}</div>
+                      <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
+                        <strong>Coefficient of Determination</strong><br/>
+                        Proportion of variance explained by the model. Range 0-1, higher is better.<br/>
+                        - 0.9+: Excellent fit<br/>
+                        - 0.7-0.9: Good fit<br/>
+                        - 0.5-0.7: Moderate fit
+                        <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
+                      </div>
                     </div>
                   </div>
 
