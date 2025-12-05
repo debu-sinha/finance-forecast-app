@@ -1476,29 +1476,31 @@ const App = () => {
 
       console.log('📦 Backend Response:', backendResponse);
 
-      // Backend now returns multiple model results
-      const modelResults: ModelRunResult[] = backendResponse.models.map((m: any) => {
-        console.log('Processing model:', m.model_name, 'isBest:', m.is_best, 'experimentUrl:', m.experiment_url);
-        return {
-          modelType: m.model_type,
-          modelName: m.model_name,
-          isBest: m.is_best,
-          metrics: {
-            rmse: m.metrics.rmse,
-            mape: m.metrics.mape,
-            r2: m.metrics.r2
-          },
-          hyperparameters: {
-            seasonality: seasonalityMode,
-            mlflow_run_id: m.run_id,
-            regressor_method: regressorMethod
-          },
-          validation: m.validation || [],
-          forecast: m.forecast || [],
-          experimentUrl: m.experiment_url,
-          runUrl: m.run_url
-        };
-      });
+      // Backend now returns multiple model results - filter out failed ones for display
+      const modelResults: ModelRunResult[] = backendResponse.models
+        .filter((m: any) => !m.error && m.metrics.mape !== 'N/A')  // Only successful models
+        .map((m: any) => {
+          console.log('Processing model:', m.model_name, 'isBest:', m.is_best, 'experimentUrl:', m.experiment_url);
+          return {
+            modelType: m.model_type,
+            modelName: m.model_name,
+            isBest: m.is_best,
+            metrics: {
+              rmse: m.metrics.rmse,
+              mape: m.metrics.mape,
+              r2: m.metrics.r2
+            },
+            hyperparameters: {
+              seasonality: seasonalityMode,
+              mlflow_run_id: m.run_id,
+              regressor_method: regressorMethod
+            },
+            validation: m.validation || [],
+            forecast: m.forecast || [],
+            experimentUrl: m.experiment_url,
+            runUrl: m.run_url
+          };
+        });
 
       // Update model progress with completed status and metrics
       setModelProgress(prev => prev.map(mp => {
@@ -1523,6 +1525,15 @@ const App = () => {
       }));
 
       console.log('Processed models:', modelResults.length, 'Best:', modelResults.find(m => m.isBest)?.modelName);
+
+      // Check if any models succeeded
+      if (modelResults.length === 0) {
+        const failedModels = backendResponse.models
+          .filter((m: any) => m.error || m.metrics.mape === 'N/A')
+          .map((m: any) => `${m.model_type}: ${m.error || 'Unknown error'}`)
+          .join('\n');
+        throw new Error(`All models failed to train:\n${failedModels}`);
+      }
 
       const aiResult = await generateForecastInsights(
         analysis?.summary || '',
