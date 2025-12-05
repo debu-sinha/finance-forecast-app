@@ -678,17 +678,21 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         try: model.add_country_holidays(country_name=country)
         except: pass
         
+        # Track which regressors are actually added to ensure consistency between train and test
+        added_regressors = []
         for cov in covariates:
-            if cov in train_df.columns:
-                # Only add regressor if it has non-NaN values
-                if train_df[cov].notna().any():
+            if cov in train_df.columns and cov in test_df.columns:
+                # Only add regressor if it has non-NaN values in BOTH train and test
+                if train_df[cov].notna().any() and test_df[cov].notna().any():
                     model.add_regressor(cov)
+                    added_regressors.append(cov)
                 else:
-                    logger.warning(f"Skipping regressor '{cov}' - all values are NaN in training data")
+                    logger.warning(f"Skipping regressor '{cov}' - has NaN values in train or test data")
 
         model.fit(train_df)
-        
-        test_future = test_df[['ds'] + [c for c in covariates if c in test_df.columns]].copy()
+
+        # Use only the regressors that were actually added to the model
+        test_future = test_df[['ds'] + added_regressors].copy()
         metrics = compute_metrics(test_df['y'].values, model.predict(test_future)['yhat'].values)
         
         for k, v in metrics.items(): client.log_metric(run_id, k, v)
@@ -1048,12 +1052,22 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                           daily_seasonality=False, changepoint_prior_scale=best_params['changepoint_prior_scale'], seasonality_prior_scale=best_params['seasonality_prior_scale'])
     try: final_model.add_country_holidays(country_name=country)
     except: pass
+
+    # Only add regressors that have valid (non-NaN) values in history
+    final_regressors = []
     for cov in covariates:
-        if cov in history_df.columns: final_model.add_regressor(cov)
+        if cov in history_df.columns:
+            if history_df[cov].notna().any():
+                final_model.add_regressor(cov)
+                final_regressors.append(cov)
+            else:
+                logger.warning(f"Final model: Skipping regressor '{cov}' - all NaN in history")
+    logger.info(f"Final model using {len(final_regressors)} regressors: {final_regressors}")
     final_model.fit(history_df)
-    
+
     # Pass FULL df (including future covariates) to create_future_dataframe
-    future = create_future_dataframe(final_model, horizon, freq_code, covariates, df, regressor_method)
+    # Use final_regressors (not covariates) to ensure consistency with model
+    future = create_future_dataframe(final_model, horizon, freq_code, final_regressors, df, regressor_method)
     
     # 4. Log the future dataframe used for prediction to the parent run
     # Note: We log to the parent_run_id since the nested run has ended
