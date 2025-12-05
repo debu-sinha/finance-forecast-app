@@ -684,8 +684,13 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         except: pass
         
         for cov in covariates:
-            if cov in train_df.columns: model.add_regressor(cov)
-        
+            if cov in train_df.columns:
+                # Only add regressor if it has non-NaN values
+                if train_df[cov].notna().any():
+                    model.add_regressor(cov)
+                else:
+                    logger.warning(f"Skipping regressor '{cov}' - all values are NaN in training data")
+
         model.fit(train_df)
         
         test_future = test_df[['ds'] + [c for c in covariates if c in test_df.columns]].copy()
@@ -807,7 +812,25 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     
     if test_size is None: test_size = min(horizon, len(history_df) // 5)
     train_df, test_df = history_df.iloc[:-test_size].copy(), history_df.iloc[-test_size:].copy()
-    
+
+    # Filter out covariates that have all NaN values in training data
+    # This can happen with YoY lag features when there's < 1 year of data
+    valid_covariates = []
+    dropped_covariates = []
+    for cov in covariates:
+        if cov in train_df.columns:
+            if train_df[cov].notna().any():
+                valid_covariates.append(cov)
+            else:
+                dropped_covariates.append(cov)
+        else:
+            dropped_covariates.append(cov)
+
+    if dropped_covariates:
+        logger.warning(f"Dropped {len(dropped_covariates)} covariates with all-NaN values in training data: {dropped_covariates}")
+    covariates = valid_covariates
+    logger.info(f"Using {len(covariates)} valid covariates for Prophet: {covariates}")
+
     param_grid = {
         'changepoint_prior_scale': [0.001, 0.05, 0.5],
         'seasonality_prior_scale': [0.01, 1.0, 10.0],
