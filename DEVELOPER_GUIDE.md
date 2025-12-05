@@ -488,163 +488,153 @@ ensemble_forecast = np.mean(predictions, axis=0)
 
 ## Preprocessing & Feature Engineering
 
-### Automatic Feature Enhancement
+### Design Philosophy
 
-The platform includes a preprocessing module (`backend/preprocessing.py`) that automatically enhances your data with derived features. This is applied to models that support covariates (Prophet, SARIMAX, XGBoost) but **not** to univariate models (ARIMA, ETS).
+The preprocessing module (`backend/preprocessing.py`) adds **generic features** that improve forecasting for all algorithms. It follows these principles:
 
-### Why Preprocessing Matters for Holidays
+1. **User's promo columns are preserved as-is** - Binary indicators are already well-structured
+2. **Only universally useful features are added** - Calendar, trend, and conditional YoY lags
+3. **No redundant derived features** - Models learn directly from user's holiday indicators
+4. **Conditional features based on data availability** - YoY lags only added if 1+ year of data
 
-**The Problem:**
-Users reported that models were under-predicting on Thanksgiving and holiday weekends. The root cause was that:
-1. The best predictor for Thanksgiving 2024 is Thanksgiving 2023 - but models had no access to same-period-last-year values
-2. Promo files marked individual days (e.g., Black Friday), but the elevated sales effect extends ±2 days
-3. Holiday weekends behave differently from regular weekends, but models couldn't distinguish them
+### Features Added
 
-**The Solution:**
-The preprocessing module automatically derives features that address these gaps.
+#### Calendar Features (Always Added)
 
-### Features Automatically Added
+| Feature | Description |
+|---------|-------------|
+| `day_of_week` | 0=Monday, 6=Sunday |
+| `is_weekend` | 1 if Saturday/Sunday |
+| `month` | 1-12 |
+| `quarter` | 1-4 |
+| `day_of_month` | 1-31 |
+| `week_of_year` | 1-52 |
 
-#### Year-over-Year Lag Features (Critical for Holidays)
+#### Trend Features (Always Added)
 
-| Feature | Calculation | Purpose |
-|---------|-------------|---------|
-| `lag_364` | `target.shift(364)` | Same day 52 weeks ago |
-| `lag_365` | `target.shift(365)` | Handles leap year edge cases |
-| `lag_364_rolling_avg` | Rolling mean around YoY lag | Smooths date misalignment |
-| `yoy_ratio` | `target / lag_364` | Captures year-over-year growth |
+| Feature | Description |
+|---------|-------------|
+| `time_index` | Sequential index (0, 1, 2, ...) |
+| `year` | Year from date |
 
-**Why 364 and not 365?**
-- 364 days = exactly 52 weeks, so same day-of-week alignment
-- 365 days = different day of week (e.g., Monday → Tuesday)
-- Both are included to handle edge cases
+#### YoY Lag Features (Conditional)
 
-#### Promo-Derived Features
+Only added if sufficient historical data exists:
 
-| Feature | Calculation | Purpose |
-|---------|-------------|---------|
-| `any_promo_active` | `max(all_promo_columns)` | Simplified "any special day" indicator |
-| `promo_count` | `sum(all_promo_columns)` | Handles overlapping events |
-| `promo_window` | Rolling max ±2 days | Extends promo effect to surrounding days |
-| `days_to_promo` | Distance to next promo | Anticipation effect |
-| `days_since_promo` | Distance from last promo | Post-event hangover |
-| `near_promo` | Within 3 days of any promo | Proximity indicator |
-
-#### Weekend Distinction Features
-
-| Feature | Calculation | Purpose |
-|---------|-------------|---------|
-| `is_promo_weekend` | Weekend AND near a promo | Holiday weekend indicator |
-| `is_regular_weekend` | Weekend AND NOT near a promo | Normal weekend indicator |
-
-#### Enhanced Calendar Features
-
-| Feature | Purpose |
-|---------|---------|
-| `is_month_start` | Beginning of month patterns |
-| `is_month_end` | End of month patterns (important for finance) |
-| `is_quarter_start` | Quarterly patterns |
-| `is_quarter_end` | Quarter-end reporting effects |
-| `week_of_month` | 1st week vs 4th week differences |
+| Frequency | Min Rows | Features Added |
+|-----------|----------|----------------|
+| Daily | 400+ | `lag_364`, `lag_364_avg` |
+| Weekly | 60+ | `lag_52`, `lag_52_avg` |
+| Monthly | 15+ | `lag_12`, `lag_12_avg` |
 
 ### How It's Applied Per Model
 
 #### Prophet
 ```python
 # In train_service.py
-df = enhance_features_for_forecasting(df, date_col='ds', target_col='y', promo_cols=covariates, frequency=frequency)
+df = enhance_features_for_forecasting(df, date_col='ds', target_col='y',
+                                       promo_cols=covariates, frequency=frequency)
 
-# Derived features are added as regressors
+# Calendar + trend + YoY features added as regressors (if they have valid values)
 for col in derived_cols:
-    model.add_regressor(col)
+    if train_df[col].notna().any():
+        model.add_regressor(col)
 ```
 
 #### XGBoost
 ```python
 # In models_training.py - create_xgboost_features()
-# YoY lag features added directly
-df['lag_364'] = df[target_col].shift(364)
-df['lag_365'] = df[target_col].shift(365)
+# Calendar features
+df['day_of_week'] = df['ds'].dt.dayofweek
+df['is_weekend'] = (df['ds'].dt.dayofweek >= 5).astype(int)
+df['month'] = df['ds'].dt.month
 
-# Promo-derived features
-df['any_promo_active'] = df[promo_cols].max(axis=1)
-df['promo_window'] = df['any_promo_active'].rolling(window=5, center=True).max()
+# Short-term lags (XGBoost-specific, not in preprocessing.py)
+df['lag_1'] = df[target_col].shift(1)
+df['lag_7'] = df[target_col].shift(7)
+df['rolling_mean_7'] = df[target_col].rolling(window=7).mean()
+
+# YoY lags (same as preprocessing)
+df['lag_364'] = df[target_col].shift(364)
 ```
 
 #### SARIMAX
 ```python
 # In models_training.py - train_sarimax_model()
-# Promo-derived features added as exogenous variables
-df['any_promo_active'] = df[promo_cols].max(axis=1)
-df['promo_window'] = df['any_promo_active'].rolling(window=5, center=True).max()
-df['is_promo_weekend'] = ((df['is_weekend'] == 1) & (df['promo_window'] == 1)).astype(int)
+# Uses user covariates directly + auto-adds country holidays
+country_holidays = holidays.country_holidays(country)
+train_df['is_holiday'] = train_df['ds'].apply(lambda x: 1 if x in country_holidays else 0)
 ```
+
+### User Promo Columns
+
+Your binary holiday indicators are used directly without modification:
+
+```csv
+date,Black Friday,Christmas,Valentine's Day,Easter
+2024-11-29,1,0,0,0
+2024-11-30,1,0,0,0
+2024-12-25,0,1,0,0
+```
+
+Each column becomes a separate regressor - models learn distinct coefficients for each holiday's effect.
 
 ### Customizing Preprocessing
 
-To modify the preprocessing behavior, edit `backend/preprocessing.py`:
+Edit `backend/preprocessing.py` to modify behavior:
 
 ```python
-# Change the promo window size (default: ±2 days = 5 total)
-window_size = 5  # Change to 3 for ±1 day, or 7 for ±3 days
-
-# Change the YoY lag for different frequencies
-yoy_lag_map = {
-    'daily': 364,   # Same day last year
-    'weekly': 52,   # Same week last year
-    'monthly': 12,  # Same month last year
+# Change minimum data requirements for YoY lags
+lag_config = {
+    'daily': {'lag': 364, 'min_rows': 400},   # Increase to 500 for stricter requirement
+    'weekly': {'lag': 52, 'min_rows': 60},
+    'monthly': {'lag': 12, 'min_rows': 15},
 }
 
-# Disable specific features
-# Comment out lines in enhance_features_for_forecasting()
+# Add additional calendar features
+df['is_month_end'] = dates.dt.is_month_end.astype(int)
+df['is_quarter_end'] = dates.dt.is_quarter_end.astype(int)
 ```
 
 ### Reproducibility
 
-All preprocessing code is logged to MLflow for complete reproducibility:
+All preprocessing code is logged to MLflow:
 
-1. **Inline in training code**: `reproducibility/training_code.py` includes the preprocessing functions directly
-2. **Full module**: `reproducibility/preprocessing.py` contains the complete source
+1. **Inline in training code**: `reproducibility/training_code.py`
+2. **Full module**: `reproducibility/preprocessing.py`
 
-To reproduce a training run:
 ```python
 import mlflow
 
-# Download the preprocessing code
+# Download and reproduce
 preprocessing_path = mlflow.artifacts.download_artifacts(
     run_id="your_run_id",
     artifact_path="reproducibility/preprocessing.py"
 )
-
-# Use it
 exec(open(preprocessing_path).read())
 df = enhance_features_for_forecasting(your_data, ...)
 ```
 
-### Troubleshooting Preprocessing
+### Troubleshooting
 
-#### Feature not appearing in model?
-Check that the column is numeric and has non-null values:
+#### YoY lag features not appearing?
+Check if you have enough data:
 ```python
-# Only numeric columns with values are added
-if df[col].dtype in ['int64', 'float64'] and df[col].notna().any():
+# Daily data needs 400+ rows for lag_364
+if len(df) < 400:
+    print("Insufficient data for YoY lags - they will be skipped")
+```
+
+#### Feature has all NaN values?
+The system automatically filters out features with all-NaN values before training:
+```python
+# Only features with valid values are used
+if train_df[col].notna().any():
     covariates.append(col)
 ```
 
-#### Too many features?
-If you have many promo columns and the derived features are causing issues:
-```python
-# Limit which promo columns are used for derived features
-promo_cols_for_derivation = ['Black_Friday', 'Thanksgiving', 'Christmas']  # Subset
-```
-
-#### YoY lag is all NaN?
-This happens if you have less than 1 year of data:
-```python
-# Check data length
-if len(df) < 365:
-    logger.warning("Less than 1 year of data - YoY features will be mostly NaN")
-```
+#### Model fails with "all values are NaN"?
+This typically means a covariate column exists but has no valid values in the training split. The preprocessing now automatically skips these columns and logs a warning.
 
 ---
 
@@ -1604,17 +1594,19 @@ class NeuralProphetWrapper(mlflow.pyfunc.PythonModel):
 
 | Feature | Files Changed | Description |
 |---------|---------------|-------------|
-| **Automatic Preprocessing** | `preprocessing.py`, `train_service.py`, `models_training.py` | YoY lag features and promo-derived features for holiday forecasting |
-| **YoY Lag Features** | `preprocessing.py`, `models_training.py` | `lag_364`, `lag_365` for same-period-last-year patterns |
-| **Promo Window Features** | `preprocessing.py`, `models_training.py` | `promo_window`, `is_promo_weekend` for extended holiday effects |
+| **Simplified Preprocessing** | `preprocessing.py`, `train_service.py`, `models_training.py` | Generic calendar + trend features, conditional YoY lags |
+| **Consistent Preprocessing** | `preprocessing.py`, `models_training.py` | All models use same preprocessing approach, no duplicates |
+| **Conditional YoY Lags** | `preprocessing.py` | Only added when 1+ year of data exists |
+| **User Covariates Preserved** | All model files | Binary holiday indicators used as-is without modification |
 | **Reproducibility Logging** | `train_service.py` | Preprocessing code logged to MLflow artifacts |
 | **Segment Exclusion** | `BatchTraining.tsx` | Click segments to exclude before training |
 | **Real MAPE Calculation** | `BatchComparison.tsx` | Compares forecast values vs uploaded actuals |
 | **Bias Metric** | `BatchComparison.tsx` | Shows under/over-forecast direction |
-| **Holiday Calendar** | `models_training.py` | SARIMAX/XGBoost use country holidays |
+| **Holiday Calendar** | `models_training.py` | SARIMAX auto-adds country holidays |
 | **Auto-open Comparison** | `App.tsx` | Opens comparison modal after batch completes |
 | **localStorage Persistence** | `App.tsx` | Batch results survive page refresh |
 | **Confirmation Dialog** | `BatchTraining.tsx` | Warns before losing unsaved results |
+| **UX Improvements** | `App.tsx` | Data validation, metric tooltips, error messages |
 | **Filter Bug Fix** | `App.tsx` | Empty "All (Aggregated)" filter now works |
 | **MLflow Deprecation Fix** | `models_training.py`, `train_service.py` | `artifact_path` → `name` |
 

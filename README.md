@@ -96,11 +96,11 @@ databricks-forecast-for-finance/
 
 | Model | Covariates Support | Auto-Preprocessing | Cross-Validation | Best For |
 |-------|-------------------|-------------------|------------------|----------|
-| **Prophet** | Yes | Yes (YoY lags, promo features) | Time series CV (prophet.diagnostics) | Complex seasonality, holidays, trend changes |
-| **ARIMA** | No | No (univariate) | Expanding window CV | Short-term forecasts, stationary data |
-| **Exponential Smoothing (ETS)** | No | No (univariate) | Expanding window CV | Clear trends and seasonality patterns |
-| **SARIMAX** | Yes | Yes (promo features) | Expanding window CV | Seasonal patterns with external regressors |
-| **XGBoost** | Yes | Yes (YoY lags, promo features) | Expanding window CV | Non-linear patterns, feature-rich datasets |
+| **Prophet** | Yes | Calendar + Trend + YoY lags | Time series CV (prophet.diagnostics) | Complex seasonality, holidays, trend changes |
+| **ARIMA** | No | None (univariate) | Expanding window CV | Short-term forecasts, stationary data |
+| **Exponential Smoothing (ETS)** | No | None (univariate) | Expanding window CV | Clear trends and seasonality patterns |
+| **SARIMAX** | Yes | User covariates + country holidays | Expanding window CV | Seasonal patterns with external regressors |
+| **XGBoost** | Yes | Calendar + Trend + YoY lags + short-term lags | Expanding window CV | Non-linear patterns, feature-rich datasets |
 
 ---
 
@@ -376,50 +376,58 @@ targets:
 
 ## Automatic Feature Preprocessing
 
-### Holiday/Weekend Forecasting Enhancement
+### How It Works
 
-The platform automatically enhances your data with derived features to improve forecasting accuracy on holidays and special events. **No changes required to your promo file** - the system derives these features automatically.
+The platform automatically adds generic features that improve forecasting accuracy across all covariate-supporting models. **Your promo/holiday columns are used as-is** - the system only adds complementary calendar and trend features.
+
+### Design Philosophy
+
+1. **User's promo columns are preserved as-is** - Binary indicators (0/1) for holidays/promos are already well-structured
+2. **Only universally useful features are added** - Calendar features, trend indicators, and YoY lags (when applicable)
+3. **No redundant derived features** - Models learn holiday effects directly from your indicators
 
 ### Features Added (for Prophet, SARIMAX, XGBoost)
 
-| Feature | Description | Why It Helps |
-|---------|-------------|--------------|
-| `lag_364` / `lag_365` | Same day last year | **Critical**: Best predictor for Thanksgiving 2024 is Thanksgiving 2023 |
-| `lag_364_rolling_avg` | Smoothed YoY average | Handles slight date misalignment |
-| `yoy_ratio` | Year-over-year growth | Captures growth/decline trends |
-| `any_promo_active` | Combined promo indicator | Simplifies "any special day" detection |
-| `promo_count` | Count of active promos | Handles overlapping events |
-| `promo_window` | Extended promo effect (±2 days) | Captures halo effect around holidays |
-| `is_promo_weekend` | Holiday weekend indicator | Differentiates Black Friday weekend from regular weekends |
-| `is_regular_weekend` | Regular weekend indicator | Separate pattern for normal weekends |
+| Category | Features | Description |
+|----------|----------|-------------|
+| **Calendar** | `day_of_week`, `is_weekend`, `month`, `quarter`, `day_of_month`, `week_of_year` | Captures day/week/month patterns |
+| **Trend** | `time_index`, `year` | Helps XGBoost capture trends (Prophet/SARIMAX handle internally) |
+| **YoY Lags** | `lag_364`, `lag_364_avg` (daily) / `lag_52` (weekly) / `lag_12` (monthly) | Same-period-last-year patterns (only if 1+ year of data) |
 
-### How It Works
+### Conditional YoY Lag Features
 
-1. **User uploads promo file** with binary indicators (0/1) for holidays/promos
-2. **System automatically derives** additional features from the promo data
-3. **Models use all features** (original + derived) during training
-4. **Preprocessing code is logged** to MLflow for 100% reproducibility
+YoY lag features are **only added if sufficient historical data exists**:
 
-### Example: Black Friday Improvement
+| Frequency | Required Data | Lag Feature |
+|-----------|---------------|-------------|
+| Daily | 400+ rows (~1.1 years) | `lag_364`, `lag_364_avg` |
+| Weekly | 60+ rows (~1.2 years) | `lag_52`, `lag_52_avg` |
+| Monthly | 15+ rows (~1.25 years) | `lag_12`, `lag_12_avg` |
 
-**Problem:** Model under-predicts on Thanksgiving weekend because:
-- Only Black Friday (Friday) is marked, but Sat-Sun also have elevated sales
-- No same-week-last-year signal for the model to learn from
-
-**Solution:** The preprocessing module:
-- Adds `promo_window` that extends the Black Friday effect ±2 days
-- Adds `lag_364` that looks at what happened on Black Friday weekend 2023
-- Adds `is_promo_weekend` to differentiate holiday weekends from regular weekends
+If you have less data, these features are automatically skipped to avoid all-NaN columns.
 
 ### Models That Benefit
 
 | Model | Preprocessing Applied | Notes |
 |-------|----------------------|-------|
-| **Prophet** | ✅ Full (YoY lags + promo features) | All features added as regressors |
-| **SARIMAX** | ✅ Partial (promo features) | Promo-derived features as exogenous variables |
-| **XGBoost** | ✅ Full (YoY lags + promo features) | All features + enhanced calendar features |
-| **ARIMA** | ❌ None | Univariate model - cannot use features |
-| **ETS** | ❌ None | Univariate model - cannot use features |
+| **Prophet** | Calendar + Trend + YoY lags | All features added as regressors |
+| **SARIMAX** | User covariates + country holidays | Auto-adds `is_holiday` indicator |
+| **XGBoost** | Calendar + Trend + YoY lags + short-term lags | Also adds `lag_1`, `lag_7`, `rolling_mean_7` |
+| **ARIMA** | None | Univariate model - cannot use features |
+| **ETS** | None | Univariate model - cannot use features |
+
+### Your Promo File Structure
+
+The system works optimally with sparse promo files containing binary indicators:
+
+```csv
+date,Black Friday,Christmas,Valentine's Day,...
+2024-11-29,1,0,0,...
+2024-11-30,1,0,0,...
+2024-12-25,0,1,0,...
+```
+
+Each holiday column is used directly by Prophet/SARIMAX/XGBoost - they learn separate coefficients for each holiday's effect.
 
 ### Reproducibility
 
@@ -963,8 +971,9 @@ holidays>=0.35
 ## Recent Updates (December 2024)
 
 ### New Features
-- **Automatic Feature Preprocessing**: YoY lag features (`lag_364`, `lag_365`) and promo-derived features for improved holiday forecasting
-- **Holiday/Weekend Forecasting Enhancement**: System automatically derives `promo_window`, `is_promo_weekend`, and `any_promo_active` features
+- **Simplified Preprocessing**: Generic calendar and trend features that work with any promo file structure
+- **Conditional YoY Lags**: Year-over-year lag features only added when sufficient data exists (1+ year)
+- **User Promo Columns Preserved**: Binary holiday indicators used directly without modification
 - **Batch Training with Segment Exclusion**: Click on segments to exclude them from training before running
 - **Real Actual vs Forecast MAPE**: BatchComparison now calculates true MAPE from uploaded actuals (not just training MAPE)
 - **Bias Calculation**: Shows forecast bias direction (under-forecast vs over-forecast) in comparison scorecard
@@ -972,15 +981,17 @@ holidays>=0.35
 - **Auto-open Comparison**: After batch training completes, comparison modal opens automatically
 - **localStorage Persistence**: Batch results survive page refresh - no more losing 1-hour training sessions
 - **Confirmation Dialogs**: Warning before closing batch training with unsaved results
+- **UX Improvements**: Data validation, metric tooltips, improved error messages
 
 ### Bug Fixes
-- Fixed holiday under-prediction by adding same-week-last-year features (`lag_364`)
+- Fixed Prophet model failures with short datasets (less than 1 year of data)
 - Fixed empty chart bug when "All (Aggregated)" filter was selected
 - Fixed MLflow `artifact_path` deprecation warning (now uses `name`)
 - Dynamic grouping fields now reset properly when loading new files
+- Removed duplicate preprocessing code across model files
 
 ### Infrastructure
-- New `backend/preprocessing.py` module for feature engineering
+- Refactored `backend/preprocessing.py` for consistency across all models
 - Preprocessing code logged to MLflow for 100% reproducibility
 - Improved MLflow experiment organization with batch_id grouping
 - Added segment-level error isolation in batch training
