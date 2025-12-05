@@ -2347,35 +2347,23 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       <div className="mt-4 pt-4 border-t border-gray-200">
                         <div className="flex items-center space-x-2 mb-2">
                           <BrainCircuit className="w-4 h-4 text-blue-600" />
-                          <span className="text-xs font-semibold text-gray-700">Automatic Preprocessing Applied</span>
+                          <span className="text-xs font-semibold text-gray-700">Features Used</span>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
-                          <div className="bg-blue-50 p-2 rounded border border-blue-100">
-                            <div className="text-blue-600 font-semibold">YoY Lag Features</div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                          <div className="bg-purple-50 p-2 rounded border border-purple-100">
+                            <div className="text-purple-600 font-semibold">Holiday/Promo Indicators</div>
                             <div className="text-gray-600">
-                              {frequency === 'daily' ? 'lag_364, lag_365' : frequency === 'weekly' ? 'lag_52' : 'lag_12'}
-                              <span className="text-gray-400 ml-1">(same-period-last-year)</span>
+                              {covariates.length} user-provided columns
+                              <span className="text-gray-400 ml-1">(used as-is)</span>
                             </div>
                           </div>
-                          {covariates.some(c => c.toLowerCase().includes('promo') || c.toLowerCase().includes('holiday') || c.toLowerCase().includes('event')) && (
-                            <div className="bg-purple-50 p-2 rounded border border-purple-100">
-                              <div className="text-purple-600 font-semibold">Promo-Derived Features</div>
-                              <div className="text-gray-600">
-                                promo_window, any_promo_active
-                                <span className="text-gray-400 ml-1">(enhanced promo effects)</span>
-                              </div>
-                            </div>
-                          )}
                           <div className="bg-green-50 p-2 rounded border border-green-100">
                             <div className="text-green-600 font-semibold">Calendar Features</div>
                             <div className="text-gray-600">
-                              day_of_week, is_weekend, is_month_end
-                              <span className="text-gray-400 ml-1">(pattern detection)</span>
+                              day_of_week, is_weekend
+                              <span className="text-gray-400 ml-1">(auto-added)</span>
                             </div>
                           </div>
-                        </div>
-                        <div className="mt-2 text-[10px] text-gray-500 italic">
-                          Preprocessing logged to MLflow for 100% reproducibility
                         </div>
                       </div>
                     )}
