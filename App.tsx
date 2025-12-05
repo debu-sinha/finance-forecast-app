@@ -2349,19 +2349,26 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                           <BrainCircuit className="w-4 h-4 text-blue-600" />
                           <span className="text-xs font-semibold text-gray-700">Features Used</span>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
                           <div className="bg-purple-50 p-2 rounded border border-purple-100">
                             <div className="text-purple-600 font-semibold">Holiday/Promo Indicators</div>
                             <div className="text-gray-600">
                               {covariates.length} user-provided columns
-                              <span className="text-gray-400 ml-1">(used as-is)</span>
+                              <span className="text-gray-400 ml-1">(as-is)</span>
                             </div>
                           </div>
                           <div className="bg-green-50 p-2 rounded border border-green-100">
                             <div className="text-green-600 font-semibold">Calendar Features</div>
                             <div className="text-gray-600">
-                              day_of_week, is_weekend
-                              <span className="text-gray-400 ml-1">(auto-added)</span>
+                              day_of_week, is_weekend, month, quarter
+                              <span className="text-gray-400 ml-1">(auto)</span>
+                            </div>
+                          </div>
+                          <div className="bg-blue-50 p-2 rounded border border-blue-100">
+                            <div className="text-blue-600 font-semibold">Trend + YoY Lags</div>
+                            <div className="text-gray-600">
+                              time_index, year, lag_{frequency === 'daily' ? '364' : frequency === 'weekly' ? '52' : '12'}
+                              <span className="text-gray-400 ml-1">(if data allows)</span>
                             </div>
                           </div>
                         </div>

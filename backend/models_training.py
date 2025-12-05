@@ -1784,24 +1784,10 @@ def train_sarimax_model(
     if 'is_holiday' not in valid_covariates:
         valid_covariates.append('is_holiday')
 
-    # Add promo-derived features for better holiday forecasting
+    # User-provided covariates are used as-is
+    # SARIMAX can use them directly as exogenous variables
     if valid_covariates:
-        # Combined promo indicator
-        promo_cols = [c for c in valid_covariates if c in train_df.columns and c != 'is_holiday']
-        if promo_cols:
-            for df in [train_df, test_df]:
-                df['any_promo_active'] = df[promo_cols].max(axis=1)
-                df['promo_window'] = df['any_promo_active'].rolling(window=5, center=True, min_periods=1).max()
-                # Weekend near promo
-                df['day_of_week'] = df['ds'].dt.dayofweek
-                df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-                df['is_promo_weekend'] = ((df['is_weekend'] == 1) & (df['promo_window'] == 1)).astype(int)
-
-            # Add derived features to covariates
-            for derived in ['any_promo_active', 'promo_window', 'is_promo_weekend']:
-                if derived not in valid_covariates:
-                    valid_covariates.append(derived)
-            logger.info(f"SARIMAX: Added promo-derived features from {len(promo_cols)} promo columns")
+        logger.info(f"SARIMAX: Using {len(valid_covariates)} covariates as exogenous variables")
 
     if valid_covariates:
         train_exog = train_df[valid_covariates].values
@@ -2407,22 +2393,12 @@ def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates:
         if frequency == 'daily':
             df['lag_365'] = 0
 
-    # Promo-derived features if covariates (promo columns) are present
+    # User-provided covariates (promo columns) are used as-is
+    # XGBoost can learn non-linear interactions directly from binary indicators
     if covariates:
         valid_promo_cols = [c for c in covariates if c in df.columns]
         if valid_promo_cols:
-            # Combined promo indicator
-            df['any_promo_active'] = df[valid_promo_cols].max(axis=1)
-            df['promo_count'] = df[valid_promo_cols].sum(axis=1)
-
-            # Extended promo window (±2 days effect)
-            df['promo_window'] = df['any_promo_active'].rolling(window=5, center=True, min_periods=1).max()
-
-            # Is this a promo/holiday weekend?
-            df['is_promo_weekend'] = ((df['is_weekend'] == 1) & (df['promo_window'] == 1)).astype(int)
-            df['is_regular_weekend'] = ((df['is_weekend'] == 1) & (df['promo_window'] == 0)).astype(int)
-
-            logger.info(f"XGBoost: Added promo-derived features from {len(valid_promo_cols)} promo columns")
+            logger.info(f"XGBoost: Using {len(valid_promo_cols)} user-provided covariate columns as-is")
 
     return df
 

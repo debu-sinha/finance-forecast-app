@@ -357,46 +357,41 @@ random.seed({random_seed})
 # ============================================================================
 def enhance_features_for_forecasting(df, date_col='ds', target_col='y', promo_cols=None, frequency='daily'):
     """
-    Auto-enhance dataframe with derived features for better holiday forecasting.
+    Add generic features that improve forecasting for all algorithms.
 
-    Features Added:
-    - lag_364/lag_365: Same day last year (critical for holiday patterns)
-    - days_to_promo/days_since_promo: Anticipation and hangover effects
-    - promo_window: Extended effect around promo days
-    - is_promo_weekend: Holiday weekend vs regular weekend
+    Features added:
+    1. Calendar features (always): day_of_week, is_weekend, month, quarter
+    2. Trend features (always): time_index, year
+    3. YoY lag features (conditional): only if enough data exists
     """
     result = df.copy()
     result[date_col] = pd.to_datetime(result[date_col])
     result = result.sort_values(date_col).reset_index(drop=True)
 
-    # Lag periods based on frequency
-    lag_map = {{'daily': 364, 'weekly': 52, 'monthly': 12}}
-    yoy_lag = lag_map.get(frequency, 364)
-
-    # YoY lag features
-    if target_col in result.columns:
-        result[f'lag_{{yoy_lag}}'] = result[target_col].shift(yoy_lag)
-        if frequency == 'daily':
-            result['lag_365'] = result[target_col].shift(365)
-        result[f'lag_{{yoy_lag}}_rolling_avg'] = result[target_col].shift(yoy_lag - 3).rolling(window=7, min_periods=1).mean()
-        safe_lag = result[f'lag_{{yoy_lag}}'].replace(0, np.nan)
-        result['yoy_ratio'] = (result[target_col] / safe_lag).clip(0.1, 10.0).fillna(1.0)
-
-    # Promo-derived features
-    if promo_cols:
-        valid_promo_cols = [c for c in promo_cols if c in result.columns]
-        if valid_promo_cols:
-            result['any_promo_active'] = result[valid_promo_cols].max(axis=1)
-            result['promo_count'] = result[valid_promo_cols].sum(axis=1)
-            result['promo_window'] = result['any_promo_active'].rolling(window=5, center=True, min_periods=1).max()
-
-    # Calendar features
     dates = pd.to_datetime(result[date_col])
+
+    # Calendar features (always added)
     result['day_of_week'] = dates.dt.dayofweek
     result['is_weekend'] = (result['day_of_week'] >= 5).astype(int)
-    result['is_month_start'] = dates.dt.is_month_start.astype(int)
-    result['is_month_end'] = dates.dt.is_month_end.astype(int)
-    result['week_of_month'] = (dates.dt.day - 1) // 7 + 1
+    result['month'] = dates.dt.month
+    result['quarter'] = dates.dt.quarter
+    result['day_of_month'] = dates.dt.day
+    result['week_of_year'] = dates.dt.isocalendar().week.astype(int)
+
+    # Trend features
+    result['time_index'] = range(len(result))
+    result['year'] = dates.dt.year
+
+    # YoY lag features (only if enough data)
+    lag_config = {{'daily': {{'lag': 364, 'min_rows': 400}}, 'weekly': {{'lag': 52, 'min_rows': 60}}, 'monthly': {{'lag': 12, 'min_rows': 15}}}}
+    config = lag_config.get(frequency, lag_config['daily'])
+
+    if target_col in result.columns and result[target_col].notna().sum() >= config['min_rows']:
+        lag_col = f"lag_{{config['lag']}}"
+        result[lag_col] = result[target_col].shift(config['lag'])
+        if result[lag_col].notna().any():
+            window = 7 if frequency == 'daily' else 4 if frequency == 'weekly' else 3
+            result[f'{{lag_col}}_avg'] = result[target_col].shift(config['lag']).rolling(window=window, min_periods=1).mean()
 
     return result
 
