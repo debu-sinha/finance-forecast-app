@@ -316,6 +316,7 @@ const App = () => {
     status: 'pending' | 'training' | 'completed' | 'failed';
     mape?: string;
     startTime?: number;
+    error?: string;
   }
   const [modelProgress, setModelProgress] = useState<ModelTrainingProgress[]>([]);
 
@@ -1503,14 +1504,22 @@ const App = () => {
       setModelProgress(prev => prev.map(mp => {
         const result = backendResponse.models.find((m: any) => m.model_type === mp.model);
         if (result) {
+          // Check if model failed (has error field or N/A metrics)
+          if (result.error || result.metrics.mape === 'N/A') {
+            return {
+              ...mp,
+              status: 'failed' as const,
+              error: result.error || 'Training failed'
+            };
+          }
           return {
             ...mp,
             status: 'completed' as const,
             mape: result.metrics.mape
           };
         }
-        // Model was skipped or failed
-        return { ...mp, status: 'failed' as const };
+        // Model was not in response - possibly skipped
+        return { ...mp, status: 'failed' as const, error: 'Model not returned by backend' };
       }));
 
       console.log('Processed models:', modelResults.length, 'Best:', modelResults.find(m => m.isBest)?.modelName);
@@ -2187,8 +2196,18 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                             )}
                             {mp.status === 'training' && 'Training...'}
                             {mp.status === 'pending' && `Queue #${idx + 1}`}
-                            {mp.status === 'failed' && 'Skipped'}
+                            {mp.status === 'failed' && (
+                              <span className="text-red-500" title={mp.error || 'Training failed'}>
+                                Failed {mp.error && <span className="cursor-help">(?)</span>}
+                              </span>
+                            )}
                           </div>
+                          {/* Error tooltip for failed models */}
+                          {mp.status === 'failed' && mp.error && (
+                            <div className="absolute z-20 hidden group-hover:block bottom-full left-0 mb-1 p-2 bg-red-900 text-white text-[10px] rounded shadow-lg max-w-xs whitespace-normal">
+                              {mp.error}
+                            </div>
+                          )}
                           {/* Progress indicator line */}
                           <div className="absolute bottom-0 left-0 right-0 h-1 rounded-b-lg overflow-hidden">
                             {mp.status === 'training' && (

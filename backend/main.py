@@ -386,7 +386,8 @@ async def train_model(request: TrainRequest):
 
                 except Exception as e:
                     logger.error(f"{model_type} failed: {e}", exc_info=True)
-                    # Add failed model to results with error info so frontend knows it was attempted
+                    # Add failed model to results with error info so frontend can show why it failed
+                    error_msg = str(e)[:300]  # Truncate long errors
                     failed_result = ModelResult(
                         model_type=model_type,
                         model_name=f"{model_type.upper()} (Failed)",
@@ -395,10 +396,11 @@ async def train_model(request: TrainRequest):
                         validation=[],
                         forecast=[],
                         covariate_impacts=[],
-                        is_best=False
+                        is_best=False,
+                        error=error_msg
                     )
-                    # Don't add failed models to results - just log the error
-                    logger.warning(f"Model {model_type} skipped due to error: {str(e)[:200]}")
+                    model_results.append(failed_result)
+                    logger.warning(f"Model {model_type} failed: {error_msg}")
 
         if not model_results: raise Exception("All models failed")
 

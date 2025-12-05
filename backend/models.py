@@ -97,6 +97,7 @@ class ModelResult(BaseModel):
     is_best: bool = False
     experiment_url: Optional[str] = Field(None, description="URL to MLflow experiment")
     run_url: Optional[str] = Field(None, description="URL to MLflow run")
+    error: Optional[str] = Field(None, description="Error message if model failed")
 
 
 class TrainResponse(BaseModel):
