@@ -1,0 +1,56 @@
+name: finance-forecast-app
+description: Finance Forecasting Platform with MLflow and Model Serving
+
+# Command to run the application (Python backend serves React frontend)
+command:
+  - /bin/bash
+  - -c
+  - |
+    pip install -r requirements.txt && \
+    python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
+
+# Environment variables
+# NOTE: Databricks Apps has a hard limit of 4 vCPU / 12GB RAM
+# Tune these values based on your workload - see DEVELOPER_GUIDE.md for details
+env:
+
+  - name: MLFLOW_TRACKING_URI
+    value: "databricks"
+  - name: MLFLOW_EXPERIMENT_NAME
+    value: "/Users/${DATABRICKS_USER}/finance-forecasting"
+  - name: PYTHONUNBUFFERED
+    value: "1"
+
+  # Performance tuning for 4 vCPU / 12GB RAM constraint
+  # Increase these values for local development with more resources
+  - name: MLFLOW_MAX_WORKERS
+    value: "2"  # Parallel threads for hyperparameter search (local: 4-8)
+  - name: PROPHET_MAX_COMBINATIONS
+    value: "3"  # Prophet grid search combinations (local: 9-12)
+  - name: ARIMA_MAX_COMBINATIONS
+    value: "6"  # ARIMA grid search combinations (local: 12-18)
+  - name: ETS_MAX_COMBINATIONS
+    value: "4"  # ETS grid search combinations (local: 8-12)
+  - name: SARIMAX_MAX_COMBINATIONS
+    value: "8"  # SARIMAX grid search combinations (local: 16-24)
+  - name: XGBOOST_MAX_COMBINATIONS
+    value: "4"  # XGBoost grid search combinations (local: 8-16)
+
+  # Unity Catalog configuration
+  - name: UC_CATALOG_NAME
+    value: "main"
+  - name: UC_SCHEMA_NAME
+    value: "default"
+  - name: UC_MODEL_NAME_ONLY
+    value: "finance_forecast_model"
+  - name: UC_MODEL_NAME
+    value: "main.default.finance_forecast_model"
+
+
+  
+# Permissions required
+permissions:
+  - workspace_access
+  - cluster_access
+  - model_serving_access
+  - unity_catalog_access

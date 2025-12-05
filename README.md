@@ -1,0 +1,1004 @@
+# Databricks Finance Forecasting Platform
+
+<div align="center">
+  <img src="https://img.shields.io/badge/Databricks-Apps-FF3621?style=for-the-badge&logo=databricks&logoColor=white" />
+  <img src="https://img.shields.io/badge/MLflow-0194E2?style=for-the-badge&logo=mlflow&logoColor=white" />
+  <img src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=black" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
+  <img src="https://img.shields.io/badge/Prophet-4285F4?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/XGBoost-FF6600?style=for-the-badge" />
+</div>
+
+## Overview
+
+A comprehensive **prototype and reference implementation** for an AI-powered time series forecasting application built on Databricks. This accelerator demonstrates how to combine modern data science workflows (MLflow, Unity Catalog, Databricks Apps) with an intuitive notebook-style UI to make financial forecasting accessible to business users.
+
+### Key Features
+
+*   **AutoML Forecasting Paradigm**: Automatically trains and compares multiple model types (Prophet, ARIMA, Exponential Smoothing, SARIMAX, XGBoost) to find the best fit for your data.
+*   **Time Series Cross-Validation**: Expanding window CV for robust metric estimation (not just single holdout).
+*   **Statistical Prediction Intervals**: Residual-based confidence bounds using t-distribution (not arbitrary ±10%).
+*   **Parallel Hyperparameter Tuning**: Leverages multi-threading to optimize model parameters efficiently.
+*   **AI-Powered Analysis**: Uses Databricks Foundation Models for dataset analysis and executive summaries.
+*   **One-Click Deployment**: Deploy best-performing model to Databricks Model Serving for real-time inference.
+*   **Interactive UI**: React-based frontend for data upload, configuration, and visualization.
+*   **Forecast vs Actuals Comparison**: Compare predictions against actuals with finance industry MAPE thresholds.
+*   **Batch Training**: Train forecasts for multiple segments (e.g., region × product × channel) with progress tracking and MAPE statistics.
+*   **Batch Comparison Scorecard**: Compare batch forecasts against actuals across all segments with status breakdown.
+*   **Full Reproducibility**: Logs exact training datasets, random seeds, and generates reproducible Python code.
+*   **Enterprise Governance**: Full integration with Unity Catalog and MLflow experiment tracking.
+*   **Export Capabilities**: Download comparison reports (CSV), batch results, scorecards, and executive summaries (Markdown).
+
+---
+
+## Project Structure
+
+```
+databricks-forecast-for-finance/
+├── App.tsx                        # Main React application
+├── index.tsx                      # React entry point
+├── index.html                     # HTML template
+├── types.ts                       # TypeScript type definitions
+├── vite.config.ts                 # Vite build configuration
+├── tsconfig.json                  # TypeScript configuration
+├── package.json                   # Node.js dependencies
+├── requirements.txt               # Python dependencies
+│
+├── backend/
+│   ├── __init__.py
+│   ├── main.py                    # FastAPI application
+│   ├── models.py                  # Pydantic request/response models
+│   ├── train_service.py           # Prophet model training
+│   ├── models_training.py         # ARIMA/ETS/SARIMAX/XGBoost training
+│   ├── preprocessing.py           # Feature engineering for holiday/weekend forecasting
+│   ├── ai_service.py              # AI analysis via Foundation Models
+│   └── deploy_service.py          # Model deployment to serving endpoints
+│
+├── components/
+│   ├── ResultsChart.tsx           # Main forecast visualization
+│   ├── EvaluationChart.tsx        # Model evaluation charts
+│   ├── ForecastTable.tsx          # Tabular forecast display
+│   ├── CovariateImpactChart.tsx   # Feature importance visualization
+│   ├── TrainTestSplitViz.tsx      # Train/test split visualization
+│   ├── NotebookCell.tsx           # Code display component
+│   ├── BatchTraining.tsx          # Batch training modal
+│   └── BatchComparison.tsx        # Batch comparison scorecard
+│
+├── services/
+│   ├── analysisService.ts         # Frontend data analysis
+│   └── databricksApi.ts           # Databricks API client
+│
+├── utils/
+│   └── csvParser.ts               # CSV parsing utilities
+│
+├── scripts/
+│   ├── batch_forecast.py          # CLI for parallel batch training
+│   └── validate_mlflow_data.py    # MLflow artifact validation
+│
+├── setup-local.sh                 # One-time setup script
+├── start-local.sh                 # Start development servers
+├── restart-clean.sh               # Clean restart (kills old processes)
+├── deploy-to-databricks.sh        # Deployment helper script
+│
+├── databricks.yml                 # Databricks Asset Bundle config
+├── app.yaml                       # Databricks App configuration
+├── databricks_notebook_template.py # Standalone Databricks notebook example
+├── .env.example                   # Environment template (copy to .env.local)
+├── .env.local                     # Local environment variables (not in git)
+│
+├── DEVELOPER_GUIDE.md             # Detailed developer documentation
+└── README.md                      # This file
+```
+
+---
+
+## Supported Models
+
+| Model | Covariates Support | Auto-Preprocessing | Cross-Validation | Best For |
+|-------|-------------------|-------------------|------------------|----------|
+| **Prophet** | Yes | Yes (YoY lags, promo features) | Time series CV (prophet.diagnostics) | Complex seasonality, holidays, trend changes |
+| **ARIMA** | No | No (univariate) | Expanding window CV | Short-term forecasts, stationary data |
+| **Exponential Smoothing (ETS)** | No | No (univariate) | Expanding window CV | Clear trends and seasonality patterns |
+| **SARIMAX** | Yes | Yes (promo features) | Expanding window CV | Seasonal patterns with external regressors |
+| **XGBoost** | Yes | Yes (YoY lags, promo features) | Expanding window CV | Non-linear patterns, feature-rich datasets |
+
+---
+
+## Hardware & Scaling Quick Reference
+
+| Environment | Max Data Size | Max Batch Segments | Parallel Workers |
+|-------------|--------------|-------------------|------------------|
+| **Databricks Apps** (4 vCPU/12GB) | 50K rows/segment | 20 segments | 1-2 |
+| **Local Dev** (16GB RAM) | 100K rows/segment | 50 segments | 2-4 |
+
+**Key Limits:**
+- Databricks Apps has a hard limit of **4 vCPU / 12GB RAM**
+- Batch training processes segments **sequentially** for progress tracking
+- Each segment takes ~30s-3min depending on data size and models
+- For larger workloads, use the CLI script or pre-aggregate data
+
+> **📖 See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#hardware--scaling-recommendations)** for detailed hardware recommendations, memory usage by model, and scaling strategies.
+
+---
+
+## Local Development Guide
+
+### Prerequisites
+*   **Node.js** 18+
+*   **Python** 3.10+
+*   **Databricks CLI** (Optional for local run, Required for deployment)
+*   **OpenMP** (Required for XGBoost on macOS): `brew install libomp`
+
+### Quick Start (Recommended)
+
+1.  **Setup Environment**:
+    ```bash
+    ./setup-local.sh
+    ```
+
+2.  **Configure Credentials**:
+    Edit `.env.local` and add your Databricks credentials:
+    ```bash
+    # Backend Authentication
+    DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
+    DATABRICKS_TOKEN=dapi...
+
+    # Frontend Authentication (required for AI features)
+    VITE_DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
+    VITE_DATABRICKS_TOKEN=dapi...
+
+    # MLflow Experiment Path
+    MLFLOW_EXPERIMENT_NAME=/Users/your.email@company.com/finance-forecasting
+    ```
+
+3.  **Run Application**:
+    ```bash
+    ./start-local.sh
+    ```
+    Access the app at `http://localhost:3000`.
+
+4.  **Clean Restart** (if things get stuck):
+    ```bash
+    ./restart-clean.sh
+    ```
+
+### Manual Setup
+
+#### 1. Create `.env.local`
+
+```bash
+# Backend Authentication
+DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
+DATABRICKS_TOKEN=dapi...
+
+# Frontend Authentication (required for AI features)
+VITE_DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
+VITE_DATABRICKS_TOKEN=dapi...
+
+# MLflow Experiment Path
+MLFLOW_EXPERIMENT_NAME=/Users/your.email@company.com/finance-forecasting
+
+# Unity Catalog Settings (optional - has defaults)
+UC_CATALOG_NAME=main
+UC_SCHEMA_NAME=default
+UC_MODEL_NAME_ONLY=finance_forecast_model
+UC_MODEL_NAME=main.default.finance_forecast_model
+
+# Performance & Tuning (optional - has defaults)
+MLFLOW_MAX_WORKERS=2           # Number of parallel training jobs
+PROPHET_MAX_COMBINATIONS=3     # Grid search limit for Prophet
+ARIMA_MAX_COMBINATIONS=6       # Grid search limit for ARIMA
+ETS_MAX_COMBINATIONS=4         # Grid search limit for ETS
+SARIMAX_MAX_COMBINATIONS=4     # Grid search limit for SARIMAX
+XGBOOST_MAX_COMBINATIONS=4     # Grid search limit for XGBoost
+```
+
+#### 2. Install Dependencies
+
+**Frontend:**
+```bash
+npm install
+```
+
+**Backend:**
+```bash
+pip install -r requirements.txt
+```
+
+**XGBoost on macOS** (if you encounter OpenMP errors):
+```bash
+brew install libomp
+```
+
+#### 3. Run Application
+
+**Start Backend (FastAPI):**
+```bash
+python -m uvicorn backend.main:app --reload --port 8000
+```
+
+**Start Frontend (React):**
+```bash
+npm run dev
+```
+
+---
+
+## Configuration Reference
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABRICKS_HOST` | Yes | - | Databricks workspace URL |
+| `DATABRICKS_TOKEN` | Yes (local) | - | Personal access token (auto on Apps) |
+| `VITE_DATABRICKS_HOST` | Yes (local) | - | Frontend AI Gateway access |
+| `VITE_DATABRICKS_TOKEN` | Yes (local) | - | Frontend AI Gateway token |
+| `MLFLOW_TRACKING_URI` | No | `databricks` | MLflow tracking server |
+| `MLFLOW_EXPERIMENT_NAME` | Yes | - | Experiment path (e.g., `/Users/you@company.com/finance-forecasting`) |
+| `UC_CATALOG_NAME` | No | `main` | Unity Catalog catalog |
+| `UC_SCHEMA_NAME` | No | `default` | Unity Catalog schema |
+| `UC_MODEL_NAME_ONLY` | No | `finance_forecast_model` | Model name (without catalog/schema) |
+| `UC_MODEL_NAME` | No | `main.default.finance_forecast_model` | Full 3-level model name |
+| `MLFLOW_MAX_WORKERS` | No | `1` | Parallel training workers |
+| `PROPHET_MAX_COMBINATIONS` | No | `3` | Prophet hyperparameter grid size |
+| `ARIMA_MAX_COMBINATIONS` | No | `6` | ARIMA grid size |
+| `ETS_MAX_COMBINATIONS` | No | `4` | ETS grid size |
+| `SARIMAX_MAX_COMBINATIONS` | No | `8` | SARIMAX grid size |
+| `XGBOOST_MAX_COMBINATIONS` | No | `4` | XGBoost grid size |
+
+> **Note:** See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for detailed configuration tuning between local development and Databricks Apps (4 vCPU/12GB RAM limit).
+
+### Vite Configuration (vite.config.ts)
+
+```typescript
+export default defineConfig({
+  server: {
+    port: 3000,
+    host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        secure: false,
+      }
+    }
+  },
+  plugins: [react()],
+  envPrefix: ['VITE_'],
+  build: {
+    outDir: 'dist',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom'],
+          'chart-vendor': ['recharts'],
+        }
+      }
+    }
+  }
+});
+```
+
+### TypeScript Configuration (tsconfig.json)
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "paths": { "@/*": ["./*"] },
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}
+```
+
+### Databricks App Configuration (app.yaml)
+
+```yaml
+name: finance-forecast-app
+description: Finance Forecasting Platform with MLflow and Model Serving
+
+command:
+  - /bin/bash
+  - -c
+  - |
+    pip install -r requirements.txt && \
+    python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
+
+env:
+  - name: MLFLOW_TRACKING_URI
+    value: "databricks"
+  - name: MLFLOW_EXPERIMENT_NAME
+    value: "/Users/${DATABRICKS_USER}/finance-forecasting"
+  - name: MLFLOW_MAX_WORKERS
+    value: "2"
+  - name: PROPHET_MAX_COMBINATIONS
+    value: "3"
+  - name: UC_CATALOG_NAME
+    value: "main"
+  - name: UC_SCHEMA_NAME
+    value: "default"
+  - name: UC_MODEL_NAME
+    value: "main.default.finance_forecast_model"
+
+permissions:
+  - workspace_access
+  - cluster_access
+  - model_serving_access
+  - unity_catalog_access
+```
+
+### Databricks Asset Bundle (databricks.yml)
+
+```yaml
+bundle:
+  name: finance-forecast-app
+
+resources:
+  apps:
+    finance-forecast-app:
+      name: finance-forecast-app
+      description: "Finance Forecasting Platform"
+      command:
+        - /bin/bash
+        - -c
+        - |
+          pip install -r requirements.txt && \
+          python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
+
+      env:
+        - name: MLFLOW_TRACKING_URI
+          value: "databricks"
+        - name: UC_CATALOG_NAME
+          value: "main"
+        # ... additional env vars
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: ${workspace_host}
+
+  prod:
+    mode: production
+    workspace:
+      host: ${workspace_host}
+```
+
+---
+
+## Automatic Feature Preprocessing
+
+### Holiday/Weekend Forecasting Enhancement
+
+The platform automatically enhances your data with derived features to improve forecasting accuracy on holidays and special events. **No changes required to your promo file** - the system derives these features automatically.
+
+### Features Added (for Prophet, SARIMAX, XGBoost)
+
+| Feature | Description | Why It Helps |
+|---------|-------------|--------------|
+| `lag_364` / `lag_365` | Same day last year | **Critical**: Best predictor for Thanksgiving 2024 is Thanksgiving 2023 |
+| `lag_364_rolling_avg` | Smoothed YoY average | Handles slight date misalignment |
+| `yoy_ratio` | Year-over-year growth | Captures growth/decline trends |
+| `any_promo_active` | Combined promo indicator | Simplifies "any special day" detection |
+| `promo_count` | Count of active promos | Handles overlapping events |
+| `promo_window` | Extended promo effect (±2 days) | Captures halo effect around holidays |
+| `is_promo_weekend` | Holiday weekend indicator | Differentiates Black Friday weekend from regular weekends |
+| `is_regular_weekend` | Regular weekend indicator | Separate pattern for normal weekends |
+
+### How It Works
+
+1. **User uploads promo file** with binary indicators (0/1) for holidays/promos
+2. **System automatically derives** additional features from the promo data
+3. **Models use all features** (original + derived) during training
+4. **Preprocessing code is logged** to MLflow for 100% reproducibility
+
+### Example: Black Friday Improvement
+
+**Problem:** Model under-predicts on Thanksgiving weekend because:
+- Only Black Friday (Friday) is marked, but Sat-Sun also have elevated sales
+- No same-week-last-year signal for the model to learn from
+
+**Solution:** The preprocessing module:
+- Adds `promo_window` that extends the Black Friday effect ±2 days
+- Adds `lag_364` that looks at what happened on Black Friday weekend 2023
+- Adds `is_promo_weekend` to differentiate holiday weekends from regular weekends
+
+### Models That Benefit
+
+| Model | Preprocessing Applied | Notes |
+|-------|----------------------|-------|
+| **Prophet** | ✅ Full (YoY lags + promo features) | All features added as regressors |
+| **SARIMAX** | ✅ Partial (promo features) | Promo-derived features as exogenous variables |
+| **XGBoost** | ✅ Full (YoY lags + promo features) | All features + enhanced calendar features |
+| **ARIMA** | ❌ None | Univariate model - cannot use features |
+| **ETS** | ❌ None | Univariate model - cannot use features |
+
+### Reproducibility
+
+All preprocessing code is logged to MLflow artifacts:
+- `reproducibility/training_code.py` - Includes inline preprocessing functions
+- `reproducibility/preprocessing.py` - Full preprocessing module source
+
+---
+
+## Model Validation & Metrics
+
+### Time Series Cross-Validation
+
+All models use **expanding window cross-validation** for robust metric estimation:
+
+```
+Split 1: [===Train===][Test]
+Split 2: [=====Train=====][Test]
+Split 3: [=======Train=======][Test]
+```
+
+**Why CV matters:**
+- Single holdout validation can give misleading metrics due to random variation
+- CV MAPE provides a more reliable estimate of out-of-sample performance
+- Standard deviation shows metric stability across different time periods
+
+**Metrics returned:**
+- `mape`: Validation MAPE (single holdout)
+- `cv_mape`: Cross-validation MAPE (averaged across folds)
+- `cv_mape_std`: Standard deviation of CV MAPE
+
+### Statistical Prediction Intervals
+
+Confidence intervals are computed using residual standard deviation and t-distribution:
+
+```
+PI = forecast ± t_{α/2,n-1} × σ_residuals × √(1 + 1/n)
+```
+
+This replaces arbitrary ±10% bounds with **statistically valid intervals** based on actual model uncertainty.
+
+### MAPE Thresholds (Finance Industry Best Practices)
+
+| Category | MAPE Range | Description |
+|----------|------------|-------------|
+| Excellent | ≤5% | Industry gold standard |
+| Good | 5-10% | Reliable for planning |
+| Acceptable | 10-15% | Suitable with caution |
+| Needs Review | 15-25% | Investigate root causes |
+| Significant Deviation | >25% | Requires attention |
+
+---
+
+## AutoML & Hyperparameter Tuning
+
+### How It Works
+
+1.  **Parallel Training**: The system trains five distinct model types simultaneously.
+
+2.  **Hyperparameter Tuning**:
+    *   **Prophet**: Grid search over `changepoint_prior_scale`, `seasonality_prior_scale`, `seasonality_mode`, `growth`.
+    *   **ARIMA**: Grid search over `p` (0-2), `d` (0-1), `q` (0-1) parameters.
+    *   **ETS**: Grid search over `trend` and `seasonal` components.
+    *   **SARIMAX**: Grid search over `(p,d,q)` and seasonal `(P,D,Q,s)` parameters.
+    *   **XGBoost**: Grid search over `max_depth`, `n_estimators`, `learning_rate`.
+
+3.  **Model Selection**:
+    *   All models evaluated on holdout validation set with cross-validation
+    *   Compares MAPE, RMSE, R², and CV MAPE
+    *   Best model (lowest CV MAPE) automatically recommended for deployment
+
+---
+
+## Backend API Reference
+
+### Core Endpoints
+
+#### POST /api/train
+
+Train forecasting models on uploaded data.
+
+**Request Body:**
+```json
+{
+  "data": [{"ds": "2023-01-01", "y": 1000, "marketing_spend": 500}],
+  "time_col": "ds",
+  "target_col": "y",
+  "covariates": ["marketing_spend"],
+  "horizon": 12,
+  "frequency": "monthly",
+  "seasonality_mode": "multiplicative",
+  "test_size": 100,
+  "regressor_method": "mean",
+  "models": ["prophet", "arima", "exponential_smoothing", "sarimax", "xgboost"],
+  "catalog_name": "main",
+  "schema_name": "default",
+  "model_name": "finance_forecast_model",
+  "country": "US",
+  "random_seed": 42,
+  "from_date": "2023-01-01",
+  "to_date": "2024-12-31",
+  "future_features": [{"ds": "2025-01-01", "marketing_spend": 600}]
+}
+```
+
+**Request Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `data` | array | Yes | - | Time series data rows |
+| `time_col` | string | Yes | - | Name of date/time column |
+| `target_col` | string | Yes | - | Name of target column |
+| `covariates` | array | No | `[]` | List of covariate column names |
+| `horizon` | int | No | `12` | Number of periods to forecast |
+| `frequency` | string | No | `monthly` | `daily`, `weekly`, or `monthly` |
+| `seasonality_mode` | string | No | `multiplicative` | `additive` or `multiplicative` |
+| `test_size` | int | No | auto | Size of validation set |
+| `regressor_method` | string | No | `mean` | `mean`, `last_value`, or `linear_trend` |
+| `models` | array | No | `["prophet"]` | Models to train |
+| `random_seed` | int | No | `42` | Random seed for reproducibility |
+| `from_date` | string | No | - | Filter data from this date |
+| `to_date` | string | No | - | Filter data to this date |
+| `future_features` | array | No | - | Future covariate values |
+
+**Response:**
+```json
+{
+  "models": [
+    {
+      "model_type": "prophet",
+      "model_name": "Prophet_20241204_123456",
+      "run_id": "207dc64a1c8b46e7b58c8e4d1cfd0d02",
+      "metrics": {
+        "rmse": "125.43",
+        "mape": "8.32",
+        "r2": "0.92",
+        "cv_mape": "6.09",
+        "cv_mape_std": "0.91"
+      },
+      "validation": [...],
+      "forecast": [...],
+      "covariate_impacts": [...],
+      "is_best": true,
+      "experiment_url": "https://...",
+      "run_url": "https://..."
+    }
+  ],
+  "best_model": "Prophet_20241204_123456",
+  "artifact_uri": "dbfs:/databricks/mlflow/..."
+}
+```
+
+#### POST /api/deploy
+
+Deploy a trained model to a serving endpoint.
+
+**Request:**
+```json
+{
+  "model_name": "main.default.finance_forecast_model",
+  "model_version": "1",
+  "endpoint_name": "finance-forecast-endpoint",
+  "workload_size": "Small",
+  "scale_to_zero": true
+}
+```
+
+#### GET /api/health
+
+Health check endpoint.
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "message": "Backend is operational",
+  "databricks_connected": true,
+  "mlflow_enabled": true
+}
+```
+
+### Analysis Endpoints
+
+*   **`POST /api/analyze`**: Analyze uploaded dataset structure
+*   **`POST /api/insights`**: Generate natural language insights
+*   **`POST /api/executive-summary`**: Generate executive summary with root cause analysis
+
+### Batch & Data Processing
+
+*   **`POST /api/train-batch`**: Train multiple forecasts in parallel (see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md))
+*   **`POST /api/aggregate`**: Convert daily data to weekly/monthly before training
+
+### Endpoint Management
+
+*   **`GET /api/endpoints`**: List all serving endpoints
+*   **`GET /api/endpoints/{name}/status`**: Get endpoint status
+*   **`DELETE /api/endpoints/{name}`**: Delete an endpoint
+
+---
+
+## MLflow Artifacts & Reproducibility
+
+### Logged Datasets
+
+| Artifact Path | Description |
+|--------------|-------------|
+| `datasets/raw/original_timeseries_data.csv` | Original uploaded data |
+| `datasets/raw/promotions_future_features.csv` | Promotions file (if provided) |
+| `datasets/processed/full_merged_data.csv` | Merged data with preprocessing features |
+| `datasets/training/train.csv` | Training split |
+| `datasets/training/eval.csv` | Evaluation/validation split |
+| `datasets/inference/input.csv` | Sample input for endpoint |
+| `datasets/inference/output.csv` | Forecast output |
+| `reproducibility/training_code.py` | Reproducible training script (includes preprocessing) |
+| `reproducibility/preprocessing.py` | Full preprocessing module source code |
+
+### Logged Parameters
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `frequency` | Data frequency | `monthly` |
+| `horizon` | Forecast periods | `12` |
+| `time_column` | Time column name | `date` |
+| `target_column` | Target column name | `sales` |
+| `covariates` | List of covariates | `['Black Friday', 'Christmas']` |
+| `random_seed` | Seed for reproducibility | `42` |
+| `cv_mape` | Cross-validation MAPE | `6.09` |
+| `cv_mape_std` | CV MAPE standard deviation | `0.91` |
+
+### Validation Script
+
+Use the validation script to verify MLflow artifacts:
+
+```bash
+# List recent experiments
+python scripts/validate_mlflow_data.py --list-only
+
+# Validate specific run
+python scripts/validate_mlflow_data.py --run-id <run_id>
+
+# Download artifacts locally
+python scripts/validate_mlflow_data.py --run-id <run_id> --download
+```
+
+The script verifies:
+- Date continuity (train → eval → forecast with no gaps)
+- Random seed logging
+- CV metrics presence
+- Training code accuracy
+
+### Batch Processing Script
+
+Run forecasts for multiple data segments in parallel:
+
+```bash
+# Basic: Forecast all segments
+python scripts/batch_forecast.py --input data.csv --segment-col BUSINESS_SEGMENT
+
+# Specify segments and configuration
+python scripts/batch_forecast.py --input data.csv --segment-col region \
+    --segments "US,EU,APAC" --time-col date --target-col revenue \
+    --horizon 12 --frequency monthly --workers 4
+
+# Use multiple models
+python scripts/batch_forecast.py --input data.csv --segment-col category \
+    --models "prophet,arima,xgboost" --output ./results
+```
+
+Results are saved to the output directory as JSON (detailed) and CSV (summary).
+
+---
+
+## Deployment to Databricks
+
+### Prerequisites
+*   Databricks Workspace with **Unity Catalog** and **Model Serving** enabled
+*   **Databricks Apps** feature enabled
+
+### Deployment Steps
+
+1.  **Install Databricks CLI**:
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+    databricks auth login
+    ```
+
+2.  **Build Frontend**:
+    ```bash
+    npm run build
+    ```
+
+3.  **Deploy App**:
+    ```bash
+    databricks bundle validate
+    databricks bundle deploy
+    ```
+
+4.  **Access App**:
+    Navigate to **Apps** in Databricks workspace and open `finance-forecast-app`.
+
+---
+
+## Model Serving API Usage
+
+### Prophet (Supports Covariates)
+
+#### Mode 1: Simple Forecast
+
+```json
+{
+  "dataframe_records": [
+    {"ds": "2025-01-01", "periods": 12}
+  ]
+}
+```
+
+#### Mode 2: Advanced Forecast (with covariates)
+
+```json
+{
+  "dataframe_records": [
+    {"ds": "2025-11-28", "Black Friday": 1, "Christmas": 0},
+    {"ds": "2025-12-25", "Black Friday": 0, "Christmas": 1}
+  ]
+}
+```
+
+### ARIMA & ETS (Univariate)
+
+```json
+{
+  "dataframe_records": [
+    {"periods": 12, "start_date": "2025-01-01"}
+  ]
+}
+```
+
+### SARIMAX & XGBoost (with covariates)
+
+```json
+{
+  "dataframe_records": [
+    {
+      "periods": 12,
+      "start_date": "2025-01-01",
+      "covariates": {
+        "Black Friday": [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        "Christmas": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Forecast vs Actuals Comparison
+
+### Features
+*   **Flexible File Upload**: Upload actuals in various CSV formats with column selection
+*   **Multi-Segment Data Filtering**: Filter by business segment, region, etc.
+*   **Severity Filter**: Toggle buttons to filter comparison table by error severity (Excellent, Good, Acceptable, Review, Deviation)
+*   **Duplicate Date Handling**: Automatically aggregates (sums) values when actuals file has multiple rows per date
+*   **Context Indicators**: Day of week, weekend flags, active promos/holidays
+*   **Root Cause Analysis**: AI-powered executive summary identifies potential causes
+*   **Export Capability**: Download comparison report as CSV
+
+### Severity Filtering
+
+Filter the comparison table to focus on anomalous forecasts:
+
+| Severity | MAPE Range | Button Color |
+|----------|------------|--------------|
+| Excellent | ≤5% | Green |
+| Good | 5-10% | Blue |
+| Acceptable | 10-15% | Yellow |
+| Review | 15-25% | Orange |
+| Significant Deviation | >25% | Red |
+
+- Click severity buttons to filter (multi-select supported)
+- Each button shows count of periods in that category
+- "Clear filters" link resets to show all periods
+- Buttons are disabled when count is zero
+
+### Understanding Errors
+*   **Under-forecast** (blue): Actual > Predicted
+*   **Over-forecast** (purple): Actual < Predicted
+*   **Bias**: Positive = systematic under-forecasting, Negative = systematic over-forecasting
+
+---
+
+## Batch Training & Comparison
+
+### Overview
+
+The Batch Training feature allows you to train forecasts for multiple segments (e.g., region × product × channel) in a single workflow. Each unique combination of segment values gets its own trained model.
+
+### How to Use Batch Training
+
+1. **Upload and Configure**: Load your data and configure the forecast settings (time column, target, covariates, models, etc.)
+
+2. **Click "Batch Training"**: In the CONFIG step, click the purple "Batch Training" button in the header
+
+3. **Select Segment Columns**: Choose one or more columns that define your segments (e.g., `region`, `product_line`, `channel`)
+   - Excluded columns: time column, target column, and selected covariates
+
+4. **Preview Segments**: View the unique segment combinations and row counts
+
+5. **Train**: Click "Train N Segments" to start sequential training for all segments
+
+6. **View Results**: See MAPE statistics (min, max, mean, median) and per-segment results with status indicators
+
+7. **Export or Compare**:
+   - Export results to CSV
+   - Click "Done - Compare with Actuals" to proceed to batch comparison
+
+### Batch Comparison Scorecard
+
+After batch training, compare forecasts against actuals across all segments:
+
+1. **Upload Actuals**: Upload a CSV file with actuals data that includes the same segment columns
+
+2. **Column Mapping**: Select the date and value columns from your actuals file
+
+3. **Generate Scorecard**: View overall MAPE and status distribution across all segments
+
+4. **Filter & Export**: Filter by status and export the scorecard to CSV
+
+### MAPE Thresholds (Finance Industry Standards)
+
+| Status | MAPE Range | Interpretation |
+|--------|------------|----------------|
+| Excellent | ≤5% | Industry gold standard |
+| Good | 5-10% | Good forecast accuracy |
+| Acceptable | 10-15% | Within acceptable range |
+| Review | 15-25% | Needs investigation |
+| Significant Deviation | >25% | Requires immediate attention |
+
+### CLI Batch Training
+
+For automated pipelines, use the batch training CLI script:
+
+```bash
+python scripts/batch_forecast.py \
+  --data-path data/sales.csv \
+  --segment-cols region,product_line \
+  --time-col date \
+  --target-col revenue \
+  --horizon 12 \
+  --frequency monthly \
+  --models prophet,xgboost
+```
+
+---
+
+## Dependencies
+
+### Python (requirements.txt)
+
+```
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+prophet>=1.1.4
+statsmodels>=0.14.0
+pmdarima>=2.0.3
+xgboost>=2.0.0
+mlflow>=2.9.0
+databricks-sdk>=0.12.0
+pydantic>=2.0.0
+requests>=2.31.0
+holidays>=0.35
+```
+
+### Node.js (package.json)
+
+```json
+{
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0",
+    "lucide-react": "^0.454.0",
+    "papaparse": "^5.4.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.1"
+  }
+}
+```
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+1.  **"Invalid URL 'inherit/...'**: Run locally without `.env.local`. App expects real URLs locally but uses "inherit" on Databricks.
+
+2.  **Model Training Fails**: Ensure enough history (at least 2 full seasonal cycles for ETS/Prophet).
+
+3.  **Deployment Timeouts**: Model serving endpoints can take 5-10 minutes. Check Serving tab.
+
+4.  **XGBoost OpenMP Error on macOS**:
+    ```bash
+    brew install libomp
+    ```
+
+5.  **Port Already in Use**:
+    ```bash
+    ./restart-clean.sh
+    # or manually:
+    lsof -ti:8000 | xargs kill -9
+    lsof -ti:3000 | xargs kill -9
+    ```
+
+6.  **No Matching Dates in Actuals Comparison**: Ensure actuals dates overlap with forecast horizon.
+
+7.  **MLflow Connection Error**: Verify DATABRICKS_HOST and DATABRICKS_TOKEN in `.env.local`.
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Frontend** | React 19 + TypeScript + Vite | Interactive UI |
+| **Backend** | FastAPI + Uvicorn | High-performance API |
+| **ML Engine** | Prophet, Statsmodels, pmdarima, XGBoost | Forecasting Algorithms |
+| **Tracking** | MLflow | Experiment Management |
+| **Registry** | Unity Catalog | Model Governance |
+| **Platform** | Databricks Apps | Hosting & Compute |
+| **AI** | Databricks Foundation Models | Natural Language Analysis |
+
+---
+
+## Recent Updates (December 2024)
+
+### New Features
+- **Automatic Feature Preprocessing**: YoY lag features (`lag_364`, `lag_365`) and promo-derived features for improved holiday forecasting
+- **Holiday/Weekend Forecasting Enhancement**: System automatically derives `promo_window`, `is_promo_weekend`, and `any_promo_active` features
+- **Batch Training with Segment Exclusion**: Click on segments to exclude them from training before running
+- **Real Actual vs Forecast MAPE**: BatchComparison now calculates true MAPE from uploaded actuals (not just training MAPE)
+- **Bias Calculation**: Shows forecast bias direction (under-forecast vs over-forecast) in comparison scorecard
+- **Country Holiday Support**: All models (Prophet, SARIMAX, XGBoost) now use country-specific holiday calendars
+- **Auto-open Comparison**: After batch training completes, comparison modal opens automatically
+- **localStorage Persistence**: Batch results survive page refresh - no more losing 1-hour training sessions
+- **Confirmation Dialogs**: Warning before closing batch training with unsaved results
+
+### Bug Fixes
+- Fixed holiday under-prediction by adding same-week-last-year features (`lag_364`)
+- Fixed empty chart bug when "All (Aggregated)" filter was selected
+- Fixed MLflow `artifact_path` deprecation warning (now uses `name`)
+- Dynamic grouping fields now reset properly when loading new files
+
+### Infrastructure
+- New `backend/preprocessing.py` module for feature engineering
+- Preprocessing code logged to MLflow for 100% reproducibility
+- Improved MLflow experiment organization with batch_id grouping
+- Added segment-level error isolation in batch training
+
+---
+
+## Pending Work / Future Enhancements
+
+| Feature | Priority | Status |
+|---------|----------|--------|
+| **SQL Query Import** | Medium | Not started - currently CSV upload only |
+| **Auto-ingestion Scheduling** | Low | Documented workaround using Databricks Workflows |
+| **Executive Summary Customization** | Low | System prompt editable in code, not exposed in UI |
+| **Test Coverage** | High | Only 1 test file exists (~15% coverage) |
+| **NeuralProphet Model** | Low | Template documented in DEVELOPER_GUIDE |
+
+---
+
+**Built for Finance Teams using Databricks**
+
+**Created by Debu Sinha**

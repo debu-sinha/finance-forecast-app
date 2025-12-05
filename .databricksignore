@@ -1,0 +1,17 @@
+.git/
+.gitignore
+.vscode/
+node_modules/
+.vite/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.DS_Store
+*.log
+.env
+.env.local
+mlruns/
+.pytest_cache/
+*.png
+.databricks/

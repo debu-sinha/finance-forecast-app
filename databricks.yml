@@ -1,0 +1,56 @@
+# Databricks bundle configuration
+bundle:
+  name: finance-forecast-app
+
+# Application resource definition
+resources:
+  apps:
+    finance-forecast-app:
+      name: finance-forecast-app
+      description: "Finance Forecasting Platform with MLflow and Model Serving"
+      command: 
+        - /bin/bash
+        - -c
+        - |
+          pip install -r requirements.txt && \
+          python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
+      
+      env:
+        - name: MLFLOW_TRACKING_URI
+          value: "databricks"
+        - name: MLFLOW_EXPERIMENT_NAME
+          value: "/Users/${bundle.deployer.user_name}/finance-forecasting"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: MLFLOW_MAX_WORKERS
+          value: "2"
+        - name: PROPHET_MAX_COMBINATIONS
+          value: "3"
+        - name: ARIMA_MAX_COMBINATIONS
+          value: "6"
+        - name: ETS_MAX_COMBINATIONS
+          value: "4"
+        - name: UC_CATALOG_NAME
+          value: "main"
+        - name: UC_SCHEMA_NAME
+          value: "default"
+        - name: UC_MODEL_NAME_ONLY
+          value: "finance_forecast_model"
+        - name: UC_MODEL_NAME
+          value: "main.default.finance_forecast_model"
+
+      permissions:
+        - level: CAN_MANAGE
+          user_name: ${bundle.deployer.user_name}
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: ${workspace_host}
+
+  prod:
+    mode: production
+    workspace:
+      host: ${workspace_host}
