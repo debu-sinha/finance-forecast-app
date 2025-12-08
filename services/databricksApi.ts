@@ -171,80 +171,94 @@ export interface BatchTrainRequest {
 
 export const trainBatchOnBackend = async (
     requests: BatchTrainRequest[],
-    maxWorkers: number = 2,
-    onProgress?: (completed: number, total: number, latestResult?: any) => void
+    maxWorkers: number = 4,
+    onProgress?: (completed: number, total: number, latestResult?: any) => void,
+    signal?: AbortSignal
 ): Promise<BatchTrainingSummary> => {
     const startTime = Date.now();
-    const results: BatchTrainingResult[] = [];
-    let successful = 0;
-    let failed = 0;
 
     // Generate a unique batch ID for MLflow tracking
-    // This ensures all segments from this batch are grouped in the same experiment
     const batchId = `${new Date().toISOString().split('T')[0]}_${Date.now().toString(36)}`;
     const totalSegments = requests.length;
 
-    console.log(`Starting batch training: ${totalSegments} segments, batch_id=${batchId}`);
+    console.log(`Starting batch training: ${totalSegments} segments, batch_id=${batchId}, max_workers=${maxWorkers}`);
 
-    // Process segments sequentially in the frontend to show progress
-    // The backend /api/train endpoint handles each segment
-    for (let i = 0; i < requests.length; i++) {
-        const req = requests[i];
+    // Prepare the payload for the parallel backend endpoint
+    const trainRequests = requests.map((req, i) => {
         const segmentId = Object.entries(req.filters)
             .map(([k, v]) => `${k}=${v}`)
             .join(' | ');
 
-        try {
-            const payload = {
-                data: req.data,
-                time_col: req.timeCol,
-                target_col: req.targetCol,
-                covariates: req.covariates,
-                horizon: req.horizon,
-                frequency: req.frequency,
-                seasonality_mode: req.seasonalityMode,
-                regressor_method: req.regressorMethod,
-                models: req.models,
-                catalog_name: req.catalogName || 'main',
-                schema_name: req.schemaName || 'default',
-                model_name: req.modelName || 'finance_forecast_model',
-                country: req.country || 'US',
-                filters: req.filters,
-                random_seed: req.randomSeed || 42,
-                // Batch context for MLflow tracking
-                batch_id: batchId,
-                batch_segment_id: segmentId,
-                batch_segment_index: i + 1,
-                batch_total_segments: totalSegments
-            };
+        return {
+            data: req.data,
+            time_col: req.timeCol,
+            target_col: req.targetCol,
+            covariates: req.covariates,
+            horizon: req.horizon,
+            frequency: req.frequency,
+            seasonality_mode: req.seasonalityMode,
+            regressor_method: req.regressorMethod,
+            models: req.models,
+            catalog_name: req.catalogName || 'main',
+            schema_name: req.schemaName || 'default',
+            model_name: req.modelName || 'finance_forecast_model',
+            country: req.country || 'US',
+            filters: req.filters,
+            random_seed: req.randomSeed || 42,
+            // Batch context for MLflow tracking
+            batch_id: batchId,
+            batch_segment_id: segmentId,
+            batch_segment_index: i + 1,
+            batch_total_segments: totalSegments
+        };
+    });
 
-            const response = await fetch(`${API_BASE}/train`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
+    const payload = {
+        requests: trainRequests,
+        max_workers: maxWorkers
+    };
 
-            if (!response.ok) {
-                const text = await response.text();
-                let errDetail = "Training failed";
-                try {
-                    const json = JSON.parse(text);
-                    errDetail = json.detail || errDetail;
-                } catch (e) {
-                    errDetail = text || `Error ${response.status}`;
-                }
-                throw new Error(errDetail);
+    try {
+        const response = await fetch(`${API_BASE}/train-batch`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: signal
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            let errDetail = "Batch training failed";
+            try {
+                const json = JSON.parse(text);
+                errDetail = json.detail || errDetail;
+            } catch (e) {
+                errDetail = text || `Error ${response.status}`;
+            }
+            throw new Error(errDetail);
+        }
+
+        const backendResponse = await response.json();
+
+        // Transform backend results to our internal format
+        const results: BatchTrainingResult[] = backendResponse.results.map((item: any) => {
+            if (item.status === 'error') {
+                return {
+                    segmentId: item.segment_id || 'unknown',
+                    filters: item.filters || {},
+                    status: 'error',
+                    error: item.error || 'Unknown error'
+                };
             }
 
-            const backendResponse = await response.json();
+            // Success case
+            const trainRes = item.result;
+            const bestModel = trainRes.models?.find((m: any) => m.is_best) || trainRes.models?.[0];
 
-            // Find best model from response
-            const bestModel = backendResponse.models?.find((m: any) => m.is_best) || backendResponse.models?.[0];
-
-            // Transform backend response to ForecastResult format for comparison
+            // Transform to ForecastResult format
             const forecastResult: any = {
-                history: [],
-                results: backendResponse.models?.map((m: any) => ({
+                history: trainRes.history || [],  // Use history from backend response
+                results: trainRes.models?.map((m: any) => ({
                     modelType: m.model_type,
                     modelName: m.model_name,
                     isBest: m.is_best,
@@ -259,12 +273,12 @@ export const trainBatchOnBackend = async (
                 pythonCode: ''
             };
 
-            results.push({
-                segmentId,
-                filters: req.filters,
+            return {
+                segmentId: item.segment_id,
+                filters: item.filters,
                 status: 'success',
-                result: forecastResult,  // Store full forecast result for comparison
-                bestModel: bestModel?.model_name || backendResponse.best_model,
+                result: forecastResult,
+                bestModel: bestModel?.model_name || trainRes.best_model,
                 metrics: bestModel ? {
                     mape: bestModel.metrics.mape,
                     rmse: bestModel.metrics.rmse,
@@ -272,58 +286,140 @@ export const trainBatchOnBackend = async (
                     cv_mape: bestModel.metrics.cv_mape
                 } : undefined,
                 runId: bestModel?.run_id,
-                experimentUrl: bestModel?.experiment_url  // Store experiment URL for linking
-            });
-            successful++;
+                experimentUrl: bestModel?.experiment_url
+            };
+        });
 
-            if (onProgress) {
-                onProgress(i + 1, requests.length, results[results.length - 1]);
-            }
+        // Calculate MAPE stats
+        const mapes = results
+            .filter(r => r.status === 'success' && r.metrics?.mape)
+            .map(r => parseFloat(r.metrics!.mape));
 
-        } catch (error: any) {
-            results.push({
-                segmentId,
-                filters: req.filters,
-                status: 'error',
-                error: error.message || 'Unknown error'
-            });
-            failed++;
-
-            if (onProgress) {
-                onProgress(i + 1, requests.length, results[results.length - 1]);
-            }
+        let mapeStats = undefined;
+        if (mapes.length > 0) {
+            const sorted = [...mapes].sort((a, b) => a - b);
+            mapeStats = {
+                min: Math.min(...mapes),
+                max: Math.max(...mapes),
+                mean: mapes.reduce((a, b) => a + b, 0) / mapes.length,
+                median: sorted[Math.floor(sorted.length / 2)]
+            };
         }
+
+        console.log(`Batch training complete: ${backendResponse.successful}/${backendResponse.total_requests} successful`);
+
+        return {
+            totalSegments: backendResponse.total_requests,
+            successful: backendResponse.successful,
+            failed: backendResponse.failed,
+            results,
+            startTime,
+            endTime: Date.now(),
+            mapeStats,
+            batchId,
+            experimentName: `finance-forecasting-batch-${batchId}`
+        };
+
+    } catch (error: any) {
+        if (error.name === 'AbortError') {
+            console.log('Batch training cancelled by user');
+            throw error;
+        }
+        console.error('Batch training error:', error);
+        throw error;
     }
+};
 
-    // Calculate MAPE statistics
-    const mapes = results
-        .filter(r => r.status === 'success' && r.metrics?.mape)
-        .map(r => parseFloat(r.metrics!.mape));
+// ==========================================
+// BATCH DEPLOYMENT API
+// ==========================================
 
-    let mapeStats = undefined;
-    if (mapes.length > 0) {
-        const sorted = [...mapes].sort((a, b) => a - b);
-        mapeStats = {
-            min: Math.min(...mapes),
-            max: Math.max(...mapes),
-            mean: mapes.reduce((a, b) => a + b, 0) / mapes.length,
-            median: sorted[Math.floor(sorted.length / 2)]
+export interface BatchDeployRequest {
+    segments: Array<{
+        segmentId: string;
+        filters: Record<string, any>;
+        modelVersion: string;
+        runId?: string;
+    }>;
+    endpointName: string;
+    catalogName: string;
+    schemaName: string;
+    modelName: string;
+}
+
+export interface BatchDeployResponse {
+    status: 'success' | 'error';
+    message: string;
+    endpointName?: string;
+    endpointUrl?: string;
+    deployedSegments?: number;
+    routerModelVersion?: string;
+}
+
+export const deployBatchModels = async (
+    batchResults: BatchTrainingSummary,
+    endpointName: string,
+    catalogName: string = 'main',
+    schemaName: string = 'default',
+    modelName: string = 'finance_forecast_model'
+): Promise<BatchDeployResponse> => {
+    // Collect all successful segments with their model versions
+    const segments = batchResults.results
+        .filter(r => r.status === 'success' && r.result)
+        .map(r => {
+            // Find the best model's registered version
+            const bestModel = r.result?.results?.find(m => m.isBest) || r.result?.results?.[0];
+            return {
+                segmentId: r.segmentId,
+                filters: r.filters,
+                modelVersion: (bestModel as any)?.registeredVersion || 'latest',
+                runId: r.runId
+            };
+        });
+
+    if (segments.length === 0) {
+        return {
+            status: 'error',
+            message: 'No successful models to deploy'
         };
     }
 
-    console.log(`Batch training complete: ${successful}/${totalSegments} successful, batch_id=${batchId}`);
-
-    return {
-        totalSegments: requests.length,
-        successful,
-        failed,
-        results,
-        startTime,
-        endTime: Date.now(),
-        mapeStats,
-        batchId,
-        experimentName: `finance-forecasting-batch-${batchId}`
+    // Convert to snake_case for backend API
+    const payload = {
+        segments: segments.map(s => ({
+            segment_id: s.segmentId,
+            filters: s.filters,
+            model_version: s.modelVersion,
+            run_id: s.runId
+        })),
+        endpoint_name: endpointName,
+        catalog_name: catalogName,
+        schema_name: schemaName,
+        model_name: modelName
     };
+
+    const response = await fetch(`${API_BASE}/deploy-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        let errDetail = "Batch deployment failed";
+        try {
+            const json = JSON.parse(text);
+            errDetail = json.detail || errDetail;
+        } catch (e) {
+            errDetail = text || `Error ${response.status}`;
+        }
+        return {
+            status: 'error',
+            message: errDetail
+        };
+    }
+
+    return await response.json();
 };
 
 // Export batch results to CSV

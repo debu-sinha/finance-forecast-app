@@ -16,6 +16,37 @@ import {
 } from 'recharts';
 import { DataRow } from '../types';
 
+/**
+ * Parse a date string without timezone issues.
+ * Adding 'T12:00:00' ensures we're at noon UTC, avoiding midnight boundary issues
+ * that can cause dates to shift when displayed in local timezone.
+ */
+const parseDate = (dateStr: string): Date => {
+  if (!dateStr) return new Date(NaN);
+  // If it's already a full ISO string with time, use as-is
+  if (dateStr.includes('T')) {
+    return new Date(dateStr);
+  }
+  // For date-only strings (YYYY-MM-DD), add noon time to avoid timezone boundary issues
+  return new Date(dateStr + 'T12:00:00');
+};
+
+/**
+ * Format a date for display, preserving the original date without timezone shift
+ */
+const formatDateForDisplay = (dateStr: string, format: 'short' | 'full' = 'short'): string => {
+  try {
+    const d = parseDate(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    if (format === 'short') {
+      return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+    }
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch (e) {
+    return dateStr;
+  }
+};
+
 // Columns to exclude from event/holiday detection (system columns)
 const EXCLUDED_COLUMNS = [
   'ds', 'y', 'yhat', 'yhat_lower', 'yhat_upper',
@@ -58,10 +89,10 @@ const CustomTooltip = ({ active, payload, label, holidayColumns }: any) => {
     return val === 1 || val === '1' || val === true || val === 'true';
   });
 
-  // Format date
+  // Format date using timezone-safe parsing
   let formattedDate = label;
   try {
-    const d = new Date(label);
+    const d = parseDate(label);
     if (!isNaN(d.getTime())) {
       formattedDate = d.toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
     }
@@ -257,7 +288,7 @@ export const ResultsChart: React.FC<ResultsChartProps> = ({
     // But let's make sure we extract them properly if they are in the row
 
     return Array.from(dataMap.values()).sort((a, b) =>
-      new Date(a[timeCol]).getTime() - new Date(b[timeCol]).getTime()
+      parseDate(a[timeCol]).getTime() - parseDate(b[timeCol]).getTime()
     );
   }, [history, validation, forecast, timeCol, targetCol, showForecast, comparisonForecasts, covariates]);
 
@@ -421,7 +452,7 @@ export const ResultsChart: React.FC<ResultsChartProps> = ({
             minTickGap={40}
             tickFormatter={(str) => {
               try {
-                const d = new Date(str);
+                const d = parseDate(str);
                 if (isNaN(d.getTime())) return str;
                 return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
               } catch (e) { return str; }
@@ -548,7 +579,7 @@ export const ResultsChart: React.FC<ResultsChartProps> = ({
               fill="#f9fafb"
               tickFormatter={(str) => {
                 try {
-                  const d = new Date(str);
+                  const d = parseDate(str);
                   if (isNaN(d.getTime())) return '';
                   return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
                 } catch (e) { return ''; }

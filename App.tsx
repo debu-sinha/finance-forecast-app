@@ -38,6 +38,7 @@ import { analyzeDataset, generateForecastInsights } from './services/analysisSer
 import { trainModelOnBackend, deployModel, generateExecutiveSummary, ActualsComparisonSummary, BatchTrainRequest, trainBatchOnBackend } from './services/databricksApi';
 import { BatchTraining } from './components/BatchTraining';
 import { BatchComparison } from './components/BatchComparison';
+import { BatchResultsViewer } from './components/BatchResultsViewer';
 import { BatchTrainingSummary } from './types';
 import { NotebookCell } from './components/NotebookCell';
 import { ResultsChart } from './components/ResultsChart';
@@ -172,9 +173,9 @@ const UserInstructions = () => {
                     <div>• <span className="text-green-700">value</span> - Target to forecast (numeric)</div>
                     <div className="mt-2 font-bold text-gray-600">Example:</div>
                     <div className="bg-white p-1 rounded mt-1">
-                      date,revenue,region<br/>
-                      2024-01-01,15000,North<br/>
-                      2024-01-08,16200,North<br/>
+                      date,revenue,region<br />
+                      2024-01-01,15000,North<br />
+                      2024-01-08,16200,North<br />
                       2024-01-15,14800,North
                     </div>
                   </div>
@@ -193,9 +194,9 @@ const UserInstructions = () => {
                     <div>• <span className="text-green-700">features</span> - Binary (0/1) or numeric values</div>
                     <div className="mt-2 font-bold text-gray-600">Example:</div>
                     <div className="bg-white p-1 rounded mt-1">
-                      date,promo,holiday,event<br/>
-                      2024-01-01,0,1,0<br/>
-                      2024-01-08,1,0,0<br/>
+                      date,promo,holiday,event<br />
+                      2024-01-01,0,1,0<br />
+                      2024-01-08,1,0,0<br />
                       2024-01-15,0,0,1
                     </div>
                     <div className="mt-1 text-blue-600 italic">Used by: Prophet, SARIMAX, XGBoost</div>
@@ -215,8 +216,8 @@ const UserInstructions = () => {
                     <div>• <span className="text-green-700">value column</span> - Any numeric column (you'll select which one)</div>
                     <div className="mt-2 font-bold text-gray-600">Example:</div>
                     <div className="bg-white p-1 rounded mt-1">
-                      DAY,TOT_VOL,TOT_SUB,REGION<br/>
-                      11/19/25,816485,20207713,North<br/>
+                      DAY,TOT_VOL,TOT_SUB,REGION<br />
+                      11/19/25,816485,20207713,North<br />
                       11/18/25,1973078,46131161,North
                     </div>
                     <div className="mt-1 text-green-600 italic">You can select which columns to use after upload</div>
@@ -366,12 +367,32 @@ const App = () => {
     }
   });
   const [showBatchComparison, setShowBatchComparison] = useState(false);
+  const [showBatchResultsViewer, setShowBatchResultsViewer] = useState(false);
 
   // Persist batch results to localStorage
   useEffect(() => {
     if (batchTrainingSummary) {
-      localStorage.setItem('batchTrainingSummary', JSON.stringify(batchTrainingSummary));
-      localStorage.setItem('batchSegmentCols', JSON.stringify(batchSegmentCols));
+      // Create a lightweight version for storage to prevent quota limits (5MB)
+      // We strip the heavy forecast/history arrays and keep only metrics/metadata
+      const lightweightSummary: BatchTrainingSummary = {
+        ...batchTrainingSummary,
+        results: batchTrainingSummary.results.map(r => ({
+          ...r,
+          result: r.result ? {
+            ...r.result,
+            history: [], // Strip heavy data
+            forecast: [],
+            validation: []
+          } : undefined
+        }))
+      };
+
+      try {
+        localStorage.setItem('batchTrainingSummary', JSON.stringify(lightweightSummary));
+        localStorage.setItem('batchSegmentCols', JSON.stringify(batchSegmentCols));
+      } catch (e) {
+        console.error('Failed to save batch results to localStorage:', e);
+      }
     }
   }, [batchTrainingSummary, batchSegmentCols]);
 
@@ -414,6 +435,7 @@ const App = () => {
     setBatchTrainingSummary(null);
     setBatchSegmentCols([]);
     setShowBatchComparison(false);
+    setShowBatchResultsViewer(false);
     localStorage.removeItem('batchTrainingSummary');
     localStorage.removeItem('batchSegmentCols');
     // Reset file inputs
@@ -1317,9 +1339,13 @@ const App = () => {
       errors.push('No data available. Please upload a CSV file first.');
     }
 
-    // Check minimum data points (at least 2x horizon for proper validation)
-    if (aggregatedData.length > 0 && aggregatedData.length < horizon * 2) {
-      errors.push(`Insufficient data: ${aggregatedData.length} rows available, but at least ${horizon * 2} rows recommended for ${horizon}-period forecast.`);
+    // Check minimum data points - need more rows than horizon for meaningful train/test split
+    // Allow training if data >= horizon + 10, but warn if less than 2x horizon
+    if (aggregatedData.length > 0 && aggregatedData.length <= horizon) {
+      errors.push(`Insufficient data: ${aggregatedData.length} rows available, but need more than ${horizon} rows for a ${horizon}-period forecast.`);
+    } else if (aggregatedData.length > 0 && aggregatedData.length < horizon + 10) {
+      // Still allow but warn - this is marginal
+      console.warn(`⚠️ Limited data: ${aggregatedData.length} rows for ${horizon}-period forecast. Consider reducing horizon for better model accuracy.`);
     }
 
     // Check for missing values in target column
@@ -1349,16 +1375,21 @@ const App = () => {
   };
 
   const handleTrainModel = async () => {
+    console.log('🚀 handleTrainModel called!');
+
     // Clear previous errors
     setTrainingError(null);
     setValidationErrors([]);
 
     // Validate before training
     const errors = validateTrainingData();
+    console.log('📋 Validation errors:', errors);
     if (errors.length > 0) {
       setValidationErrors(errors);
+      console.log('❌ Training blocked by validation errors');
       return;
     }
+    console.log('✅ Validation passed, starting training...');
 
     setStep(AppStep.TRAINING);
     setIsTraining(true);
@@ -1572,6 +1603,7 @@ const App = () => {
 
       setTrainingProgress(100);
       setTrainingStatus('Generating Executive Summary...');
+      console.log('🎯 All models trained, generating executive summary...');
 
       // Generate executive summary
       setIsGeneratingSummary(true);
@@ -1598,18 +1630,22 @@ const App = () => {
           frequency
         );
 
+        console.log('✅ Executive summary generated:', summary?.substring(0, 100) + '...');
         setTrainingResult(prev => prev ? {
           ...prev,
           executiveSummary: summary
         } : null);
       } catch (error) {
-        console.error('Failed to generate executive summary:', error);
+        console.error('❌ Failed to generate executive summary:', error);
       } finally {
         setIsGeneratingSummary(false);
+        console.log('🔚 Executive summary generation finished, transitioning to results in 500ms...');
       }
 
       setTimeout(() => {
+        console.log('🚀 Transitioning to RESULTS step now');
         setIsTraining(false);
+        setTrainingStatus('');  // Clear the status when transitioning to results
         setStep(AppStep.RESULTS);
       }, 500);
 
@@ -1706,13 +1742,23 @@ const App = () => {
             <span className="px-2 py-0.5 bg-gray-100 text-gray-500 text-xs rounded border border-gray-200">Python (Databricks App)</span>
             {step === AppStep.RESULTS && <span className="px-2 py-0.5 bg-green-50 text-green-600 text-xs rounded border border-green-200 flex items-center"><Check className="w-3 h-3 mr-1" /> Saved to MLflow</span>}
             {batchTrainingSummary && (
-              <button
-                onClick={() => setShowBatchComparison(true)}
-                className="px-2 py-0.5 bg-purple-50 text-purple-600 text-xs rounded border border-purple-200 flex items-center hover:bg-purple-100"
-              >
-                <Layers className="w-3 h-3 mr-1" />
-                Batch Results ({batchTrainingSummary.successful}/{batchTrainingSummary.totalSegments} segments)
-              </button>
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => setShowBatchResultsViewer(true)}
+                  className="px-2 py-0.5 bg-purple-50 text-purple-600 text-xs rounded border border-purple-200 flex items-center hover:bg-purple-100"
+                >
+                  <Layers className="w-3 h-3 mr-1" />
+                  View Forecasts ({batchTrainingSummary.successful}/{batchTrainingSummary.totalSegments})
+                </button>
+                <button
+                  onClick={() => setShowBatchComparison(true)}
+                  className="px-2 py-0.5 bg-emerald-50 text-emerald-600 text-xs rounded border border-emerald-200 flex items-center hover:bg-emerald-100"
+                  title="Compare batch forecasts against actual values"
+                >
+                  <Target className="w-3 h-3 mr-1" />
+                  Compare Actuals
+                </button>
+              </div>
             )}
             <button onClick={resetApp} className="text-xs text-red-500 hover:text-red-700 underline ml-4 font-medium">Reset All</button>
           </div>
@@ -1722,11 +1768,10 @@ const App = () => {
               <div className="relative group">
                 <button
                   onClick={() => setShowBatchTraining(true)}
-                  className={`px-4 py-1.5 rounded text-sm font-medium flex items-center transition-colors ${
-                    groupCols.length > 0
+                  className={`px-4 py-1.5 rounded text-sm font-medium flex items-center transition-colors ${groupCols.length > 0
                       ? 'bg-purple-600 hover:bg-purple-700 text-white ring-2 ring-purple-300 ring-offset-1'
                       : 'bg-purple-600 hover:bg-purple-700 text-white'
-                  }`}
+                    }`}
                 >
                   <Layers className="w-4 h-4 mr-2" />
                   Batch Training
@@ -1928,8 +1973,23 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       <div><label className="block text-xs text-gray-500 mb-1">Random Seed</label><input type="number" className="w-full bg-white border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-900" value={randomSeed} onChange={(e) => setRandomSeed(parseInt(e.target.value) || 42)} placeholder="42" /></div>
                       <div className="flex space-x-3">
                         <div className="flex-1"><label className="block text-xs text-gray-500 mb-1">Freq</label><select className="w-full bg-white border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-900" value={frequency} onChange={(e) => setFrequency(e.target.value as any)}><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="daily">Daily</option></select></div>
-                        <div className="flex-1"><label className="block text-xs text-gray-500 mb-1">Horizon</label><input type="number" className="w-full bg-white border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-900" value={horizon} onChange={(e) => setHorizon(parseInt(e.target.value))} /></div>
+                        <div className="flex-1">
+                          <label className="block text-xs text-gray-500 mb-1">Horizon</label>
+                          <input type="number" className={`w-full bg-white border rounded-md px-3 py-2 text-sm text-gray-900 ${aggregatedData.length > 0 && horizon >= aggregatedData.length ? 'border-red-400 bg-red-50' : 'border-gray-300'}`} value={horizon} onChange={(e) => setHorizon(parseInt(e.target.value) || 12)} min={1} />
+                        </div>
                       </div>
+                      {aggregatedData.length > 0 && horizon >= aggregatedData.length && (
+                        <div className="flex items-center gap-2 p-2 bg-red-50 border border-red-200 rounded-md text-xs text-red-700">
+                          <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                          <span>Horizon ({horizon}) must be less than available data ({aggregatedData.length} rows). Reduce horizon to train.</span>
+                        </div>
+                      )}
+                      {aggregatedData.length > 0 && horizon < aggregatedData.length && horizon > aggregatedData.length / 2 && (
+                        <div className="flex items-center gap-2 p-2 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-700">
+                          <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                          <span>Consider reducing horizon. Recommended: &lt;{Math.floor(aggregatedData.length / 2)} periods for {aggregatedData.length} rows.</span>
+                        </div>
+                      )}
                       <div>
                         <label className="block text-xs text-gray-500 mb-1">Seasonality Mode</label>
                         <select
@@ -2172,20 +2232,18 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       {modelProgress.map((mp, idx) => (
                         <div
                           key={mp.model}
-                          className={`relative p-3 rounded-lg border transition-all duration-300 ${
-                            mp.status === 'completed' ? 'bg-green-50 border-green-200' :
-                            mp.status === 'training' ? 'bg-blue-50 border-blue-300 ring-2 ring-blue-200' :
-                            mp.status === 'failed' ? 'bg-red-50 border-red-200' :
-                            'bg-gray-50 border-gray-200'
-                          }`}
+                          className={`relative p-3 rounded-lg border transition-all duration-300 ${mp.status === 'completed' ? 'bg-green-50 border-green-200' :
+                              mp.status === 'training' ? 'bg-blue-50 border-blue-300 ring-2 ring-blue-200' :
+                                mp.status === 'failed' ? 'bg-red-50 border-red-200' :
+                                  'bg-gray-50 border-gray-200'
+                            }`}
                         >
                           <div className="flex items-center justify-between mb-1">
-                            <span className={`text-sm font-semibold ${
-                              mp.status === 'completed' ? 'text-green-700' :
-                              mp.status === 'training' ? 'text-blue-700' :
-                              mp.status === 'failed' ? 'text-red-700' :
-                              'text-gray-500'
-                            }`}>
+                            <span className={`text-sm font-semibold ${mp.status === 'completed' ? 'text-green-700' :
+                                mp.status === 'training' ? 'text-blue-700' :
+                                  mp.status === 'failed' ? 'text-red-700' :
+                                    'text-gray-500'
+                              }`}>
                               {mp.displayName}
                             </span>
                             {mp.status === 'completed' && (
@@ -2389,13 +2447,12 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         {trainingResult.results.length} model{trainingResult.results.length !== 1 ? 's' : ''} trained
                       </div>
                     </div>
-                    <div className={`grid gap-3 ${
-                      trainingResult.results.length === 1 ? 'grid-cols-1 max-w-md' :
-                      trainingResult.results.length === 2 ? 'grid-cols-2' :
-                      trainingResult.results.length <= 3 ? 'grid-cols-3' :
-                      trainingResult.results.length === 4 ? 'grid-cols-2 md:grid-cols-4' :
-                      'grid-cols-2 md:grid-cols-3 lg:grid-cols-5'
-                    }`}>
+                    <div className={`grid gap-3 ${trainingResult.results.length === 1 ? 'grid-cols-1 max-w-md' :
+                        trainingResult.results.length === 2 ? 'grid-cols-2' :
+                          trainingResult.results.length <= 3 ? 'grid-cols-3' :
+                            trainingResult.results.length === 4 ? 'grid-cols-2 md:grid-cols-4' :
+                              'grid-cols-2 md:grid-cols-3 lg:grid-cols-5'
+                      }`}>
                       {trainingResult.results.map((result) => (
                         <div
                           key={result.modelType}
@@ -2435,9 +2492,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                               )}
                             </div>
                             {covariates.length > 0 && (
-                              <div className={`text-[10px] mt-1 ${
-                                ['prophet', 'sarimax', 'xgboost'].includes(result.modelType) ? 'text-green-600' : 'text-orange-500'
-                              }`}>
+                              <div className={`text-[10px] mt-1 ${['prophet', 'sarimax', 'xgboost'].includes(result.modelType) ? 'text-green-600' : 'text-orange-500'
+                                }`}>
                                 {['prophet', 'sarimax', 'xgboost'].includes(result.modelType) ? '✓ Uses covariates' : '⚠ Covariates ignored'}
                               </div>
                             )}
@@ -2841,21 +2897,38 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
 
                         {/* Summary Metrics */}
                         <div className="grid grid-cols-4 gap-3">
-                          <div className="bg-white border rounded p-3 text-center">
-                            <div className="text-xs text-gray-500 uppercase">Overall MAPE</div>
-                            <div className={`text-xl font-bold ${
-                              actualsComparison.overallMAPE <= 5 ? 'text-green-600' :
-                              actualsComparison.overallMAPE <= 10 ? 'text-blue-600' :
-                              actualsComparison.overallMAPE <= 15 ? 'text-yellow-600' :
-                              actualsComparison.overallMAPE <= 25 ? 'text-orange-600' : 'text-red-600'
-                            }`}>
+                          <div className="bg-white border rounded p-3 text-center relative group cursor-help">
+                            <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
+                              Overall MAPE
+                              <Info className="w-3 h-3 ml-1 text-gray-400" />
+                            </div>
+                            <div className={`text-xl font-bold ${actualsComparison.overallMAPE <= 5 ? 'text-green-600' :
+                                actualsComparison.overallMAPE <= 10 ? 'text-blue-600' :
+                                  actualsComparison.overallMAPE <= 15 ? 'text-yellow-600' :
+                                    actualsComparison.overallMAPE <= 25 ? 'text-orange-600' : 'text-red-600'
+                              }`}>
                               {actualsComparison.overallMAPE.toFixed(2)}%
                             </div>
+                            <div className="text-[10px] text-gray-400">Forecast vs Actuals</div>
+                            <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
+                              <strong>Actuals Comparison MAPE</strong><br />
+                              Error calculated by comparing the model's predictions against actual values you uploaded. This shows real-world forecast accuracy.
+                              <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
+                            </div>
                           </div>
-                          <div className="bg-white border rounded p-3 text-center">
-                            <div className="text-xs text-gray-500 uppercase">RMSE</div>
+                          <div className="bg-white border rounded p-3 text-center relative group cursor-help">
+                            <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
+                              RMSE
+                              <Info className="w-3 h-3 ml-1 text-gray-400" />
+                            </div>
                             <div className="text-xl font-bold text-gray-800">
                               {actualsComparison.overallRMSE.toFixed(2)}
+                            </div>
+                            <div className="text-[10px] text-gray-400">Forecast vs Actuals</div>
+                            <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
+                              <strong>Actuals Comparison RMSE</strong><br />
+                              Root mean square error between predictions and actual values you uploaded. Lower is better.
+                              <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
                             </div>
                           </div>
                           <div className="bg-white border rounded p-3 text-center">
@@ -2943,12 +3016,23 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                               </div>
                             )}
                           </div>
-                          <div className="flex justify-between mt-1 text-[10px] text-gray-500">
-                            <span>Excellent ≤5%</span>
-                            <span>Good 5-10%</span>
-                            <span>Acceptable 10-15%</span>
-                            <span>Review 15-25%</span>
-                            <span>Deviation &gt;25%</span>
+                          {/* Only show legend items that have data */}
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-[10px]">
+                            {actualsComparison.excellentCount > 0 && (
+                              <span className="flex items-center"><span className="w-2 h-2 rounded-full bg-green-500 mr-1"></span>Excellent ≤5%</span>
+                            )}
+                            {actualsComparison.goodCount > 0 && (
+                              <span className="flex items-center"><span className="w-2 h-2 rounded-full bg-blue-500 mr-1"></span>Good 5-10%</span>
+                            )}
+                            {actualsComparison.acceptableCount > 0 && (
+                              <span className="flex items-center"><span className="w-2 h-2 rounded-full bg-yellow-500 mr-1"></span>Acceptable 10-15%</span>
+                            )}
+                            {actualsComparison.reviewCount > 0 && (
+                              <span className="flex items-center"><span className="w-2 h-2 rounded-full bg-orange-500 mr-1"></span>Review 15-25%</span>
+                            )}
+                            {actualsComparison.deviationCount > 0 && (
+                              <span className="flex items-center"><span className="w-2 h-2 rounded-full bg-red-500 mr-1"></span>Deviation &gt;25%</span>
+                            )}
                           </div>
                         </div>
 
@@ -2983,21 +3067,20 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                       );
                                     }}
                                     disabled={count === 0}
-                                    className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${
-                                      comparisonSeverityFilter.includes(key)
+                                    className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${comparisonSeverityFilter.includes(key)
                                         ? color === 'green' ? 'bg-green-500 text-white border-green-600' :
                                           color === 'blue' ? 'bg-blue-500 text-white border-blue-600' :
-                                          color === 'yellow' ? 'bg-yellow-500 text-white border-yellow-600' :
-                                          color === 'orange' ? 'bg-orange-500 text-white border-orange-600' :
-                                          'bg-red-500 text-white border-red-600'
+                                            color === 'yellow' ? 'bg-yellow-500 text-white border-yellow-600' :
+                                              color === 'orange' ? 'bg-orange-500 text-white border-orange-600' :
+                                                'bg-red-500 text-white border-red-600'
                                         : count === 0
                                           ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
                                           : color === 'green' ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-100' :
                                             color === 'blue' ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' :
-                                            color === 'yellow' ? 'bg-yellow-50 text-yellow-700 border-yellow-200 hover:bg-yellow-100' :
-                                            color === 'orange' ? 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100' :
-                                            'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'
-                                    }`}
+                                              color === 'yellow' ? 'bg-yellow-50 text-yellow-700 border-yellow-200 hover:bg-yellow-100' :
+                                                color === 'orange' ? 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100' :
+                                                  'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'
+                                      }`}
                                   >
                                     {label} ({count})
                                   </button>
@@ -3045,64 +3128,61 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                 {actualsComparison.rows
                                   .filter(row => comparisonSeverityFilter.length === 0 || comparisonSeverityFilter.includes(row.status))
                                   .map((row, idx) => (
-                                  <tr key={idx} className={
-                                    row.status === 'significant_deviation' ? 'bg-red-50' :
-                                    row.status === 'review' ? 'bg-orange-50' :
-                                    row.status === 'acceptable' ? 'bg-yellow-50' :
-                                    row.status === 'good' ? 'bg-blue-50' : 'bg-green-50'
-                                  }>
-                                    <td className="px-2 py-2 text-gray-700">{row.date}</td>
-                                    <td className="px-2 py-2 text-center">
-                                      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                        row.isWeekend
-                                          ? 'bg-amber-100 text-amber-700'
-                                          : 'bg-gray-100 text-gray-600'
-                                      }`}>
-                                        {row.dayOfWeek}
-                                        {row.isWeekend && ' 🗓'}
-                                      </span>
-                                    </td>
-                                    <td className="px-2 py-2 text-right text-gray-700">{row.predicted.toFixed(2)}</td>
-                                    <td className="px-2 py-2 text-right text-gray-700 font-medium">{row.actual.toFixed(2)}</td>
-                                    <td className={`px-2 py-2 text-right font-medium ${row.error >= 0 ? 'text-blue-600' : 'text-purple-600'}`}>
-                                      {row.error >= 0 ? '+' : ''}{row.error.toFixed(2)}
-                                    </td>
-                                    <td className={`px-2 py-2 text-right font-bold ${
-                                      row.status === 'excellent' ? 'text-green-600' :
-                                      row.status === 'good' ? 'text-blue-600' :
-                                      row.status === 'acceptable' ? 'text-yellow-600' :
-                                      row.status === 'review' ? 'text-orange-600' : 'text-red-600'
-                                    }`}>
-                                      {row.mape.toFixed(2)}%
-                                    </td>
-                                    <td className="px-2 py-2 text-center">
-                                      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                        row.error >= 0
-                                          ? 'bg-blue-100 text-blue-700'
-                                          : 'bg-purple-100 text-purple-700'
-                                      }`}>
-                                        {row.error >= 0 ? 'Under' : 'Over'}
-                                      </span>
-                                    </td>
-                                    <td className="px-2 py-2">
-                                      <div className="flex flex-wrap gap-1">
-                                        {row.contextFlags && row.contextFlags.length > 0 ? (
-                                          row.contextFlags.map((flag, flagIdx) => (
-                                            <span
-                                              key={flagIdx}
-                                              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-100 text-emerald-700"
-                                              title={`Active covariate: ${flag}`}
-                                            >
-                                              {flag.replace(/^(is_|has_)/, '').replace(/_/g, ' ')}
-                                            </span>
-                                          ))
-                                        ) : (
-                                          <span className="text-[10px] text-gray-400">—</span>
-                                        )}
-                                      </div>
-                                    </td>
-                                  </tr>
-                                ))}
+                                    <tr key={idx} className={
+                                      row.status === 'significant_deviation' ? 'bg-red-50' :
+                                        row.status === 'review' ? 'bg-orange-50' :
+                                          row.status === 'acceptable' ? 'bg-yellow-50' :
+                                            row.status === 'good' ? 'bg-blue-50' : 'bg-green-50'
+                                    }>
+                                      <td className="px-2 py-2 text-gray-700">{row.date}</td>
+                                      <td className="px-2 py-2 text-center">
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${row.isWeekend
+                                            ? 'bg-amber-100 text-amber-700'
+                                            : 'bg-gray-100 text-gray-600'
+                                          }`}>
+                                          {row.dayOfWeek}
+                                          {row.isWeekend && ' 🗓'}
+                                        </span>
+                                      </td>
+                                      <td className="px-2 py-2 text-right text-gray-700">{row.predicted.toFixed(2)}</td>
+                                      <td className="px-2 py-2 text-right text-gray-700 font-medium">{row.actual.toFixed(2)}</td>
+                                      <td className={`px-2 py-2 text-right font-medium ${row.error >= 0 ? 'text-blue-600' : 'text-purple-600'}`}>
+                                        {row.error >= 0 ? '+' : ''}{row.error.toFixed(2)}
+                                      </td>
+                                      <td className={`px-2 py-2 text-right font-bold ${row.status === 'excellent' ? 'text-green-600' :
+                                          row.status === 'good' ? 'text-blue-600' :
+                                            row.status === 'acceptable' ? 'text-yellow-600' :
+                                              row.status === 'review' ? 'text-orange-600' : 'text-red-600'
+                                        }`}>
+                                        {row.mape.toFixed(2)}%
+                                      </td>
+                                      <td className="px-2 py-2 text-center">
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${row.error >= 0
+                                            ? 'bg-blue-100 text-blue-700'
+                                            : 'bg-purple-100 text-purple-700'
+                                          }`}>
+                                          {row.error >= 0 ? 'Under' : 'Over'}
+                                        </span>
+                                      </td>
+                                      <td className="px-2 py-2">
+                                        <div className="flex flex-wrap gap-1">
+                                          {row.contextFlags && row.contextFlags.length > 0 ? (
+                                            row.contextFlags.map((flag, flagIdx) => (
+                                              <span
+                                                key={flagIdx}
+                                                className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-100 text-emerald-700"
+                                                title={`Active covariate: ${flag}`}
+                                              >
+                                                {flag.replace(/^(is_|has_)/, '').replace(/_/g, ' ')}
+                                              </span>
+                                            ))
+                                          ) : (
+                                            <span className="text-[10px] text-gray-400">—</span>
+                                          )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  ))}
                               </tbody>
                             </table>
                           </div>
@@ -3161,7 +3241,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                     )}
                   </div>
 
-                  {/* Evaluation Grid with Tooltips */}
+                  {/* Evaluation Grid with Tooltips - Training/Validation Metrics */}
                   <div className="grid grid-cols-3 gap-4">
                     <div className="p-4 bg-white border rounded text-center relative group cursor-help">
                       <div className="text-xs text-gray-500 uppercase flex items-center justify-center">
@@ -3169,9 +3249,10 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         <Info className="w-3 h-3 ml-1 text-gray-400" />
                       </div>
                       <div className="text-xl font-bold text-gray-800">{activeResult.metrics.rmse}</div>
+                      <div className="text-[10px] text-gray-400">From Training</div>
                       <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
-                        <strong>Root Mean Square Error</strong><br/>
-                        Measures average prediction error in the same units as your target. Lower is better. Compare to the scale of your data.
+                        <strong>Training RMSE</strong><br />
+                        Calculated during model training using held-out test data (last ~12 periods of historical data). This shows model performance on past data, not uploaded actuals.
                         <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
                       </div>
                     </div>
@@ -3180,24 +3261,25 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         Validation MAPE
                         <Info className="w-3 h-3 ml-1 text-gray-400" />
                       </div>
-                      <div className={`text-xl font-bold ${
-                        parseFloat(activeResult.metrics.mape) <= 5 ? 'text-green-600' :
-                        parseFloat(activeResult.metrics.mape) <= 10 ? 'text-blue-600' :
-                        parseFloat(activeResult.metrics.mape) <= 15 ? 'text-yellow-600' :
-                        parseFloat(activeResult.metrics.mape) <= 25 ? 'text-orange-600' : 'text-red-600'
-                      }`}>{activeResult.metrics.mape}%</div>
-                      {activeResult.metrics.cv_mape && (
-                        <div className="text-xs text-gray-500 mt-1">
+                      <div className={`text-xl font-bold ${parseFloat(activeResult.metrics.mape) <= 5 ? 'text-green-600' :
+                          parseFloat(activeResult.metrics.mape) <= 10 ? 'text-blue-600' :
+                            parseFloat(activeResult.metrics.mape) <= 15 ? 'text-yellow-600' :
+                              parseFloat(activeResult.metrics.mape) <= 25 ? 'text-orange-600' : 'text-red-600'
+                        }`}>{activeResult.metrics.mape}%</div>
+                      {activeResult.metrics.cv_mape ? (
+                        <div className="text-[10px] text-gray-400">
                           CV: {activeResult.metrics.cv_mape}% (+/-{activeResult.metrics.cv_mape_std || '0'}%)
                         </div>
+                      ) : (
+                        <div className="text-[10px] text-gray-400">From Training</div>
                       )}
                       <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
-                        <strong>Mean Absolute Percentage Error</strong><br/>
-                        Average % error. Finance thresholds:<br/>
-                        - Excellent: 5% or less<br/>
-                        - Good: 5-10%<br/>
-                        - Acceptable: 10-15%<br/>
-                        - Needs Review: 15-25%
+                        <strong>Training/Validation MAPE</strong><br />
+                        Error calculated during model training on held-out historical data. Different from "Forecast vs Actuals" MAPE above which compares predictions to your uploaded actuals.<br /><br />
+                        Finance thresholds:<br />
+                        - Excellent: 5% or less<br />
+                        - Good: 5-10%<br />
+                        - Acceptable: 10-15%
                         <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
                       </div>
                     </div>
@@ -3206,16 +3288,16 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         R2 Score
                         <Info className="w-3 h-3 ml-1 text-gray-400" />
                       </div>
-                      <div className={`text-xl font-bold ${
-                        parseFloat(activeResult.metrics.r2) >= 0.9 ? 'text-green-600' :
-                        parseFloat(activeResult.metrics.r2) >= 0.7 ? 'text-blue-600' :
-                        parseFloat(activeResult.metrics.r2) >= 0.5 ? 'text-yellow-600' : 'text-red-600'
-                      }`}>{activeResult.metrics.r2}</div>
+                      <div className={`text-xl font-bold ${parseFloat(activeResult.metrics.r2) >= 0.9 ? 'text-green-600' :
+                          parseFloat(activeResult.metrics.r2) >= 0.7 ? 'text-blue-600' :
+                            parseFloat(activeResult.metrics.r2) >= 0.5 ? 'text-yellow-600' : 'text-red-600'
+                        }`}>{activeResult.metrics.r2}</div>
+                      <div className="text-[10px] text-gray-400">From Training</div>
                       <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
-                        <strong>Coefficient of Determination</strong><br/>
-                        Proportion of variance explained by the model. Range 0-1, higher is better.<br/>
-                        - 0.9+: Excellent fit<br/>
-                        - 0.7-0.9: Good fit<br/>
+                        <strong>Training R2 Score</strong><br />
+                        Proportion of variance explained by the model during training. Range 0-1, higher is better.<br />
+                        - 0.9+: Excellent fit<br />
+                        - 0.7-0.9: Good fit<br />
                         - 0.5-0.7: Moderate fit
                         <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
                       </div>
@@ -3297,13 +3379,25 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
             setBatchTrainingSummary(summary);
             setBatchSegmentCols(segmentCols);
             setShowBatchTraining(false);
-            // Automatically open the comparison modal after training completes
-            setShowBatchComparison(true);
+            // Automatically open the results viewer after training completes
+            setShowBatchResultsViewer(true);
           }}
         />
       )}
 
-      {/* Batch Comparison Modal */}
+      {/* Batch Results Viewer Modal - Individual forecast view per segment */}
+      {showBatchResultsViewer && batchTrainingSummary && (
+        <BatchResultsViewer
+          batchResults={batchTrainingSummary}
+          segmentCols={batchSegmentCols}
+          timeCol={timeCol}
+          targetCol={targetCol}
+          covariates={covariates}
+          onClose={() => setShowBatchResultsViewer(false)}
+        />
+      )}
+
+      {/* Batch Comparison Modal - Compare forecasts vs actuals */}
       {showBatchComparison && batchTrainingSummary && (
         <BatchComparison
           batchResults={batchTrainingSummary}

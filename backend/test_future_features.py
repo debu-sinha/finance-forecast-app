@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.getcwd())
 
 try:
-    from backend.train_service import train_prophet_model
+    from backend.models.prophet import train_prophet_model
 except ImportError:
     logger.error("Could not import backend.train_service. Make sure you are running this from the project root.")
     sys.exit(1)

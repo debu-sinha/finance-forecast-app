@@ -9,23 +9,131 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.models import (
+from backend.schemas import (
     TrainRequest, TrainResponse, DeployRequest, DeployResponse,
     HealthResponse, ForecastMetrics, ModelResult, CovariateImpact,
     BatchTrainRequest, BatchTrainResponse, BatchResultItem,
-    AggregateRequest, AggregateResponse
+    AggregateRequest, AggregateResponse, TestModelRequest, TestModelResponse,
+    ModelTestResult, BatchDeployRequest, BatchDeployResponse, BatchSegmentInfo
 )
-from backend.train_service import train_prophet_model, register_model_to_unity_catalog, prepare_prophet_data
-from backend.models_training import train_arima_model, train_exponential_smoothing_model, train_sarimax_model, train_xgboost_model
+from backend.models.prophet import train_prophet_model, prepare_prophet_data
+from backend.models.arima import train_arima_model, train_sarimax_model
+from backend.models.ets import train_exponential_smoothing_model
+from backend.models.xgboost import train_xgboost_model
+from backend.models.utils import register_model_to_unity_catalog, validate_mlflow_run_artifacts
 from backend.deploy_service import (
     deploy_model_to_serving, get_endpoint_status, delete_endpoint,
-    list_endpoints, get_databricks_client
+    list_endpoints, get_databricks_client, test_model_inference
 )
 from backend.ai_service import analyze_dataset, generate_forecast_insights, generate_executive_summary
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging with both console and file handlers
+LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, 'training.log')
+
+# Create formatter
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Root logger setup
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Console handler (stdout)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_formatter)
+
+# File handler (writes to backend/logs/training.log)
+file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(log_formatter)
+
+# Add handlers to root logger
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
+logger.info(f"📝 Logging to file: {LOG_FILE}")
+
+
+def truncate_log_file():
+    """Truncate the log file to start fresh for a new training run."""
+    global file_handler
+    try:
+        # Close the current file handler
+        file_handler.close()
+        root_logger.removeHandler(file_handler)
+
+        # Truncate the file
+        with open(LOG_FILE, 'w') as f:
+            f.truncate(0)
+
+        # Re-create and add the file handler
+        file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
+
+        logger.info(f"📝 Log file truncated and ready for new training run: {LOG_FILE}")
+    except Exception as e:
+        logger.warning(f"Could not truncate log file: {e}")
+
+
+def log_dataframe_summary(df, name: str, show_sample: bool = True):
+    """Log a comprehensive summary of a DataFrame for debugging."""
+    import pandas as pd
+
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"📋 {name.upper()}")
+    logger.info(f"{'='*60}")
+    logger.info(f"   Shape: {df.shape[0]} rows x {df.shape[1]} columns")
+    logger.info(f"   Columns: {list(df.columns)}")
+
+    # Log data types
+    logger.info(f"   Data types:")
+    for col in df.columns:
+        logger.info(f"      - {col}: {df[col].dtype}")
+
+    # Log null counts
+    null_counts = df.isnull().sum()
+    if null_counts.sum() > 0:
+        logger.info(f"   Null counts:")
+        for col, count in null_counts.items():
+            if count > 0:
+                logger.info(f"      - {col}: {count} nulls ({count/len(df)*100:.1f}%)")
+    else:
+        logger.info(f"   Null counts: No nulls in data")
+
+    # Log date range if there's a datetime column
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]) or col in ['ds', 'date', 'Date', 'DATE']:
+            try:
+                col_dates = pd.to_datetime(df[col])
+                logger.info(f"   Date range ({col}): {col_dates.min()} to {col_dates.max()}")
+            except:
+                pass
+
+    # Log numeric column stats
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        logger.info(f"   Numeric column stats:")
+        for col in numeric_cols[:5]:  # Limit to first 5 numeric columns
+            logger.info(f"      - {col}: min={df[col].min():.4f}, max={df[col].max():.4f}, mean={df[col].mean():.4f}, std={df[col].std():.4f}")
+
+    # Log sample rows
+    if show_sample and len(df) > 0:
+        logger.info(f"   First 3 rows:")
+        for idx, row in df.head(3).iterrows():
+            row_str = ", ".join([f"{k}={v}" for k, v in row.items()])
+            logger.info(f"      [{idx}] {row_str[:200]}...")
+        logger.info(f"   Last 3 rows:")
+        for idx, row in df.tail(3).iterrows():
+            row_str = ", ".join([f"{k}={v}" for k, v in row.items()])
+            logger.info(f"      [{idx}] {row_str[:200]}...")
+
+    logger.info(f"{'='*60}")
 
 # Resolve "inherit" in DATABRICKS_HOST
 if os.environ.get("DATABRICKS_HOST") == "inherit":
@@ -95,7 +203,70 @@ async def health_check():
 @app.post("/api/train", response_model=TrainResponse)
 async def train_model(request: TrainRequest):
     try:
-        logger.info(f"Training request: target={request.target_col}, horizon={request.horizon}")
+        import pandas as pd
+
+        # TRUNCATE LOG FILE at the start of each training run (unless batch training)
+        if not request.batch_id:
+            truncate_log_file()
+
+        logger.info(f"")
+        logger.info(f"{'#'*70}")
+        logger.info(f"#  NEW TRAINING RUN STARTED")
+        logger.info(f"{'#'*70}")
+        logger.info(f"Training request: target={request.target_col}, horizon={request.horizon}, data_rows={len(request.data)}")
+
+        # Log segment/filter info for batch training
+        if request.filters:
+            logger.info(f"📋 Segment filters: {request.filters}")
+        if request.batch_segment_id:
+            logger.info(f"📋 Batch segment: {request.batch_segment_id}")
+
+        # ========================================
+        # LOG RAW INPUT DATA
+        # ========================================
+        raw_input_df = pd.DataFrame(request.data)
+        log_dataframe_summary(raw_input_df, "RAW INPUT DATA (from frontend)")
+
+        # ========================================
+        # LOG RAW PROMOTIONS/EVENTS DATA (if covariates provided)
+        # ========================================
+        if request.covariates and len(request.covariates) > 0:
+            logger.info(f"")
+            logger.info(f"{'='*60}")
+            logger.info(f"📋 RAW PROMOTIONS/COVARIATES")
+            logger.info(f"{'='*60}")
+            logger.info(f"   Covariates requested: {request.covariates}")
+            # Check which covariates are present in the data
+            present_covariates = [c for c in request.covariates if c in raw_input_df.columns]
+            missing_covariates = [c for c in request.covariates if c not in raw_input_df.columns]
+            logger.info(f"   Present in data: {present_covariates}")
+            if missing_covariates:
+                logger.info(f"   ⚠️ Missing from data: {missing_covariates}")
+            # Log covariate statistics
+            for cov in present_covariates:
+                non_null_count = raw_input_df[cov].notna().sum()
+                non_zero_count = (raw_input_df[cov] != 0).sum() if raw_input_df[cov].dtype in ['int64', 'float64'] else 0
+                logger.info(f"   - {cov}: non-null={non_null_count}, non-zero={non_zero_count}, unique={raw_input_df[cov].nunique()}")
+            logger.info(f"{'='*60}")
+        else:
+            logger.info(f"📋 No covariates/promotions provided in request")
+
+        # ========================================
+        # LOG DATE FILTER PARAMETERS
+        # ========================================
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📅 DATE FILTER PARAMETERS")
+        logger.info(f"{'='*60}")
+        logger.info(f"   from_date: {request.from_date or '(not specified - use all data)'}")
+        logger.info(f"   to_date: {request.to_date or '(not specified - will use max date in data)'}")
+        # Parse raw dates to show the range
+        if request.time_col in raw_input_df.columns:
+            raw_dates = pd.to_datetime(raw_input_df[request.time_col], errors='coerce')
+            logger.info(f"   Raw data date range: {raw_dates.min()} to {raw_dates.max()}")
+            logger.info(f"   Total periods in raw data: {len(raw_input_df)}")
+        logger.info(f"{'='*60}")
+
         if not request.data or request.horizon <= 0:
             raise ValueError("Invalid data or horizon")
         
@@ -107,7 +278,18 @@ async def train_model(request: TrainRequest):
         np.random.seed(seed)
         logger.info(f"🌱 Set random seed: {seed} for reproducibility")
 
-        df = prepare_prophet_data(request.data, request.time_col, request.target_col, request.covariates)
+        # CRITICAL: Filter out target column from covariates to prevent data leakage
+        # The target column should NEVER be used as a covariate/feature
+        safe_covariates = [c for c in (request.covariates or []) if c != request.target_col]
+        if len(safe_covariates) != len(request.covariates or []):
+            logger.warning(f"🚨 Removed target column '{request.target_col}' from covariates to prevent data leakage")
+
+        df = prepare_prophet_data(request.data, request.time_col, request.target_col, safe_covariates)
+
+        # ========================================
+        # LOG COMBINED/PROCESSED DATASET (after prepare_prophet_data)
+        # ========================================
+        log_dataframe_summary(df, "COMBINED/PROCESSED DATASET (after prepare_prophet_data)")
 
         # Store pre-filter data for logging
         pre_filter_df = df.copy()
@@ -137,12 +319,54 @@ async def train_model(request: TrainRequest):
         
         if len(df) == 0:
             raise ValueError(f"No data remaining after date filtering (from_date: {request.from_date}, to_date: {effective_to_date})")
-        
+
         if request.from_date or not request.to_date:
             logger.info(f"📅 Final filtered dataset: {len(df)} rows (from {df['ds'].min()} to {df['ds'].max()})")
-        
+
+        # ========================================
+        # LOG DATE-FILTERED DATASET
+        # ========================================
+        log_dataframe_summary(df, f"DATE-FILTERED DATASET (from_date={request.from_date or 'N/A'}, to_date={effective_to_date})")
+
         test_size = request.test_size or min(request.horizon, len(df) // 5)
         train_df, test_df = df.iloc[:-test_size].copy(), df.iloc[-test_size:].copy()
+
+        # ========================================
+        # LOG TRAIN/TEST SPLIT
+        # ========================================
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📊 TRAIN/TEST SPLIT")
+        logger.info(f"{'='*60}")
+        logger.info(f"   Test size requested: {request.test_size or 'auto'}")
+        logger.info(f"   Effective test size: {test_size}")
+        logger.info(f"   Total rows: {len(df)}")
+        logger.info(f"   Train rows: {len(train_df)} ({len(train_df)/len(df)*100:.1f}%)")
+        logger.info(f"   Test rows: {len(test_df)} ({len(test_df)/len(df)*100:.1f}%)")
+        logger.info(f"{'='*60}")
+
+        # Log TRAIN set details
+        log_dataframe_summary(train_df, "TRAINING SET")
+
+        # Log TEST set details
+        log_dataframe_summary(test_df, "TEST/VALIDATION SET")
+
+        # Log the split point
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📅 SPLIT POINT VERIFICATION")
+        logger.info(f"{'='*60}")
+        logger.info(f"   Train ends at: {train_df['ds'].max()}")
+        logger.info(f"   Test starts at: {test_df['ds'].min()}")
+        logger.info(f"   Gap check: Test should start right after train")
+        if len(train_df) > 0 and len(test_df) > 0:
+            train_end = train_df['ds'].max()
+            test_start = test_df['ds'].min()
+            gap_days = (test_start - train_end).days
+            logger.info(f"   Gap between train end and test start: {gap_days} days")
+            if gap_days > 7:
+                logger.warning(f"   ⚠️ Large gap detected! This may indicate data issues.")
+        logger.info(f"{'='*60}")
 
         import mlflow
         from datetime import datetime
@@ -277,13 +501,21 @@ async def train_model(request: TrainRequest):
                 logger.info("ℹ️ No data filters provided in request")
             
             logger.info(f"Logged training parameters to parent run {parent_run.info.run_id}")
-            
-            for model_type in request.models:
+
+            # Progress tracking
+            total_models = len(request.models)
+            completed_models = 0
+
+            for model_idx, model_type in enumerate(request.models, 1):
+                logger.info(f"")
+                logger.info(f"{'='*60}")
+                logger.info(f"📊 Training model {model_idx}/{total_models}: {model_type.upper()}")
+                logger.info(f"{'='*60}")
                 try:
                     result = None
                     if model_type == 'prophet':
                         run_id, _, metrics, val, fcst, uri, impacts = train_prophet_model(
-                            request.data, request.time_col, request.target_col, request.covariates,
+                            request.data, request.time_col, request.target_col, safe_covariates,
                             request.horizon, request.frequency, request.seasonality_mode, test_size,
                             request.regressor_method, request.country, seed, request.future_features
                         )
@@ -300,7 +532,7 @@ async def train_model(request: TrainRequest):
                     elif model_type == 'arima':
                         run_id, _, metrics, val, fcst, uri, params = train_arima_model(
                             train_df, test_df, request.horizon, request.frequency, None, seed,
-                            original_data=request.data, covariates=request.covariates
+                            original_data=request.data, covariates=safe_covariates
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -322,7 +554,7 @@ async def train_model(request: TrainRequest):
                             continue
                         run_id, _, metrics, val, fcst, uri, params = train_exponential_smoothing_model(
                             train_df, test_df, request.horizon, request.frequency, seasonal_periods, seed,
-                            original_data=request.data, covariates=request.covariates
+                            original_data=request.data, covariates=safe_covariates
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -339,7 +571,7 @@ async def train_model(request: TrainRequest):
                         # SARIMAX - Seasonal ARIMA with eXogenous variables (supports covariates)
                         run_id, _, metrics, val, fcst, uri, params = train_sarimax_model(
                             train_df, test_df, request.horizon, request.frequency,
-                            covariates=request.covariates, random_seed=seed, original_data=request.data,
+                            covariates=safe_covariates, random_seed=seed, original_data=request.data,
                             country=request.country
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -359,7 +591,7 @@ async def train_model(request: TrainRequest):
                         # XGBoost - Gradient boosting with calendar features and full covariate support
                         run_id, _, metrics, val, fcst, uri, params = train_xgboost_model(
                             train_df, test_df, request.horizon, request.frequency,
-                            covariates=request.covariates, random_seed=seed, original_data=request.data,
+                            covariates=safe_covariates, random_seed=seed, original_data=request.data,
                             country=request.country
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -377,12 +609,24 @@ async def train_model(request: TrainRequest):
                         )
 
                     if result:
+                        completed_models += 1
+                        logger.info(f"✅ {model_type.upper()} completed - MAPE: {metrics['mape']:.2f}%")
+                        logger.info(f"📈 Progress: {completed_models}/{total_models} models completed")
                         if metrics['mape'] < best_mape:
                             best_mape = metrics['mape']
                             best_model_name = result.model_name
                             best_run_id = run_id
                             artifact_uri_ref = uri
+                            logger.info(f"🏆 New best model: {result.model_name} (MAPE: {best_mape:.2f}%)")
                         model_results.append(result)
+
+                        # Validate MLflow artifacts for this model run
+                        try:
+                            validation_result = validate_mlflow_run_artifacts(run_id)
+                            if not validation_result.get("validation_passed"):
+                                logger.warning(f"   ⚠️ Artifact validation issues for {result.model_name}: {validation_result.get('issues', [])}")
+                        except Exception as val_error:
+                            logger.warning(f"   Could not validate artifacts: {val_error}")
 
                 except Exception as e:
                     logger.error(f"{model_type} failed: {e}", exc_info=True)
@@ -404,6 +648,19 @@ async def train_model(request: TrainRequest):
 
         if not model_results: raise Exception("All models failed")
 
+        # Log final training summary
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"🎉 TRAINING COMPLETE - {len(model_results)}/{total_models} models succeeded")
+        logger.info(f"{'='*60}")
+        for res in model_results:
+            status_icon = "🏆" if res.model_name == best_model_name else "  "
+            mape_str = res.metrics.mape if res.metrics.mape != "N/A" else "Failed"
+            logger.info(f"{status_icon} {res.model_name}: MAPE={mape_str}")
+        logger.info(f"")
+        logger.info(f"🏆 Best model: {best_model_name} (MAPE: {best_mape:.2f}%)")
+        logger.info(f"{'='*60}")
+
         # Build MLflow URLs for experiment and runs
         databricks_host = os.environ.get("DATABRICKS_HOST", "")
         if databricks_host:
@@ -423,14 +680,21 @@ async def train_model(request: TrainRequest):
                 res.run_url = f"{databricks_host}/ml/experiments/{experiment_id}/runs/{res.run_id}" if experiment_id else None
                 logger.info(f"🔗 Run URL for {res.model_name}: {res.run_url}")
 
-        # Register ALL models to Unity Catalog so they are available for deployment
+        # Register ALL models to Unity Catalog and run pre-deployment tests
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📦 REGISTERING AND TESTING MODELS")
+        logger.info(f"{'='*60}")
         logger.info(f"Attempting to register {len(model_results)} models to Unity Catalog...")
+
+        full_model_name = f"{request.catalog_name}.{request.schema_name}.{request.model_name}"
+
         for res in model_results:
             if not res.run_id:
                 logger.error(f"Cannot register {res.model_name}: missing run_id")
                 continue
             try:
-                logger.info(f"Registering {res.model_name} (Run: {res.run_id})...")
+                logger.info(f"📦 Registering {res.model_name} (Run: {res.run_id})...")
                 # Exclude 'source' tag as it's restricted by Unity Catalog tag policies
                 tags_to_set = {
                     "run_id": res.run_id,
@@ -440,15 +704,101 @@ async def train_model(request: TrainRequest):
                     "experiment_id": experiment_id or ""
                 }
                 version = register_model_to_unity_catalog(
-                    f"runs:/{res.run_id}/model", 
-                    f"{request.catalog_name}.{request.schema_name}.{request.model_name}",
+                    f"runs:/{res.run_id}/model",
+                    full_model_name,
                     tags_to_set
                 )
-                logger.info(f"Registered {res.model_name} as version {version} in Unity Catalog")
-            except Exception as e: 
+                logger.info(f"   ✅ Registered {res.model_name} as version {version} in Unity Catalog")
+                res.registered_version = str(version)
+
+                # Run pre-deployment test on the registered model
+                logger.info(f"   🧪 Testing {res.model_name} v{version}...")
+                try:
+                    test_result = test_model_inference(
+                        model_name=full_model_name,
+                        model_version=str(version),
+                        test_periods=3,  # Quick test with 3 periods
+                        frequency=request.frequency
+                    )
+
+                    res.test_result = ModelTestResult(
+                        test_passed=test_result["test_passed"],
+                        message=test_result["message"],
+                        load_time_seconds=test_result.get("load_time_seconds"),
+                        inference_time_seconds=test_result.get("inference_time_seconds"),
+                        error_details=test_result.get("error_details")
+                    )
+
+                    if test_result["test_passed"]:
+                        logger.info(f"   ✅ TEST PASSED (Load: {test_result.get('load_time_seconds', 0):.2f}s, Inference: {test_result.get('inference_time_seconds', 0):.3f}s)")
+                    else:
+                        logger.warning(f"   ❌ TEST FAILED: {test_result['message']}")
+                        # Mark model as not deployable in tags
+                        try:
+                            import mlflow
+                            mlflow.set_registry_uri("databricks-uc")
+                            client = mlflow.MlflowClient()
+                            client.set_model_version_tag(full_model_name, str(version), "test_passed", "false")
+                            client.set_model_version_tag(full_model_name, str(version), "test_error", test_result.get("error_details", "Unknown error")[:250])
+                        except Exception as tag_error:
+                            logger.warning(f"   Could not set test result tags: {tag_error}")
+
+                except Exception as test_error:
+                    logger.error(f"   ❌ Test error for {res.model_name}: {test_error}")
+                    res.test_result = ModelTestResult(
+                        test_passed=False,
+                        message=f"Test execution failed: {str(test_error)}",
+                        error_details=str(test_error)
+                    )
+
+            except Exception as e:
                 logger.error(f"Auto-register failed for {res.model_name}: {e}", exc_info=True)
 
-        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A")
+        # Log summary of test results
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"🧪 MODEL TEST SUMMARY")
+        logger.info(f"{'='*60}")
+        tested_models = [r for r in model_results if r.test_result]
+        passed_models = [r for r in tested_models if r.test_result.test_passed]
+        failed_models = [r for r in tested_models if not r.test_result.test_passed]
+
+        logger.info(f"   Total tested: {len(tested_models)}")
+        logger.info(f"   ✅ Passed: {len(passed_models)}")
+        logger.info(f"   ❌ Failed: {len(failed_models)}")
+
+        if passed_models:
+            logger.info(f"   Deployable models:")
+            for r in passed_models:
+                logger.info(f"      - {r.model_name} v{r.registered_version}")
+        if failed_models:
+            logger.info(f"   ⚠️ Non-deployable models (failed tests):")
+            for r in failed_models:
+                logger.info(f"      - {r.model_name} v{r.registered_version}: {r.test_result.message[:100]}")
+        logger.info(f"{'='*60}")
+
+        # Prepare history data for chart visualization
+        # Convert df back to original column names for the frontend
+        history_df = df.copy()
+        history_df = history_df.rename(columns={'ds': request.time_col, 'y': request.target_col})
+
+        # Debug: Log date range and sample values to verify alignment
+        if request.time_col in history_df.columns and len(history_df) > 0:
+            logger.info(f"📅 History date range: {history_df[request.time_col].min()} to {history_df[request.time_col].max()}")
+            # Log first and last few rows to verify data alignment
+            if len(history_df) >= 3:
+                logger.info(f"📅 First 3 dates: {list(history_df[request.time_col].head(3))}")
+                logger.info(f"📅 Last 3 dates: {list(history_df[request.time_col].tail(3))}")
+                logger.info(f"📊 First 3 target values: {list(history_df[request.target_col].head(3))}")
+                logger.info(f"📊 Last 3 target values: {list(history_df[request.target_col].tail(3))}")
+
+        # Convert datetime to string for JSON serialization
+        if request.time_col in history_df.columns:
+            history_df[request.time_col] = history_df[request.time_col].astype(str)
+        history_data = history_df.to_dict('records')
+        logger.info(f"📊 Returning {len(history_data)} history records for chart visualization")
+
+        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data)
 
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
@@ -488,6 +838,46 @@ async def deploy_model(request: DeployRequest):
         logger.error(f"Deployment failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/test-model", response_model=TestModelResponse)
+async def test_model_endpoint(request: TestModelRequest):
+    """
+    Test a registered model by loading it as pyfunc and running inference.
+    This validates the model can be loaded and produces valid predictions
+    before deploying to a serving endpoint.
+
+    Use this endpoint to verify model functionality before deployment.
+    """
+    try:
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"🧪 MODEL PRE-DEPLOYMENT TEST")
+        logger.info(f"{'='*60}")
+        logger.info(f"   Model: {request.model_name} v{request.model_version}")
+        logger.info(f"   Test periods: {request.test_periods}")
+        logger.info(f"   Start date: {request.start_date or 'auto (tomorrow)'}")
+        logger.info(f"   Frequency: {request.frequency}")
+
+        result = test_model_inference(
+            model_name=request.model_name,
+            model_version=request.model_version,
+            test_periods=request.test_periods,
+            start_date=request.start_date,
+            frequency=request.frequency
+        )
+
+        if result["test_passed"]:
+            logger.info(f"   ✅ TEST PASSED")
+        else:
+            logger.warning(f"   ❌ TEST FAILED: {result['message']}")
+
+        logger.info(f"{'='*60}")
+
+        return TestModelResponse(**result)
+    except Exception as e:
+        logger.error(f"Model test endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/endpoints/{endpoint_name}/status")
 async def get_endpoint_status_api(endpoint_name: str):
     return JSONResponse(content=get_endpoint_status(endpoint_name))
@@ -520,11 +910,16 @@ async def train_batch(request: BatchTrainRequest):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import traceback
 
-    logger.info(f"Batch training request: {len(request.requests)} segments, max_workers={request.max_workers}")
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"🚀 BATCH TRAINING STARTED")
+    logger.info(f"{'='*60}")
+    logger.info(f"📊 Total segments: {len(request.requests)}")
+    logger.info(f"🔧 Requested workers: {request.max_workers}")
 
     # Limit max_workers based on environment (Databricks Apps has 4 vCPU limit)
     max_workers = min(request.max_workers, int(os.environ.get('MLFLOW_MAX_WORKERS', '2')))
-    logger.info(f"Using {max_workers} parallel workers")
+    logger.info(f"⚙️ Using {max_workers} parallel workers")
 
     results = []
 
@@ -573,13 +968,17 @@ async def train_batch(request: BatchTrainRequest):
             for i, req in enumerate(request.requests)
         }
 
+        completed_segments = 0
+        total_segments = len(request.requests)
+
         for future in as_completed(future_to_index):
             index = future_to_index[future]
             try:
                 result = future.result()
                 results.append(result)
-                status_icon = "" if result.status == "success" else ""
-                logger.info(f"{status_icon} Completed segment {result.segment_id}")
+                completed_segments += 1
+                status_icon = "✅" if result.status == "success" else "❌"
+                logger.info(f"{status_icon} Completed segment {result.segment_id} [{completed_segments}/{total_segments}]")
             except Exception as e:
                 logger.error(f"Unexpected error for segment {index}: {e}")
                 results.append(BatchResultItem(
@@ -596,7 +995,13 @@ async def train_batch(request: BatchTrainRequest):
     successful = sum(1 for r in results if r.status == "success")
     failed = len(results) - successful
 
-    logger.info(f"Batch training complete: {successful} succeeded, {failed} failed")
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"🎉 BATCH TRAINING COMPLETE")
+    logger.info(f"{'='*60}")
+    logger.info(f"✅ Successful: {successful}/{len(request.requests)} segments")
+    logger.info(f"❌ Failed: {failed}/{len(request.requests)} segments")
+    logger.info(f"{'='*60}")
 
     return BatchTrainResponse(
         total_requests=len(request.requests),
@@ -604,6 +1009,298 @@ async def train_batch(request: BatchTrainRequest):
         failed=failed,
         results=results
     )
+
+
+@app.post("/api/deploy-batch", response_model=BatchDeployResponse)
+async def deploy_batch_models(request: BatchDeployRequest):
+    """
+    Deploy multiple segment models as a single router endpoint.
+
+    This creates a PyFunc model that routes incoming requests to the appropriate
+    segment-specific model based on the filter values in the request.
+    The router model is registered to Unity Catalog and deployed to a serving endpoint.
+    """
+    import mlflow
+    import json
+    import tempfile
+    import cloudpickle
+
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"🚀 BATCH DEPLOYMENT STARTED")
+    logger.info(f"{'='*60}")
+    logger.info(f"📊 Segments to deploy: {len(request.segments)}")
+    logger.info(f"🎯 Endpoint name: {request.endpoint_name}")
+
+    try:
+        # Build the segment routing table
+        # Maps segment filter string -> model version
+        segment_routing = {}
+        for seg in request.segments:
+            # Create a canonical key from filters (sorted for consistency)
+            filter_key = "|".join(f"{k}={v}" for k, v in sorted(seg.filters.items()))
+            segment_routing[filter_key] = {
+                "segment_id": seg.segment_id,
+                "model_version": seg.model_version,
+                "filters": seg.filters
+            }
+
+        logger.info(f"📋 Routing table built with {len(segment_routing)} segments")
+
+        # Full model name in Unity Catalog
+        full_model_name = f"{request.catalog_name}.{request.schema_name}.{request.model_name}"
+        router_model_name = f"{request.catalog_name}.{request.schema_name}.{request.model_name}_router"
+
+        # Create the router PyFunc model
+        class SegmentRouterModel(mlflow.pyfunc.PythonModel):
+            """
+            A router model that dispatches forecast requests to segment-specific models.
+
+            Input format (DataFrame or dict):
+            {
+                "periods": 12,
+                "start_date": "2024-01-01",
+                "filters": {"region": "US", "product": "Widget"}  # Optional - identifies segment
+            }
+
+            The model will:
+            1. Look up the appropriate segment model based on filters
+            2. Load that model from Unity Catalog
+            3. Return the forecast from that model
+            """
+
+            def __init__(self, routing_table, base_model_name):
+                self.routing_table = routing_table
+                self.base_model_name = base_model_name
+                self._model_cache = {}
+
+            def _get_filter_key(self, filters):
+                """Convert filters dict to canonical key."""
+                if not filters:
+                    return None
+                return "|".join(f"{k}={v}" for k, v in sorted(filters.items()))
+
+            def _load_segment_model(self, model_version):
+                """Load a segment model from Unity Catalog (with caching)."""
+                cache_key = f"{self.base_model_name}@{model_version}"
+                if cache_key not in self._model_cache:
+                    model_uri = f"models:/{self.base_model_name}/{model_version}"
+                    self._model_cache[cache_key] = mlflow.pyfunc.load_model(model_uri)
+                return self._model_cache[cache_key]
+
+            def predict(self, context, model_input):
+                """
+                Route prediction to appropriate segment model.
+
+                model_input can be:
+                - DataFrame with columns: periods, start_date, filters (JSON string)
+                - Dict with keys: periods, start_date, filters
+                """
+                import pandas as pd
+                import json
+
+                # Handle DataFrame input
+                if isinstance(model_input, pd.DataFrame):
+                    if len(model_input) == 0:
+                        return pd.DataFrame()
+
+                    results = []
+                    for _, row in model_input.iterrows():
+                        periods = int(row.get('periods', 12))
+                        start_date = str(row.get('start_date', ''))
+
+                        # Parse filters
+                        filters_raw = row.get('filters', {})
+                        if isinstance(filters_raw, str):
+                            try:
+                                filters = json.loads(filters_raw)
+                            except:
+                                filters = {}
+                        else:
+                            filters = filters_raw if filters_raw else {}
+
+                        # Find matching segment
+                        filter_key = self._get_filter_key(filters)
+                        segment_info = self.routing_table.get(filter_key)
+
+                        if not segment_info:
+                            # Try to find a default or return error
+                            if len(self.routing_table) == 1:
+                                # Only one segment, use it as default
+                                segment_info = list(self.routing_table.values())[0]
+                            else:
+                                results.append({
+                                    "error": f"No matching segment for filters: {filters}",
+                                    "available_segments": list(self.routing_table.keys())
+                                })
+                                continue
+
+                        # Load and call segment model
+                        try:
+                            segment_model = self._load_segment_model(segment_info['model_version'])
+
+                            # Create input for segment model
+                            segment_input = pd.DataFrame([{
+                                'periods': periods,
+                                'start_date': start_date
+                            }])
+
+                            forecast = segment_model.predict(segment_input)
+
+                            # Add segment info to result
+                            if isinstance(forecast, pd.DataFrame):
+                                forecast_dict = forecast.to_dict('records')
+                            else:
+                                forecast_dict = forecast
+
+                            results.append({
+                                "segment_id": segment_info['segment_id'],
+                                "filters": segment_info['filters'],
+                                "forecast": forecast_dict
+                            })
+                        except Exception as e:
+                            results.append({
+                                "segment_id": segment_info.get('segment_id', 'unknown'),
+                                "error": str(e)
+                            })
+
+                    return pd.DataFrame(results)
+
+                # Handle dict input (single request)
+                elif isinstance(model_input, dict):
+                    periods = model_input.get('periods', 12)
+                    start_date = model_input.get('start_date', '')
+                    filters = model_input.get('filters', {})
+
+                    filter_key = self._get_filter_key(filters)
+                    segment_info = self.routing_table.get(filter_key)
+
+                    if not segment_info and len(self.routing_table) == 1:
+                        segment_info = list(self.routing_table.values())[0]
+
+                    if not segment_info:
+                        return {
+                            "error": f"No matching segment for filters: {filters}",
+                            "available_segments": list(self.routing_table.keys())
+                        }
+
+                    segment_model = self._load_segment_model(segment_info['model_version'])
+                    segment_input = pd.DataFrame([{'periods': periods, 'start_date': start_date}])
+                    forecast = segment_model.predict(segment_input)
+
+                    return {
+                        "segment_id": segment_info['segment_id'],
+                        "filters": segment_info['filters'],
+                        "forecast": forecast.to_dict('records') if hasattr(forecast, 'to_dict') else forecast
+                    }
+
+                else:
+                    return {"error": f"Unsupported input type: {type(model_input)}"}
+
+        # Create and log the router model
+        mlflow.set_experiment(f"/Shared/finance-forecasting-router")
+
+        with mlflow.start_run(run_name=f"router_{request.endpoint_name}") as run:
+            # Log router metadata
+            mlflow.log_param("num_segments", len(segment_routing))
+            mlflow.log_param("endpoint_name", request.endpoint_name)
+            mlflow.log_param("base_model_name", full_model_name)
+
+            # Log routing table as artifact
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(segment_routing, f, indent=2)
+                routing_file = f.name
+            mlflow.log_artifact(routing_file, "routing")
+            os.unlink(routing_file)
+
+            # Create the router model instance
+            router_model = SegmentRouterModel(
+                routing_table=segment_routing,
+                base_model_name=full_model_name
+            )
+
+            # Define model signature
+            from mlflow.models.signature import ModelSignature
+            from mlflow.types.schema import Schema, ColSpec
+
+            input_schema = Schema([
+                ColSpec("long", "periods"),
+                ColSpec("string", "start_date"),
+                ColSpec("string", "filters")  # JSON string of filter dict
+            ])
+
+            output_schema = Schema([
+                ColSpec("string", "segment_id"),
+                ColSpec("string", "filters"),
+                ColSpec("string", "forecast"),
+                ColSpec("string", "error")
+            ])
+
+            signature = ModelSignature(inputs=input_schema, outputs=output_schema)
+
+            # Log the model
+            mlflow.pyfunc.log_model(
+                artifact_path="router_model",
+                python_model=router_model,
+                signature=signature,
+                pip_requirements=[
+                    "mlflow>=2.0",
+                    "pandas>=1.0",
+                    "cloudpickle>=2.0"
+                ]
+            )
+
+            router_run_id = run.info.run_id
+            logger.info(f"✅ Router model logged with run_id: {router_run_id}")
+
+        # Register the router model to Unity Catalog
+        router_version = register_model_to_unity_catalog(
+            f"runs:/{router_run_id}/router_model",
+            router_model_name,
+            {
+                "source": "finance_forecasting_app",
+                "type": "router",
+                "num_segments": str(len(segment_routing)),
+                "base_model": full_model_name
+            }
+        )
+
+        logger.info(f"✅ Router model registered: {router_model_name} v{router_version}")
+
+        # Deploy the router model to serving endpoint
+        result = deploy_model_to_serving(
+            router_model_name,
+            router_version,
+            request.endpoint_name,
+            request.workload_size,
+            request.scale_to_zero
+        )
+
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"🎉 BATCH DEPLOYMENT COMPLETE")
+        logger.info(f"{'='*60}")
+        logger.info(f"📍 Endpoint: {request.endpoint_name}")
+        logger.info(f"📊 Segments: {len(segment_routing)}")
+        logger.info(f"🔗 Router model: {router_model_name} v{router_version}")
+        logger.info(f"{'='*60}")
+
+        return BatchDeployResponse(
+            status="success",
+            message=f"Router endpoint created with {len(segment_routing)} segments",
+            endpoint_name=request.endpoint_name,
+            endpoint_url=result.get('endpoint_url'),
+            deployed_segments=len(segment_routing),
+            router_model_version=router_version
+        )
+
+    except Exception as e:
+        logger.error(f"Batch deployment failed: {e}", exc_info=True)
+        return BatchDeployResponse(
+            status="error",
+            message=str(e),
+            endpoint_name=request.endpoint_name
+        )
 
 
 @app.post("/api/aggregate", response_model=AggregateResponse)
