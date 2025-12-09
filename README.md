@@ -961,7 +961,7 @@ holidays>=0.35
     lsof -ti:3000 | xargs kill -9
     ```
 
-6.  **No Matching Dates in Actuals Comparison**: Ensure actuals dates overlap with forecast horizon.
+6.  **No Matching Dates in Actuals Comparison**: This was fixed! The issue was Prophet generating Sunday-based weeks while actual data uses Monday-based weeks. The system now auto-detects the day-of-week from your training data and generates forecast dates that align correctly.
 
 7.  **MLflow Connection Error**: Verify DATABRICKS_HOST and DATABRICKS_TOKEN in `.env.local`.
 
@@ -999,6 +999,7 @@ holidays>=0.35
 - **UX Improvements**: Data validation, metric tooltips, improved error messages
 
 ### Bug Fixes
+- **Fixed "No overlapping dates" error in forecast vs actuals comparison** - Prophet was generating Sunday-based weeks while actual data used Monday-based weeks, causing a 1-day mismatch. Now auto-detects day-of-week from training data.
 - Fixed model serving deployment failures by adding `holidays` dependency to all model pip requirements
 - Fixed Prophet model failures with short datasets (less than 1 year of data)
 - Fixed empty chart bug when "All (Aggregated)" filter was selected

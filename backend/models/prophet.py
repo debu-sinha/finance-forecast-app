@@ -40,8 +40,22 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
             model_input = pd.DataFrame(model_input)
 
         # Map human-readable frequency to pandas freq code
-        freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS'}
+        # Note: For weekly, we use W-MON by default, but the actual day-of-week
+        # should match what was used during training (stored in model history)
+        freq_map = {'daily': 'D', 'weekly': 'W-MON', 'monthly': 'MS'}
         pandas_freq = freq_map.get(self.frequency, 'MS')
+
+        # For weekly frequency, detect actual day-of-week from model's training history
+        if self.frequency == 'weekly' and hasattr(self.model, 'history'):
+            try:
+                history_dates = self.model.history['ds']
+                if len(history_dates) > 0:
+                    day_counts = history_dates.dt.dayofweek.value_counts()
+                    most_common_day = day_counts.idxmax()
+                    day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+                    pandas_freq = f"W-{day_names[most_common_day]}"
+            except Exception:
+                pass  # Fall back to W-MON
 
         # MODE 1: Simple mode - just periods (and optionally start date)
         if 'periods' in model_input.columns:
@@ -152,7 +166,8 @@ def generate_prophet_training_code(
     random_seed: int = 42, run_id: str = None, original_covariates: List[str] = None
 ) -> str:
     """Generate reproducible Python code for Prophet model training including preprocessing"""
-    freq_code = {"weekly": "W", "monthly": "MS", "daily": "D"}.get(frequency, "MS")
+    # Use W-MON for weekly to match Monday-based weeks (most common in business data)
+    freq_code = {"weekly": "W-MON", "monthly": "MS", "daily": "D"}.get(frequency, "MS")
     covariate_str = ", ".join([f"'{c}'" for c in covariates]) if covariates else ""
     original_cov_str = ", ".join([f"'{c}'" for c in (original_covariates or [])]) if original_covariates else ""
 
@@ -259,8 +274,24 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     random.seed(random_seed)
     logger.info(f"Set random seed to {random_seed} for reproducibility")
     
-    freq_code = {"weekly": "W", "monthly": "MS", "daily": "D"}.get(frequency, "MS")
+    # Default frequency codes - will be refined for weekly data based on actual day-of-week
+    freq_code = {"weekly": "W-MON", "monthly": "MS", "daily": "D"}.get(frequency, "MS")
     original_data = copy.deepcopy(data)
+
+    # For weekly frequency, detect the actual day-of-week from the data
+    # This ensures forecast dates align with historical data dates
+    if frequency == "weekly":
+        try:
+            sample_dates = pd.to_datetime([d[time_col] for d in data[:10] if d.get(time_col)])
+            if len(sample_dates) > 0:
+                # Get the most common day of week (0=Monday, 6=Sunday)
+                day_counts = sample_dates.dt.dayofweek.value_counts()
+                most_common_day = day_counts.idxmax()
+                day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+                freq_code = f"W-{day_names[most_common_day]}"
+                logger.info(f"📅 Detected weekly data on {day_names[most_common_day]}s - using freq_code='{freq_code}'")
+        except Exception as e:
+            logger.warning(f"Could not detect weekly day-of-week, defaulting to W-MON: {e}")
     
     if target_col in covariates:
         logger.warning(f"🚨 Target column '{target_col}' found in covariates! Removing it to prevent leakage.")

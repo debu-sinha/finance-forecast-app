@@ -305,7 +305,7 @@ If you need to process larger datasets or more segments:
 
 **Yes.** The platform supports three frequencies:
 - `daily` - Day-level forecasts
-- `weekly` - Week-level forecasts
+- `weekly` - Week-level forecasts (auto-detects day-of-week from your data)
 - `monthly` - Month-level forecasts
 
 Select the frequency in the UI dropdown or pass it in the API:
@@ -316,6 +316,8 @@ Select the frequency in the UI dropdown or pass it in the API:
   "horizon": 12
 }
 ```
+
+**Weekly Frequency Note:** The system automatically detects which day of the week your data uses (Monday, Tuesday, etc.) and generates forecast dates on that same day. This ensures forecast dates align perfectly with your actuals for comparison.
 
 ### Does forecast frequency need to match training data frequency?
 
@@ -1648,6 +1650,7 @@ class NeuralProphetWrapper(mlflow.pyfunc.PythonModel):
 
 | Feature | Files Changed | Description |
 |---------|---------------|-------------|
+| **Weekly Date Alignment Fix** | `models/prophet.py` | Auto-detect day-of-week from training data to align forecast dates with actuals |
 | **Batch Deployment** | `deploy_service.py`, `main.py`, `BatchResultsViewer.tsx`, `databricksApi.ts` | Deploy all batch-trained models to single endpoint with router model |
 | **Pre-deployment Inference Testing** | `deploy_service.py` | Models tested with logged input_example before deployment |
 | **Holidays Dependency Fix** | `models/arima.py`, `models/ets.py`, `models/xgboost.py` | Added `holidays` to pip deps for serving |
