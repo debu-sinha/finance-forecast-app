@@ -19,6 +19,31 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+
+def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
+    """Detect the appropriate weekly frequency code based on actual data."""
+    if frequency != 'weekly':
+        return {'daily': 'D', 'monthly': 'MS', 'yearly': 'YS'}.get(frequency, 'MS')
+
+    try:
+        if 'ds' in df.columns:
+            dates = pd.to_datetime(df['ds'])
+        else:
+            date_cols = df.select_dtypes(include=['datetime64']).columns
+            if len(date_cols) > 0:
+                dates = df[date_cols[0]]
+            else:
+                return 'W-MON'
+
+        if len(dates) > 0:
+            day_counts = dates.dt.dayofweek.value_counts()
+            most_common_day = day_counts.idxmax()
+            day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+            return f"W-{day_names[most_common_day]}"
+    except Exception:
+        pass
+    return 'W-MON'
+
 class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for Exponential Smoothing model
 
@@ -34,7 +59,7 @@ class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
     - frequency: Optional - uses training frequency if not specified
     """
 
-    def __init__(self, fitted_model, params, frequency, seasonal_periods):
+    def __init__(self, fitted_model, params, frequency, seasonal_periods, weekly_freq_code=None):
         self.fitted_model = fitted_model
         self.params = params
         # Store frequency in human-readable format for consistency
@@ -42,6 +67,8 @@ class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
         freq_to_human = {'MS': 'monthly', 'W': 'weekly', 'D': 'daily', 'YS': 'yearly'}
         self.frequency = freq_to_human.get(frequency, frequency)
         self.seasonal_periods = seasonal_periods
+        # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
+        self.weekly_freq_code = weekly_freq_code or 'W-MON'
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -54,7 +81,8 @@ class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
         start_date = pd.to_datetime(model_input['start_date'].iloc[0])
 
         # Map human-readable frequency to pandas freq code
-        freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
+        # Use stored weekly_freq_code for proper day-of-week alignment
+        freq_map = {'daily': 'D', 'weekly': self.weekly_freq_code, 'monthly': 'MS', 'yearly': 'YS'}
 
         # Get frequency from input or use stored default
         if 'frequency' in model_input.columns:
@@ -465,7 +493,8 @@ def train_exponential_smoothing_model(
             })
             sample_output = forecast_data[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(1).copy()
             signature = infer_signature(input_example, sample_output)
-            model_wrapper = ExponentialSmoothingModelWrapper(final_fitted_model, best_params, frequency, seasonal_periods)
+            weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
+            model_wrapper = ExponentialSmoothingModelWrapper(final_fitted_model, best_params, frequency, seasonal_periods, weekly_freq_code)
             
             mlflow.pyfunc.log_model(
                 artifact_path="model",

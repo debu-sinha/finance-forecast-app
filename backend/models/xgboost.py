@@ -16,6 +16,31 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+
+def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
+    """Detect the appropriate weekly frequency code based on actual data."""
+    if frequency != 'weekly':
+        return {'daily': 'D', 'monthly': 'MS', 'yearly': 'YS'}.get(frequency, 'MS')
+
+    try:
+        if 'ds' in df.columns:
+            dates = pd.to_datetime(df['ds'])
+        else:
+            date_cols = df.select_dtypes(include=['datetime64']).columns
+            if len(date_cols) > 0:
+                dates = df[date_cols[0]]
+            else:
+                return 'W-MON'
+
+        if len(dates) > 0:
+            day_counts = dates.dt.dayofweek.value_counts()
+            most_common_day = day_counts.idxmax()
+            day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+            return f"W-{day_names[most_common_day]}"
+    except Exception:
+        pass
+    return 'W-MON'
+
 class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for XGBoost time series model
 
@@ -36,7 +61,7 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
     }
     """
 
-    def __init__(self, model, feature_columns, frequency, last_known_values, covariate_means, yoy_lag_values=None):
+    def __init__(self, model, feature_columns, frequency, last_known_values, covariate_means, yoy_lag_values=None, weekly_freq_code=None):
         self.model = model
         self.feature_columns = feature_columns
         self.last_known_values = last_known_values  # For short-term lag features
@@ -47,6 +72,8 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         # YoY lag period
         yoy_lag_map = {'daily': 364, 'weekly': 52, 'monthly': 12}
         self.yoy_lag = yoy_lag_map.get(self.frequency, 364)
+        # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
+        self.weekly_freq_code = weekly_freq_code or 'W-MON'
 
     def _create_calendar_features(self, df):
         """Create enhanced calendar features from date column"""
@@ -72,7 +99,8 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         if not isinstance(model_input, pd.DataFrame):
             model_input = pd.DataFrame(model_input)
 
-        freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
+        # Use stored weekly_freq_code for proper day-of-week alignment
+        freq_map = {'daily': 'D', 'weekly': self.weekly_freq_code, 'monthly': 'MS', 'yearly': 'YS'}
         pandas_freq = freq_map.get(self.frequency, 'MS')
 
         # Mode 1: Simple forecast
@@ -737,9 +765,10 @@ def train_xgboost_model(
             logger.info(f"      Sample: {input_example.iloc[0].to_dict()}")
             logger.info(f"   📦 Dependencies: mlflow, pandas, numpy, xgboost, scikit-learn")
 
+            weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
             model_wrapper = XGBoostModelWrapper(
                 final_model, feature_columns, frequency,
-                last_known_values, covariate_means, yoy_lag_values
+                last_known_values, covariate_means, yoy_lag_values, weekly_freq_code
             )
 
             mlflow.pyfunc.log_model(

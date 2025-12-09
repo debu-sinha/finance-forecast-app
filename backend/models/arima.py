@@ -22,6 +22,41 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+
+def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
+    """Detect the appropriate weekly frequency code based on actual data.
+
+    For weekly data, detects which day of week the data falls on (e.g., Monday)
+    and returns the appropriate pandas freq code (e.g., 'W-MON').
+
+    Returns 'W-MON' as default for weekly, or appropriate code for other frequencies.
+    """
+    if frequency != 'weekly':
+        return {'daily': 'D', 'monthly': 'MS', 'yearly': 'YS'}.get(frequency, 'MS')
+
+    try:
+        if 'ds' in df.columns:
+            dates = pd.to_datetime(df['ds'])
+        else:
+            # Try to find a date column
+            date_cols = df.select_dtypes(include=['datetime64']).columns
+            if len(date_cols) > 0:
+                dates = df[date_cols[0]]
+            else:
+                return 'W-MON'
+
+        if len(dates) > 0:
+            day_counts = dates.dt.dayofweek.value_counts()
+            most_common_day = day_counts.idxmax()
+            day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+            freq_code = f"W-{day_names[most_common_day]}"
+            logger.info(f"📅 Detected weekly data on {day_names[most_common_day]}s - using freq_code='{freq_code}'")
+            return freq_code
+    except Exception as e:
+        logger.warning(f"Could not detect weekly day-of-week, defaulting to W-MON: {e}")
+
+    return 'W-MON'
+
 class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for ARIMA model
 
@@ -37,13 +72,15 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
     - frequency: Optional - uses training frequency if not specified
     """
 
-    def __init__(self, fitted_model, order, frequency):
+    def __init__(self, fitted_model, order, frequency, weekly_freq_code=None):
         self.fitted_model = fitted_model
         self.order = order
         # Store frequency in human-readable format for consistency
         # Map pandas freq codes to human-readable if needed
         freq_to_human = {'MS': 'monthly', 'W': 'weekly', 'D': 'daily', 'YS': 'yearly'}
         self.frequency = freq_to_human.get(frequency, frequency)
+        # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
+        self.weekly_freq_code = weekly_freq_code or 'W-MON'
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -56,7 +93,8 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
         start_date = pd.to_datetime(model_input['start_date'].iloc[0])
 
         # Map human-readable frequency to pandas freq code
-        freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
+        # Use stored weekly_freq_code for proper day-of-week alignment
+        freq_map = {'daily': 'D', 'weekly': self.weekly_freq_code, 'monthly': 'MS', 'yearly': 'YS'}
 
         # Get frequency from input or use stored default
         if 'frequency' in model_input.columns:
@@ -98,7 +136,7 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
     }
     """
 
-    def __init__(self, fitted_model, order, seasonal_order, frequency, covariates, covariate_means):
+    def __init__(self, fitted_model, order, seasonal_order, frequency, covariates, covariate_means, weekly_freq_code=None):
         self.fitted_model = fitted_model
         self.order = order
         self.seasonal_order = seasonal_order
@@ -107,6 +145,8 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
         # Store frequency in human-readable format
         freq_to_human = {'MS': 'monthly', 'W': 'weekly', 'D': 'daily', 'YS': 'yearly'}
         self.frequency = freq_to_human.get(frequency, frequency)
+        # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
+        self.weekly_freq_code = weekly_freq_code or 'W-MON'
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -115,7 +155,8 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
         if not isinstance(model_input, pd.DataFrame):
             model_input = pd.DataFrame(model_input)
 
-        freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
+        # Use stored weekly_freq_code for proper day-of-week alignment
+        freq_map = {'daily': 'D', 'weekly': self.weekly_freq_code, 'monthly': 'MS', 'yearly': 'YS'}
         pandas_freq = freq_map.get(self.frequency, 'MS')
 
         # Mode 1: Simple forecast (periods + start_date)
@@ -666,7 +707,8 @@ def train_arima_model(
             })
             sample_output = forecast_data[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(1).copy()
             signature = infer_signature(input_example, sample_output)
-            model_wrapper = ARIMAModelWrapper(final_fitted_model, best_order, frequency)
+            weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
+            model_wrapper = ARIMAModelWrapper(final_fitted_model, best_order, frequency, weekly_freq_code)
             
             mlflow.pyfunc.log_model(
                 artifact_path="model",
@@ -985,9 +1027,10 @@ def train_sarimax_model(
             sample_output = forecast_data[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(1).copy()
             signature = infer_signature(input_example, sample_output)
 
+            weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
             model_wrapper = SARIMAXModelWrapper(
                 final_fitted_model, best_order, best_seasonal_order,
-                frequency, valid_covariates, covariate_means
+                frequency, valid_covariates, covariate_means, weekly_freq_code
             )
 
             mlflow.pyfunc.log_model(
