@@ -375,8 +375,8 @@ def train_xgboost_model(
     np.random.seed(random_seed)
     logger.info(f"XGBoost: Set random seed to {random_seed} for reproducibility")
 
-    freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
-    pd_freq = freq_map.get(frequency, 'MS')
+    # For weekly, detect the actual day-of-week from training data
+    pd_freq = detect_weekly_freq_code(train_df, frequency)
 
     # Add country holidays as binary features
     train_df = train_df.copy()

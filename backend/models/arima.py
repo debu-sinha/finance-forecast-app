@@ -528,8 +528,8 @@ def train_arima_model(
     logger.info(f"ARIMA: Set random seed to {random_seed} for reproducibility")
 
     # Map frequency to pandas alias
-    freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
-    pd_freq = freq_map.get(frequency, 'MS')
+    # For weekly, detect the actual day-of-week from training data
+    pd_freq = detect_weekly_freq_code(train_df, frequency)
 
     best_model = None
     best_metrics = {"mape": float('inf'), "rmse": float('inf')}
@@ -760,8 +760,8 @@ def train_sarimax_model(
     random.seed(random_seed)
     np.random.seed(random_seed)
 
-    freq_map = {'daily': 'D', 'weekly': 'W', 'monthly': 'MS', 'yearly': 'YS'}
-    pd_freq = freq_map.get(frequency, 'MS')
+    # For weekly, detect the actual day-of-week from training data
+    pd_freq = detect_weekly_freq_code(train_df, frequency)
 
     # Determine seasonal period based on frequency
     seasonal_period_map = {'daily': 7, 'weekly': 52, 'monthly': 12, 'yearly': 1}
