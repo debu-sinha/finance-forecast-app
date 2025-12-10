@@ -163,12 +163,6 @@ if os.path.exists(static_dir):
 async def root():
     return FileResponse(f"{static_dir}/index.html") if os.path.exists(f"{static_dir}/index.html") else {"message": "API Running"}
 
-@app.get("/{full_path:path}")
-async def serve_spa(full_path: str):
-    if full_path.startswith("api"):
-        raise HTTPException(status_code=404, detail="API endpoint not found")
-    return FileResponse(f"{static_dir}/index.html") if os.path.exists(f"{static_dir}/index.html") else JSONResponse(status_code=404, content={"error": "Frontend not found"})
-
 @app.post("/api/analyze")
 async def analyze_data(request: dict):
     try:
@@ -1394,6 +1388,14 @@ async def aggregate_data(request: AggregateRequest):
         target_frequency=request.target_frequency,
         aggregation_methods=agg_methods_used
     )
+
+
+# SPA catch-all route - MUST be at the end after all API routes
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    if full_path.startswith("api"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    return FileResponse(f"{static_dir}/index.html") if os.path.exists(f"{static_dir}/index.html") else JSONResponse(status_code=404, content={"error": "Frontend not found"})
 
 
 if __name__ == "__main__":
