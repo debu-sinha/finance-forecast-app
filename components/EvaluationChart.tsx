@@ -11,6 +11,21 @@ import {
 } from 'recharts';
 import { DataRow } from '../types';
 
+/**
+ * Parse a date string without timezone issues.
+ * Adding 'T12:00:00' ensures we're at noon UTC, avoiding midnight boundary issues
+ * that can cause dates to shift when displayed in local timezone.
+ */
+const parseDate = (dateStr: string): Date => {
+  if (!dateStr) return new Date(NaN);
+  // If it's already a full ISO string with time, use as-is
+  if (dateStr.includes('T')) {
+    return new Date(dateStr);
+  }
+  // For date-only strings (YYYY-MM-DD), add noon time to avoid timezone boundary issues
+  return new Date(dateStr + 'T12:00:00');
+};
+
 interface EvaluationChartProps {
   validation: DataRow[];
   timeCol: string;
@@ -37,6 +52,7 @@ export const EvaluationChart: React.FC<EvaluationChartProps> = ({
   // Prepare chart data - validation data has 'y' for actuals, 'yhat' for predictions
   const chartData = validation.map(row => {
     // Backend sends: timeCol (renamed from 'ds'), 'y' (actual), 'yhat' (predicted)
+    // In batch results, the data might use 'ds' directly or the user's timeCol
     const actual = row['y'] !== undefined && row['y'] !== null
       ? Number(row['y'])
       : (row[targetCol] !== undefined && row[targetCol] !== null
@@ -46,14 +62,17 @@ export const EvaluationChart: React.FC<EvaluationChartProps> = ({
       ? Number(row['yhat'])
       : null;
 
+    // Try multiple possible date column names
+    const dateValue = row[timeCol] || row['ds'] || row['date'] || row['Date'] || '';
+
     return {
-      date: String(row[timeCol]),
+      date: String(dateValue),
       actual: actual,
       predicted: predicted,
       lower: Number(row['yhat_lower'] || 0),
       upper: Number(row['yhat_upper'] || 0)
     };
-  }).filter(row => row.actual !== null && row.predicted !== null && row.actual > 0 && row.predicted > 0); // Filter out invalid data
+  }).filter(row => row.date && row.actual !== null && row.predicted !== null && row.actual > 0 && row.predicted > 0); // Filter out invalid data
 
   if (chartData.length === 0) {
     return <div className="flex items-center justify-center h-full text-gray-400">No valid validation data to display</div>;
@@ -94,7 +113,7 @@ export const EvaluationChart: React.FC<EvaluationChartProps> = ({
               axisLine={{ stroke: '#e0e0e0' }}
               tickFormatter={(str) => {
                 try {
-                  const d = new Date(str);
+                  const d = parseDate(str);
                   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 } catch (e) { return str; }
               }}
@@ -122,7 +141,7 @@ export const EvaluationChart: React.FC<EvaluationChartProps> = ({
               }}
               labelFormatter={(label) => {
                 try {
-                  const d = new Date(label);
+                  const d = parseDate(label);
                   return d.toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
                 } catch (e) { return label; }
               }}

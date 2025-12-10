@@ -23,7 +23,7 @@ A comprehensive **prototype and reference implementation** for an AI-powered tim
 *   **One-Click Deployment**: Deploy best-performing model to Databricks Model Serving for real-time inference.
 *   **Interactive UI**: React-based frontend for data upload, configuration, and visualization.
 *   **Forecast vs Actuals Comparison**: Compare predictions against actuals with finance industry MAPE thresholds.
-*   **Batch Training**: Train forecasts for multiple segments (e.g., region × product × channel) with progress tracking and MAPE statistics.
+*   **Batch Training**: Train forecasts for multiple segments (e.g., region × product × channel) in parallel with progress tracking and MAPE statistics.
 *   **Batch Comparison Scorecard**: Compare batch forecasts against actuals across all segments with status breakdown.
 *   **Full Reproducibility**: Logs exact training datasets, random seeds, and generates reproducible Python code.
 *   **Enterprise Governance**: Full integration with Unity Catalog and MLflow experiment tracking.
@@ -47,12 +47,18 @@ databricks-forecast-for-finance/
 ├── backend/
 │   ├── __init__.py
 │   ├── main.py                    # FastAPI application
-│   ├── models.py                  # Pydantic request/response models
-│   ├── train_service.py           # Prophet model training
-│   ├── models_training.py         # ARIMA/ETS/SARIMAX/XGBoost training
+│   ├── schemas.py                 # Pydantic request/response models
 │   ├── preprocessing.py           # Feature engineering for holiday/weekend forecasting
 │   ├── ai_service.py              # AI analysis via Foundation Models
-│   └── deploy_service.py          # Model deployment to serving endpoints
+│   ├── deploy_service.py          # Model deployment to serving endpoints
+│   ├── models/                    # Model implementations
+│   │   ├── __init__.py
+│   │   ├── prophet.py             # Prophet model training
+│   │   ├── arima.py               # ARIMA/SARIMAX model training
+│   │   ├── ets.py                 # Exponential Smoothing training
+│   │   └── xgboost.py             # XGBoost model training
+│   └── tests/                     # Backend tests
+│       └── test_model_inference.py
 │
 ├── components/
 │   ├── ResultsChart.tsx           # Main forecast visualization
@@ -62,6 +68,7 @@ databricks-forecast-for-finance/
 │   ├── TrainTestSplitViz.tsx      # Train/test split visualization
 │   ├── NotebookCell.tsx           # Code display component
 │   ├── BatchTraining.tsx          # Batch training modal
+│   ├── BatchResultsViewer.tsx     # Batch results view with deployment
 │   └── BatchComparison.tsx        # Batch comparison scorecard
 │
 ├── services/
@@ -108,12 +115,12 @@ databricks-forecast-for-finance/
 
 | Environment | Max Data Size | Max Batch Segments | Parallel Workers |
 |-------------|--------------|-------------------|------------------|
-| **Databricks Apps** (4 vCPU/12GB) | 50K rows/segment | 20 segments | 1-2 |
-| **Local Dev** (16GB RAM) | 100K rows/segment | 50 segments | 2-4 |
+| **Databricks Apps** (4 vCPU/12GB) | 50K rows/segment | 20 segments | 2-4 |
+| **Local Dev** (16GB RAM) | 100K rows/segment | 50 segments | 4-8 |
 
 **Key Limits:**
 - Databricks Apps has a hard limit of **4 vCPU / 12GB RAM**
-- Batch training processes segments **sequentially** for progress tracking
+- Batch training processes segments **in parallel** (default 4 workers)
 - Each segment takes ~30s-3min depending on data size and models
 - For larger workloads, use the CLI script or pre-aggregate data
 
@@ -618,6 +625,7 @@ Health check endpoint.
 ### Batch & Data Processing
 
 *   **`POST /api/train-batch`**: Train multiple forecasts in parallel (see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md))
+*   **`POST /api/deploy-batch`**: Deploy all batch-trained models to a single serving endpoint with automatic segment routing
 *   **`POST /api/aggregate`**: Convert daily data to weekly/monthly before training
 
 ### Endpoint Management
@@ -840,7 +848,12 @@ The Batch Training feature allows you to train forecasts for multiple segments (
 
 6. **View Results**: See MAPE statistics (min, max, mean, median) and per-segment results with status indicators
 
-7. **Export or Compare**:
+7. **Deploy All Models**: Click "Deploy All Models" to deploy all segment models to a single serving endpoint
+   - Creates a router model that automatically routes requests to the correct segment model
+   - Each model is tested with its logged input_example before deployment
+   - Single endpoint handles all segments - just include segment identifiers in your request
+
+8. **Export or Compare**:
    - Export results to CSV
    - Click "Done - Compare with Actuals" to proceed to batch comparison
 
@@ -948,7 +961,7 @@ holidays>=0.35
     lsof -ti:3000 | xargs kill -9
     ```
 
-6.  **No Matching Dates in Actuals Comparison**: Ensure actuals dates overlap with forecast horizon.
+6.  **No Matching Dates in Actuals Comparison**: This was fixed! The issue was Prophet generating Sunday-based weeks while actual data uses Monday-based weeks. The system now auto-detects the day-of-week from your training data and generates forecast dates that align correctly.
 
 7.  **MLflow Connection Error**: Verify DATABRICKS_HOST and DATABRICKS_TOKEN in `.env.local`.
 
@@ -971,6 +984,8 @@ holidays>=0.35
 ## Recent Updates (December 2024)
 
 ### New Features
+- **Batch Deployment with Router Model**: Deploy all batch-trained models to a single serving endpoint with automatic segment routing
+- **Pre-deployment Model Inference Testing**: Models are tested with their logged input_example before deployment to ensure inference works correctly
 - **Simplified Preprocessing**: Generic calendar and trend features that work with any promo file structure
 - **Conditional YoY Lags**: Year-over-year lag features only added when sufficient data exists (1+ year)
 - **User Promo Columns Preserved**: Binary holiday indicators used directly without modification
@@ -984,6 +999,8 @@ holidays>=0.35
 - **UX Improvements**: Data validation, metric tooltips, improved error messages
 
 ### Bug Fixes
+- **Fixed "No overlapping dates" error in forecast vs actuals comparison** - Prophet was generating Sunday-based weeks while actual data used Monday-based weeks, causing a 1-day mismatch. Now auto-detects day-of-week from training data.
+- Fixed model serving deployment failures by adding `holidays` dependency to all model pip requirements
 - Fixed Prophet model failures with short datasets (less than 1 year of data)
 - Fixed empty chart bug when "All (Aggregated)" filter was selected
 - Fixed MLflow `artifact_path` deprecation warning (now uses `name`)
@@ -991,6 +1008,7 @@ holidays>=0.35
 - Removed duplicate preprocessing code across model files
 
 ### Infrastructure
+- Enhanced model inference testing using logged MLflow input_example for consistency
 - Refactored `backend/preprocessing.py` for consistency across all models
 - Preprocessing code logged to MLflow for 100% reproducibility
 - Improved MLflow experiment organization with batch_id grouping

@@ -76,13 +76,20 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
 
   // Handle file upload
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    console.log('📁 File upload triggered');
     const file = event.target.files?.[0];
-    if (!file) return;
+    if (!file) {
+      console.log('📁 No file selected');
+      return;
+    }
+    console.log('📁 File selected:', file.name, file.size, 'bytes');
 
     const reader = new FileReader();
     reader.onload = (e) => {
       const content = e.target?.result as string;
+      console.log('📁 File content loaded, length:', content?.length);
       const parsed = parseCSV(content);
+      console.log('📁 Parsed rows:', parsed.length);
 
       if (parsed.length > 0) {
         setActualsData(parsed);
@@ -108,28 +115,41 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
     reader.readAsText(file);
   };
 
-  // Parse flexible date format
+  // Parse flexible date format without timezone issues.
+  // Adding 'T12:00:00' ensures we're at noon, avoiding midnight boundary issues
+  // that can cause dates to shift when displayed in local timezone.
   const parseFlexibleDate = (dateStr: string): Date | null => {
     if (!dateStr) return null;
 
-    // Try ISO format first
-    let d = new Date(dateStr);
+    // If it's already a full ISO string with time, use as-is
+    if (dateStr.includes('T')) {
+      const d = new Date(dateStr);
+      if (!isNaN(d.getTime())) return d;
+    }
+
+    // For date-only strings, try various formats and add noon time
+    // Check YYYY-MM-DD format
+    const isoMatch = dateStr.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (isoMatch) {
+      const d = new Date(dateStr + 'T12:00:00');
+      if (!isNaN(d.getTime())) return d;
+    }
+
+    // Check MM/DD/YYYY format
+    const usMatch = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (usMatch) {
+      const [, month, day, year] = usMatch;
+      const d = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T12:00:00`);
+      if (!isNaN(d.getTime())) return d;
+    }
+
+    // Try direct parsing as fallback but add noon time if it's a date-only string
+    const d = new Date(dateStr + 'T12:00:00');
     if (!isNaN(d.getTime())) return d;
 
-    // Try other common formats
-    const formats = [
-      /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/, // MM/DD/YYYY or M/D/YYYY
-      /^(\d{4})-(\d{1,2})-(\d{1,2})$/, // YYYY-MM-DD
-      /^(\d{1,2})-(\d{1,2})-(\d{4})$/, // DD-MM-YYYY
-    ];
-
-    for (const fmt of formats) {
-      const match = dateStr.match(fmt);
-      if (match) {
-        d = new Date(dateStr);
-        if (!isNaN(d.getTime())) return d;
-      }
-    }
+    // Last resort: direct parsing
+    const fallback = new Date(dateStr);
+    if (!isNaN(fallback.getTime())) return fallback;
 
     return null;
   };
@@ -173,6 +193,17 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
         segmentData.set(dateKey, existingVal + Number(row[actualsValueCol]));
       });
 
+      // Debug: Log all actuals segment keys and batch result segment keys
+      console.log('🔍 Actuals segment keys:', Array.from(actualsMap.keys()));
+      console.log('🔍 Batch result segment IDs:', batchResults.results.map(r => r.segmentId));
+      console.log('🔍 Batch results structure:', batchResults.results.map(r => ({
+        segmentId: r.segmentId,
+        status: r.status,
+        hasResult: !!r.result,
+        modelCount: r.result?.results?.length || 0,
+        hasForecast: r.result?.results?.some(m => m.forecast?.length > 0) || false
+      })));
+
       // Match with forecast results and calculate real MAPE against actuals
       batchResults.results.forEach(result => {
         if (result.status === 'error') return;
@@ -182,22 +213,42 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
 
         if (!segmentActuals || segmentActuals.size === 0) {
           // No actuals for this segment - still include with training metrics
-          console.log(`No actuals found for segment: ${segmentKey}`);
+          console.log(`❌ No actuals found for segment: "${segmentKey}"`);
           return;
         }
 
         // Get forecast data from the best model result
         const forecastMAPE = result.metrics?.mape || '0';
-        const bestModelResult = result.result?.results?.find(r => r.isBest);
+        const modelResults = result.result?.results || [];
+
+        // Debug: Check what we received
+        if (!result.result) {
+          console.warn(`⚠️ Segment ${segmentKey}: result.result is undefined/null`);
+        } else if (modelResults.length === 0) {
+          console.warn(`⚠️ Segment ${segmentKey}: No models in result.result.results`);
+        }
+
+        // Find best model, or fall back to first successful model
+        const bestModelResult = modelResults.find(r => r.isBest) ||
+                                modelResults.find(r => r.forecast && r.forecast.length > 0) ||
+                                modelResults[0];
         const forecastData = bestModelResult?.forecast || [];
 
-        // Debug logging
-        console.log(`Segment ${segmentKey}: has result=${!!result.result}, results count=${result.result?.results?.length || 0}, forecast count=${forecastData.length}`);
+        // Debug: Show warning if no forecast data available
+        if (forecastData.length === 0) {
+          console.warn(`⚠️ Segment ${segmentKey}: No forecast data. Models count: ${modelResults.length}, Model names: [${modelResults.map(m => m.modelName).join(', ')}], Best: ${bestModelResult?.modelName || 'none'}`);
+        } else {
+          // Show first forecast row to debug date column name
+          const sampleRow = forecastData[0];
+          console.log(`✓ Segment ${segmentKey}: ${forecastData.length} forecast rows. Columns: ${Object.keys(sampleRow).join(', ')}`);
+        }
 
         // Build forecast map: date -> predicted value
+        // Note: forecast data uses the user's time column name (e.g., 'Date'), not always 'ds'
         const forecastMap = new Map<string, number>();
         forecastData.forEach(row => {
-          const dateStr = String(row.ds || row.date || '');
+          // Try the user's time column first, then common fallbacks
+          const dateStr = String(row[timeCol] || row.ds || row.date || row.Date || '');
           const d = parseFlexibleDate(dateStr);
           if (d) {
             const dateKey = d.toISOString().split('T')[0];
@@ -361,21 +412,24 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
                 Upload a CSV file with actuals data. Include segment columns ({segmentCols.join(', ')}) to match with forecasts.
               </p>
 
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".csv"
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="flex items-center space-x-2 px-4 py-2 border-2 border-dashed border-gray-300 rounded-lg text-sm text-gray-600 hover:border-emerald-400 hover:text-emerald-600 transition-colors"
-              >
-                <Upload className="w-4 h-4" />
-                <span>Choose CSV File</span>
-              </button>
+              <div className="flex items-center space-x-4">
+                <label
+                  className="flex items-center space-x-2 px-4 py-2 border-2 border-dashed border-gray-300 rounded-lg text-sm text-gray-600 hover:border-emerald-400 hover:text-emerald-600 transition-colors cursor-pointer bg-white"
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>Choose CSV File</span>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv"
+                    onChange={handleFileUpload}
+                    className="hidden"
+                  />
+                </label>
+                {actualsData.length === 0 && (
+                  <span className="text-xs text-gray-400">No file selected</span>
+                )}
+              </div>
 
               {actualsData.length > 0 && (
                 <div className="mt-4 p-3 bg-white rounded border border-gray-200">
@@ -442,6 +496,29 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
           {/* Scorecard Results */}
           {comparisonResult && (
             <div className="space-y-4">
+              {/* Warning if all segments have 0 periods compared */}
+              {comparisonResult.rows.every(r => r.periodsCompared === 0) && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                  <div className="flex items-start space-x-3">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <h4 className="text-sm font-semibold text-amber-800">No Forecast Data Available for Comparison</h4>
+                      <p className="text-xs text-amber-700 mt-1">
+                        The batch training results don't contain forecast data. This can happen if:
+                      </p>
+                      <ul className="text-xs text-amber-700 mt-1 ml-4 list-disc">
+                        <li>All models failed during training (check MLflow for errors)</li>
+                        <li>The forecast horizon extends beyond the actuals data dates</li>
+                        <li>Date formats don't match between forecast and actuals</li>
+                      </ul>
+                      <p className="text-xs text-amber-700 mt-2">
+                        The "Actual MAPE" shown below is using training MAPE as a fallback.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Summary Stats */}
               <div className="bg-gradient-to-r from-emerald-50 to-teal-50 rounded-lg p-4">
                 <div className="flex items-center justify-between mb-3">
@@ -566,7 +643,10 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
                               {row.forecastMAPE}%
                             </td>
                             <td className="px-3 py-2 text-right font-medium">
-                              {row.actualMAPE.toFixed(2)}%
+                              <span className={row.periodsCompared === 0 ? 'text-gray-400 italic' : ''}>
+                                {row.actualMAPE.toFixed(2)}%
+                                {row.periodsCompared === 0 && <span className="text-xs ml-1" title="Using training MAPE - no forecast data available">*</span>}
+                              </span>
                             </td>
                             <td className="px-3 py-2 text-right text-gray-600">
                               <span className={row.actualBias > 0 ? 'text-orange-600' : row.actualBias < 0 ? 'text-blue-600' : ''}>
@@ -576,8 +656,10 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
                             <td className="px-3 py-2 text-right text-gray-600">
                               {row.actualRMSE.toFixed(2)}
                             </td>
-                            <td className="px-3 py-2 text-right text-gray-600">
-                              {row.periodsCompared}
+                            <td className="px-3 py-2 text-right">
+                              <span className={row.periodsCompared === 0 ? 'text-amber-600 font-medium' : 'text-gray-600'}>
+                                {row.periodsCompared === 0 ? '⚠ 0' : row.periodsCompared}
+                              </span>
                             </td>
                           </tr>
                         ))}

@@ -181,23 +181,25 @@ PROPHET_MAX_COMBINATIONS=12
 
 ### Batch Training Capacity
 
-**Sequential Processing (Current Implementation):**
-- Segments are processed one at a time for reliable progress tracking
-- Each segment takes 30s-3min depending on data size and models selected
-- **Recommended max segments per batch:** 20-50 segments
+### Batch Training Capacity
+
+**Parallel Processing (New Architecture):**
+- Segments are processed in parallel on the backend using `ThreadPoolExecutor`
+- Default workers: 4 (configurable via `MLFLOW_MAX_WORKERS`)
+- **Recommended max segments per batch:** 50+ segments (limited by browser timeout, not backend)
 
 | Segments | Est. Time (50K rows/seg, 2 models) | MLflow Runs Created |
 |----------|-----------------------------------|---------------------|
-| 5 | ~5-10 min | 5 parent runs |
-| 10 | ~10-20 min | 10 parent runs |
-| 20 | ~20-40 min | 20 parent runs |
-| 50 | ~50-100 min | 50 parent runs |
+| 5 | ~2-3 min | 5 parent runs |
+| 10 | ~4-6 min | 10 parent runs |
+| 20 | ~8-12 min | 20 parent runs |
+| 50 | ~20-30 min | 50 parent runs |
 
-**Why Sequential?**
-1. **Progress visibility** - Users see real-time progress per segment
-2. **Error isolation** - One segment failure doesn't affect others
-3. **Memory stability** - Prevents OOM on constrained environments
-4. **MLflow consistency** - Ensures proper run logging
+**Why Parallel?**
+1. **Speed** - Significantly faster execution (3-4x speedup)
+2. **Efficiency** - Better utilization of available vCPUs
+3. **Simplicity** - Single request/response cycle simplifies frontend state
+4. **Trade-off** - Progress bar is indeterminate ("Processing...") instead of incremental
 
 ### Memory Usage by Model
 
@@ -303,7 +305,7 @@ If you need to process larger datasets or more segments:
 
 **Yes.** The platform supports three frequencies:
 - `daily` - Day-level forecasts
-- `weekly` - Week-level forecasts
+- `weekly` - Week-level forecasts (auto-detects day-of-week from your data)
 - `monthly` - Month-level forecasts
 
 Select the frequency in the UI dropdown or pass it in the API:
@@ -314,6 +316,8 @@ Select the frequency in the UI dropdown or pass it in the API:
   "horizon": 12
 }
 ```
+
+**Weekly Frequency Note:** The system automatically detects which day of the week your data uses (Monday, Tuesday, etc.) and generates forecast dates on that same day. This ensures forecast dates align perfectly with your actuals for comparison.
 
 ### Does forecast frequency need to match training data frequency?
 
@@ -771,7 +775,9 @@ The batch training feature is now integrated into the UI via the `BatchTraining`
 
 **Features:**
 - **Multi-column segmentation**: Select multiple columns to create segment combinations
-- **Progress tracking**: Real-time progress bar with current segment indicator
+- **Parallel Processing**: Fast backend execution with indeterminate progress indicator
+- **Cancellation**: Stop ongoing training at any time (aborts client request)
+- **Storage Optimization**: Automatically manages browser storage limits (strips heavy history data)
 - **MAPE statistics**: Min, max, mean, median across all segments
 - **Status indicators**: Color-coded based on finance industry MAPE thresholds
 - **Filter by status**: Focus on excellent, good, acceptable, review, or deviation segments
@@ -834,6 +840,56 @@ Running `--segment-cols "region,product,channel"` will create separate forecasts
 **Output:**
 - `batch_results_{timestamp}.json` - Detailed results with run IDs and filter metadata
 - `batch_summary_{timestamp}.csv` - Summary with individual segment columns, metrics, and MAPE statistics
+
+#### Option 4: Batch Deployment ✅ IMPLEMENTED
+
+After batch training completes, deploy all segment models to a single serving endpoint:
+
+**How It Works:**
+1. A router model is created that routes requests to the correct segment-specific model
+2. Each individual model is tested with its logged input_example before deployment
+3. All models are packaged and deployed to a single endpoint
+
+**Request:**
+```json
+POST /api/deploy-batch
+{
+  "segments": [
+    {
+      "segment_id": "region=US | product=Widget",
+      "filters": {"region": "US", "product": "Widget"},
+      "model_version": "1",
+      "run_id": "abc123..."
+    }
+  ],
+  "endpoint_name": "finance-forecast-batch",
+  "catalog_name": "main",
+  "schema_name": "default",
+  "model_name": "finance_forecast_model"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Batch deployment complete",
+  "endpoint_name": "finance-forecast-batch",
+  "endpoint_url": "https://workspace.cloud.databricks.com/serving-endpoints/finance-forecast-batch",
+  "deployed_segments": 5,
+  "router_model_version": "1"
+}
+```
+
+**Pre-deployment Inference Testing:**
+
+Before deployment, each model is tested using its logged input_example from MLflow:
+- Extracts the input_example artifact logged during training
+- Runs inference with the input_example
+- Validates predictions are not NaN and have expected structure
+- Fails deployment if inference fails (prevents broken endpoints)
+
+This ensures models work correctly before going live.
 
 ---
 
@@ -1594,6 +1650,10 @@ class NeuralProphetWrapper(mlflow.pyfunc.PythonModel):
 
 | Feature | Files Changed | Description |
 |---------|---------------|-------------|
+| **Weekly Date Alignment Fix** | `models/prophet.py` | Auto-detect day-of-week from training data to align forecast dates with actuals |
+| **Batch Deployment** | `deploy_service.py`, `main.py`, `BatchResultsViewer.tsx`, `databricksApi.ts` | Deploy all batch-trained models to single endpoint with router model |
+| **Pre-deployment Inference Testing** | `deploy_service.py` | Models tested with logged input_example before deployment |
+| **Holidays Dependency Fix** | `models/arima.py`, `models/ets.py`, `models/xgboost.py` | Added `holidays` to pip deps for serving |
 | **Simplified Preprocessing** | `preprocessing.py`, `train_service.py`, `models_training.py` | Generic calendar + trend features, conditional YoY lags |
 | **Consistent Preprocessing** | `preprocessing.py`, `models_training.py` | All models use same preprocessing approach, no duplicates |
 | **Conditional YoY Lags** | `preprocessing.py` | Only added when 1+ year of data exists |
