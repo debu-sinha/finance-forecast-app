@@ -90,12 +90,12 @@ def get_holiday_weeks_for_year(year: int, country: str = 'US') -> Dict[pd.Timest
     return week_holidays
 
 
-def _add_holiday_week_features(df: pd.DataFrame, date_col: str, frequency: str) -> List[str]:
+def _add_holiday_features(df: pd.DataFrame, date_col: str, frequency: str) -> List[str]:
     """
-    Add holiday week indicator features for weekly data.
+    Add holiday indicator features for both daily and weekly data.
 
-    For weekly data, creates binary indicators for weeks containing major holidays.
-    This helps models learn holiday-specific patterns.
+    For daily data: creates binary indicator for holiday days
+    For weekly data: creates binary indicators for weeks containing major holidays
 
     Args:
         df: DataFrame to add features to (modified in place)
@@ -105,13 +105,96 @@ def _add_holiday_week_features(df: pd.DataFrame, date_col: str, frequency: str) 
     Returns:
         List of holiday column names that were added
     """
-    if frequency != 'weekly':
-        logger.info(f"Skipping holiday week features for {frequency} data (only for weekly)")
+    if frequency == 'monthly':
+        logger.info(f"Skipping holiday features for monthly data")
         return []
 
     if not HOLIDAYS_AVAILABLE:
         logger.warning("holidays package not installed. Run: pip install holidays")
         return []
+
+    # For daily data, add simple holiday indicator
+    if frequency == 'daily':
+        return _add_daily_holiday_features(df, date_col)
+
+    # For weekly data, add week-level indicators
+    return _add_weekly_holiday_features(df, date_col)
+
+
+def _add_daily_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
+    """
+    Add holiday features for daily data.
+
+    Creates:
+    - is_holiday: binary indicator (1 if date is a US holiday)
+    - days_to_holiday: days until next holiday (-ve if days after)
+    - is_holiday_adjacent: 1 if within 1 day of a holiday
+    """
+    dates = pd.to_datetime(df[date_col])
+    years = dates.dt.year.unique()
+
+    # Get all holidays for all years in data (plus buffer years)
+    all_holidays = set()
+    for year in list(years) + [min(years) - 1, max(years) + 1]:
+        try:
+            year_holidays = holidays.US(years=int(year))
+            all_holidays.update(year_holidays.keys())
+        except Exception as e:
+            logger.warning(f"Could not load holidays for {year}: {e}")
+
+    added_cols = []
+
+    # is_holiday: binary indicator
+    if 'is_holiday' not in df.columns:
+        df['is_holiday'] = dates.apply(lambda d: 1 if d.date() in all_holidays else 0).astype(int)
+        added_cols.append('is_holiday')
+
+    # is_holiday_adjacent: within 1 day of holiday
+    if 'is_holiday_adjacent' not in df.columns:
+        def is_adjacent(d):
+            for offset in [-1, 0, 1]:
+                check_date = (d + pd.Timedelta(days=offset)).date()
+                if check_date in all_holidays:
+                    return 1
+            return 0
+        df['is_holiday_adjacent'] = dates.apply(is_adjacent).astype(int)
+        added_cols.append('is_holiday_adjacent')
+
+    # Add specific major holiday indicators (without year - same pattern each year)
+    # These use month/day patterns that repeat yearly
+    major_holiday_patterns = {
+        'is_new_years': lambda d: d.month == 1 and d.day <= 2,
+        'is_july4': lambda d: d.month == 7 and 3 <= d.day <= 5,
+        'is_christmas': lambda d: d.month == 12 and 24 <= d.day <= 26,
+        'is_thanksgiving_period': lambda d: d.month == 11 and 22 <= d.day <= 28,  # Thanksgiving is 4th Thursday
+        'is_super_bowl_period': lambda d: d.month == 2 and d.day <= 14 and d.weekday() == 6,  # First 2 Sundays of Feb
+    }
+
+    for col_name, pattern_fn in major_holiday_patterns.items():
+        if col_name not in df.columns:
+            df[col_name] = dates.apply(lambda d: 1 if pattern_fn(d) else 0).astype(int)
+            added_cols.append(col_name)
+
+    holiday_count = df['is_holiday'].sum() if 'is_holiday' in df.columns else 0
+    logger.info(f"Added daily holiday features: {added_cols} ({holiday_count} holiday days found)")
+
+    return added_cols
+
+
+def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
+    """
+    Add holiday week indicator features for weekly data.
+
+    Creates binary indicators for weeks containing major holidays.
+    This helps models learn holiday-specific patterns.
+
+    Args:
+        df: DataFrame to add features to (modified in place)
+        date_col: Name of the date column
+
+    Returns:
+        List of holiday column names that were added
+    """
 
     dates = pd.to_datetime(df[date_col])
     years = dates.dt.year.unique()
@@ -223,8 +306,8 @@ def enhance_features_for_forecasting(
     # 2. Add trend features (helps XGBoost especially)
     _add_trend_features(result, date_col)
 
-    # 3. Add holiday week features (for weekly data)
-    _add_holiday_week_features(result, date_col, frequency)
+    # 3. Add holiday features (daily or weekly)
+    _add_holiday_features(result, date_col, frequency)
 
     # 4. Conditionally add YoY lag features if enough history exists
     if target_col in result.columns:
@@ -376,10 +459,21 @@ def get_derived_feature_columns(promo_cols: Optional[List[str]] = None) -> List[
         'lag_12_avg',
     ]
 
-    # Holiday week features (added for weekly data)
-    holiday_features = list(MAJOR_HOLIDAYS.values()) + ['is_super_bowl_week', 'is_black_friday_week']
+    # Holiday features
+    # Daily: is_holiday, is_holiday_adjacent, is_new_years, is_july4, is_christmas, is_thanksgiving_period, is_super_bowl_period
+    # Weekly: is_*_week for each major holiday
+    daily_holiday_features = [
+        'is_holiday',
+        'is_holiday_adjacent',
+        'is_new_years',
+        'is_july4',
+        'is_christmas',
+        'is_thanksgiving_period',
+        'is_super_bowl_period',
+    ]
+    weekly_holiday_features = list(MAJOR_HOLIDAYS.values()) + ['is_super_bowl_week', 'is_black_friday_week']
 
-    return base_features + holiday_features
+    return base_features + daily_holiday_features + weekly_holiday_features
 
 
 def prepare_future_features(
@@ -420,8 +514,8 @@ def prepare_future_features(
     result['time_index'] = range(hist_len, hist_len + len(result))
     result['year'] = pd.to_datetime(result[date_col]).dt.year
 
-    # Add holiday week features (for weekly data)
-    _add_holiday_week_features(result, date_col, frequency)
+    # Add holiday features (daily or weekly)
+    _add_holiday_features(result, date_col, frequency)
 
     # Add YoY lag values from historical data
     _add_future_yoy_lags(result, historical_df, date_col, target_col, frequency)
