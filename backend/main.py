@@ -27,6 +27,14 @@ from backend.deploy_service import (
 )
 from backend.ai_service import analyze_dataset, generate_forecast_insights, generate_executive_summary
 
+# Simple Mode - Autopilot forecasting for finance users
+try:
+    from backend.simple_mode import simple_mode_router
+    SIMPLE_MODE_AVAILABLE = True
+except ImportError:
+    SIMPLE_MODE_AVAILABLE = False
+    simple_mode_router = None
+
 # Configure logging with both console and file handlers
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -158,6 +166,11 @@ app.add_middleware(
 static_dir = "dist" if os.path.exists("dist") else "../dist"
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=f"{static_dir}/assets"), name="assets")
+
+# Register Simple Mode routes
+if SIMPLE_MODE_AVAILABLE and simple_mode_router:
+    app.include_router(simple_mode_router)
+    logger.info("✅ Simple Mode routes registered at /api/simple/*")
 
 @app.get("/")
 async def root():

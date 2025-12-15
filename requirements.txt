@@ -17,3 +17,5 @@ statsmodels
 xgboost
 pydantic
 requests
+openpyxl
+holidays

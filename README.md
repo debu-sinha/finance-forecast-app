@@ -15,6 +15,7 @@ A comprehensive **prototype and reference implementation** for an AI-powered tim
 
 ### Key Features
 
+*   **Simple Mode (NEW!)**: Autopilot forecasting for finance users - upload data, get forecast. No ML knowledge required.
 *   **AutoML Forecasting Paradigm**: Automatically trains and compares multiple model types (Prophet, ARIMA, Exponential Smoothing, SARIMAX, XGBoost) to find the best fit for your data.
 *   **Time Series Cross-Validation**: Expanding window CV for robust metric estimation (not just single holdout).
 *   **Statistical Prediction Intervals**: Residual-based confidence bounds using t-distribution (not arbitrary ±10%).
@@ -27,7 +28,7 @@ A comprehensive **prototype and reference implementation** for an AI-powered tim
 *   **Batch Comparison Scorecard**: Compare batch forecasts against actuals across all segments with status breakdown.
 *   **Full Reproducibility**: Logs exact training datasets, random seeds, and generates reproducible Python code.
 *   **Enterprise Governance**: Full integration with Unity Catalog and MLflow experiment tracking.
-*   **Export Capabilities**: Download comparison reports (CSV), batch results, scorecards, and executive summaries (Markdown).
+*   **Export Capabilities**: Download comparison reports (CSV), batch results, scorecards, Excel with formulas, and executive summaries (Markdown).
 
 ---
 
@@ -57,6 +58,13 @@ databricks-forecast-for-finance/
 │   │   ├── arima.py               # ARIMA/SARIMAX model training
 │   │   ├── ets.py                 # Exponential Smoothing training
 │   │   └── xgboost.py             # XGBoost model training
+│   ├── simple_mode/               # Simple Mode - Autopilot forecasting
+│   │   ├── __init__.py
+│   │   ├── api.py                 # Simple mode API endpoints
+│   │   ├── data_profiler.py       # Auto-detect frequency, columns, quality
+│   │   ├── autopilot_config.py    # Generate optimal config
+│   │   ├── forecast_explainer.py  # Excel-level transparency
+│   │   └── excel_exporter.py      # Export with formulas
 │   └── tests/                     # Backend tests
 │       └── test_model_inference.py
 │
@@ -509,6 +517,93 @@ This replaces arbitrary ±10% bounds with **statistically valid intervals** base
 ---
 
 ## Backend API Reference
+
+### Simple Mode Endpoints (NEW!)
+
+Simple Mode provides autopilot forecasting for finance users who want Excel-like simplicity with ML accuracy.
+
+#### POST /api/simple/profile
+
+Profile uploaded data without running forecast. Returns auto-detected settings so user can review before forecasting.
+
+**Request:** Multipart form with CSV/Excel file
+
+**Response:**
+```json
+{
+  "success": true,
+  "profile": {
+    "frequency": "weekly",
+    "date_column": "week_start",
+    "target_column": "revenue",
+    "history_months": 18.5,
+    "data_quality_score": 92.5,
+    "holiday_coverage_score": 45.0,
+    "recommended_models": ["prophet", "xgboost"],
+    "recommended_horizon": 12
+  },
+  "warnings": [
+    {
+      "level": "medium",
+      "message": "Only 18 months of data. Holiday forecasts may be less accurate.",
+      "recommendation": "Provide 2+ years of data for best holiday accuracy."
+    }
+  ]
+}
+```
+
+#### POST /api/simple/forecast
+
+Upload data and get forecast automatically. All configuration is auto-detected.
+
+**Request:** Multipart form with CSV/Excel file, optional `horizon` query parameter
+
+**Response:**
+```json
+{
+  "success": true,
+  "mode": "simple",
+  "run_id": "abc123",
+  "summary": "Forecast Summary: Total $1.2M, Trend: +5.2%, Confidence: High",
+  "forecast": [102000, 105000, ...],
+  "dates": ["2025-01-06", "2025-01-13", ...],
+  "components": {
+    "formula": "Forecast = Base + Trend + Seasonality + Holiday Effect",
+    "periods": [...]
+  },
+  "confidence": {
+    "level": "high",
+    "score": 85,
+    "mape": 4.2
+  },
+  "audit": {
+    "run_id": "abc123",
+    "data_hash": "7f83b165...",
+    "reproducibility_token": "7f83b165:2c26b46b:1.0"
+  },
+  "excel_download_url": "/api/simple/export/abc123/excel"
+}
+```
+
+#### GET /api/simple/export/{run_id}/excel
+
+Download forecast as Excel file with multiple sheets:
+- Summary (executive view)
+- Forecast Detail (with Excel formulas showing Base + Trend + Seasonal + Holiday)
+- Components breakdown
+- Confidence factors
+- Audit trail (for compliance)
+- Raw data
+
+#### GET /api/simple/export/{run_id}/csv
+
+Download forecast as simple CSV file.
+
+#### POST /api/simple/reproduce/{run_id}
+
+Reproduce an exact previous forecast using stored configuration and data hash.
+
+---
 
 ### Core Endpoints
 
