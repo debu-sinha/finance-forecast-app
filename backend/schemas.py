@@ -41,6 +41,11 @@ class TrainRequest(BaseModel):
     batch_segment_id: Optional[str] = Field(default=None, description="Human-readable segment identifier (e.g., 'region=US | product=Widget')")
     batch_segment_index: Optional[int] = Field(default=None, description="Segment index within the batch (1-based)")
     batch_total_segments: Optional[int] = Field(default=None, description="Total number of segments in the batch")
+    # Hyperparameter guidance from data analysis - reduces search space
+    hyperparameter_filters: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Data-driven hyperparameter filters per model. Keys are model names (Prophet, ARIMA, ETS, XGBoost), values are dicts of param_name -> allowed_values."
+    )
     
     class Config:
         json_schema_extra = {
@@ -365,3 +370,46 @@ class BatchDeployResponse(BaseModel):
     endpoint_url: Optional[str] = Field(None, description="URL to the endpoint")
     deployed_segments: Optional[int] = Field(None, description="Number of segments deployed")
     router_model_version: Optional[str] = Field(None, description="Version of the router model")
+
+
+class DataAnalysisRequest(BaseModel):
+    """Request model for data analysis endpoint"""
+    data: List[Dict[str, Any]] = Field(..., description="Time series data rows")
+    time_col: str = Field(..., description="Name of the time/date column")
+    target_col: str = Field(..., description="Name of the target column to forecast")
+    frequency: str = Field(default="auto", description="Frequency: 'daily', 'weekly', 'monthly', or 'auto'")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "data": [
+                    {"ds": "2023-01-01", "y": 1000},
+                    {"ds": "2023-02-01", "y": 1100}
+                ],
+                "time_col": "ds",
+                "target_col": "y",
+                "frequency": "monthly"
+            }
+        }
+
+
+class ModelRecommendationResponse(BaseModel):
+    """Model recommendation from data analysis"""
+    model: str = Field(..., description="Model name")
+    recommended: bool = Field(..., description="Whether this model is recommended")
+    confidence: float = Field(..., description="Confidence score 0-1")
+    reason: str = Field(..., description="Reason for recommendation")
+
+
+class DataAnalysisResponse(BaseModel):
+    """Response model for data analysis endpoint"""
+    dataQuality: Dict[str, Any] = Field(..., description="Data quality assessment")
+    dataStats: Dict[str, Any] = Field(..., description="Data statistics")
+    patterns: Dict[str, Any] = Field(..., description="Detected patterns (trend, seasonality)")
+    modelRecommendations: List[ModelRecommendationResponse] = Field(..., description="Model recommendations")
+    recommendedModels: List[str] = Field(..., description="List of recommended model names")
+    excludedModels: List[str] = Field(..., description="List of excluded model names")
+    warnings: List[str] = Field(..., description="Data quality warnings")
+    notes: List[str] = Field(..., description="Additional notes")
+    overallRecommendation: str = Field(..., description="Overall recommendation summary")
+    hyperparameterFilters: Dict[str, Dict[str, Any]] = Field(..., description="Hyperparameter filters per model")

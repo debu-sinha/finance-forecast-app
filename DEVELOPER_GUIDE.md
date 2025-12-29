@@ -56,6 +56,7 @@ All tunable parameters are controlled via environment variables. Set these in `.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MLFLOW_EXPERIMENT_NAME` | `/Shared/finance-forecasting` | MLflow experiment path |
+| `MLFLOW_SKIP_CHILD_RUNS` | `false` | Set to `true` to skip logging child runs (reduces MLflow overhead) |
 | `UC_CATALOG_NAME` | `main` | Unity Catalog catalog name |
 | `UC_SCHEMA_NAME` | `default` | Unity Catalog schema name |
 | `UC_MODEL_NAME` | `main.default.finance_forecast_model` | Full model path in Unity Catalog |
@@ -1646,7 +1647,39 @@ class NeuralProphetWrapper(mlflow.pyfunc.PythonModel):
 
 ## Recent Changes (December 2024)
 
-### Completed Features
+### v1.2.0 - Holiday Proximity Features & Accuracy Improvements (December 29, 2024)
+
+| Feature | Files Changed | Description |
+|---------|---------------|-------------|
+| **Holiday Proximity Features** | `preprocessing.py` | Added 8 new features for Thanksgiving/Christmas proximity (weeks_to/after, is_pre/post flags) |
+| **Stricter MAPE Thresholds** | `simple_mode/forecast_explainer.py` | Updated thresholds: ≤1% Excellent, 1-3% Very Good, 3-5% Good, 5-10% Fair, >10% Low |
+| **MLflow Logging Reduction** | `models/prophet.py` | Added `MLFLOW_SKIP_CHILD_RUNS` env var to reduce logging overhead |
+| **Intelligent Hyperparameter Filters** | `simple_mode/autopilot_config.py` | Data-driven hyperparameter search space based on data profile |
+| **Adversarial Test Suite** | `tests/test_simple_mode_e2e.py` | 12 comprehensive tests for both Simple and Expert modes |
+| **Week Frequency Detection** | `models/arima.py`, `models/ets.py` | Auto-detect W-MON, W-TUE, etc. from training data |
+| **Thanksgiving Date Calculator** | `preprocessing.py` | Accurate Thanksgiving date calculation (4th Thursday of November) |
+
+**Holiday Proximity Features Added:**
+- `weeks_to_thanksgiving` / `weeks_after_thanksgiving` - Integer weeks before/after
+- `weeks_to_christmas` / `weeks_after_christmas` - Integer weeks before/after
+- `is_pre_thanksgiving` / `is_post_thanksgiving` - Boolean flags (within 2 weeks)
+- `is_pre_christmas` / `is_post_christmas` - Boolean flags (within 2 weeks)
+
+**Test Coverage Added:**
+- Data Profiler validation
+- Holiday feature generation verification
+- Data leakage prevention checks
+- Time series split logic validation
+- Metric calculation correctness
+- Future feature preparation
+- Autopilot configuration
+- Forecast explainer thresholds
+- MLflow config options
+- Thanksgiving date accuracy
+- Week frequency detection
+- Reproducibility guarantees
+
+### v1.1.0 - Batch Deployment & Inference Testing (December 2024)
 
 | Feature | Files Changed | Description |
 |---------|---------------|-------------|

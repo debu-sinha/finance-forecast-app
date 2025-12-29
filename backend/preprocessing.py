@@ -50,6 +50,22 @@ MAJOR_HOLIDAYS = {
 # Black Friday (day after Thanksgiving)
 # These are added separately as they're not in the holidays library
 
+# Holiday proximity windows - how many weeks before/after to track
+HOLIDAY_PROXIMITY_WEEKS = 2  # Track 2 weeks before and after major holidays
+
+
+def get_thanksgiving_date(year: int) -> pd.Timestamp:
+    """Get the date of Thanksgiving (4th Thursday of November) for a given year."""
+    first_day = pd.Timestamp(year=year, month=11, day=1)
+    first_thursday = first_day + pd.Timedelta(days=(3 - first_day.dayofweek) % 7)
+    fourth_thursday = first_thursday + pd.Timedelta(weeks=3)
+    return fourth_thursday
+
+
+def get_christmas_date(year: int) -> pd.Timestamp:
+    """Get Christmas date for a given year."""
+    return pd.Timestamp(year=year, month=12, day=25)
+
 
 def get_holiday_weeks_for_year(year: int, country: str = 'US') -> Dict[pd.Timestamp, str]:
     """
@@ -224,34 +240,43 @@ def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
             df[col] = 0
             added_cols.append(col)
 
-    # Mark holiday weeks
-    for idx, row in df.iterrows():
-        row_date = pd.Timestamp(row[date_col])
-        # Get the Monday of this week
-        week_start = row_date - pd.Timedelta(days=row_date.dayofweek)
+    # Mark holiday weeks using vectorized operations (much faster than iterrows)
+    dates = pd.to_datetime(df[date_col])
+    # Calculate week start (Monday) for each date vectorized
+    week_starts = dates - pd.to_timedelta(dates.dt.dayofweek, unit='D')
 
-        # Check if this week contains a holiday
-        if week_start in all_holiday_weeks:
-            col_name = all_holiday_weeks[week_start]
-            df.at[idx, col_name] = 1
+    # Mark holiday weeks by checking against all_holiday_weeks dictionary
+    for week_start_date, col_name in all_holiday_weeks.items():
+        mask = week_starts == week_start_date
+        if mask.any():
+            df.loc[mask, col_name] = 1
 
-        # Check for Black Friday week (week containing 4th Thursday of November)
-        if row_date.month == 11:
-            # Find 4th Thursday of November
-            first_day = pd.Timestamp(year=row_date.year, month=11, day=1)
+    # Vectorized Black Friday week detection (4th Thursday of November)
+    november_mask = dates.dt.month == 11
+    if november_mask.any():
+        nov_dates = dates[november_mask]
+        nov_years = nov_dates.dt.year.unique()
+        for year in nov_years:
+            first_day = pd.Timestamp(year=year, month=11, day=1)
             first_thursday = first_day + pd.Timedelta(days=(3 - first_day.dayofweek) % 7)
             fourth_thursday = first_thursday + pd.Timedelta(weeks=3)
             thanksgiving_week_start = fourth_thursday - pd.Timedelta(days=fourth_thursday.dayofweek)
-            if week_start == thanksgiving_week_start:
-                df.at[idx, 'is_black_friday_week'] = 1
+            bf_mask = (week_starts == thanksgiving_week_start)
+            if bf_mask.any():
+                df.loc[bf_mask, 'is_black_friday_week'] = 1
 
-        # Check for Super Bowl week (typically first Sunday of February)
-        if row_date.month == 2:
-            first_day = pd.Timestamp(year=row_date.year, month=2, day=1)
+    # Vectorized Super Bowl week detection (first Sunday of February)
+    february_mask = dates.dt.month == 2
+    if february_mask.any():
+        feb_dates = dates[february_mask]
+        feb_years = feb_dates.dt.year.unique()
+        for year in feb_years:
+            first_day = pd.Timestamp(year=year, month=2, day=1)
             first_sunday = first_day + pd.Timedelta(days=(6 - first_day.dayofweek) % 7)
             super_bowl_week_start = first_sunday - pd.Timedelta(days=first_sunday.dayofweek)
-            if week_start == super_bowl_week_start:
-                df.at[idx, 'is_super_bowl_week'] = 1
+            sb_mask = (week_starts == super_bowl_week_start)
+            if sb_mask.any():
+                df.loc[sb_mask, 'is_super_bowl_week'] = 1
 
     # Log which holidays were found
     found_holidays = []
@@ -263,6 +288,107 @@ def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
         logger.info(f"Added holiday week features: {', '.join(found_holidays)}")
     else:
         logger.info("Added holiday week columns (no holidays found in date range)")
+
+    # Add enhanced holiday proximity features for Thanksgiving and Christmas
+    # These help models learn pre-holiday ramp-up and post-holiday patterns
+    proximity_cols = _add_holiday_proximity_features(df, date_col, dates)
+    added_cols.extend(proximity_cols)
+
+    return added_cols
+
+
+def _add_holiday_proximity_features(
+    df: pd.DataFrame,
+    date_col: str,
+    dates: pd.Series
+) -> List[str]:
+    """
+    Add holiday proximity features that help models learn:
+    1. Pre-holiday ramp-up patterns (weeks_to_thanksgiving = 2, 1, 0)
+    2. Post-holiday patterns (weeks_after_thanksgiving = 1, 2)
+    3. Holiday magnitude hints (yoy_thanksgiving_ratio if historical data exists)
+
+    These features are critical for accurate Thanksgiving/Christmas predictions.
+    """
+    added_cols = []
+    years = dates.dt.year.unique()
+
+    # Initialize proximity columns
+    df['weeks_to_thanksgiving'] = -999  # -999 = not near Thanksgiving
+    df['weeks_after_thanksgiving'] = -999
+    df['weeks_to_christmas'] = -999
+    df['weeks_after_christmas'] = -999
+    df['is_pre_thanksgiving'] = 0  # 1-2 weeks before
+    df['is_post_thanksgiving'] = 0  # 1-2 weeks after
+    df['is_pre_christmas'] = 0
+    df['is_post_christmas'] = 0
+
+    added_cols.extend([
+        'weeks_to_thanksgiving', 'weeks_after_thanksgiving',
+        'weeks_to_christmas', 'weeks_after_christmas',
+        'is_pre_thanksgiving', 'is_post_thanksgiving',
+        'is_pre_christmas', 'is_post_christmas'
+    ])
+
+    # Calculate week start for each row (vectorized)
+    week_starts = dates - pd.to_timedelta(dates.dt.dayofweek, unit='D')
+
+    for year in years:
+        try:
+            # Thanksgiving proximity
+            thanksgiving = get_thanksgiving_date(int(year))
+            thanksgiving_week_start = thanksgiving - pd.Timedelta(days=thanksgiving.dayofweek)
+
+            for weeks_offset in range(-HOLIDAY_PROXIMITY_WEEKS, HOLIDAY_PROXIMITY_WEEKS + 1):
+                target_week = thanksgiving_week_start + pd.Timedelta(weeks=weeks_offset)
+                mask = (week_starts == target_week)
+
+                if mask.any():
+                    if weeks_offset < 0:
+                        # Weeks before Thanksgiving
+                        df.loc[mask, 'weeks_to_thanksgiving'] = abs(weeks_offset)
+                        df.loc[mask, 'is_pre_thanksgiving'] = 1
+                    elif weeks_offset == 0:
+                        df.loc[mask, 'weeks_to_thanksgiving'] = 0
+                    else:
+                        # Weeks after Thanksgiving
+                        df.loc[mask, 'weeks_after_thanksgiving'] = weeks_offset
+                        df.loc[mask, 'is_post_thanksgiving'] = 1
+
+            # Christmas proximity
+            christmas = get_christmas_date(int(year))
+            christmas_week_start = christmas - pd.Timedelta(days=christmas.dayofweek)
+
+            for weeks_offset in range(-HOLIDAY_PROXIMITY_WEEKS, HOLIDAY_PROXIMITY_WEEKS + 1):
+                target_week = christmas_week_start + pd.Timedelta(weeks=weeks_offset)
+                mask = (week_starts == target_week)
+
+                if mask.any():
+                    if weeks_offset < 0:
+                        df.loc[mask, 'weeks_to_christmas'] = abs(weeks_offset)
+                        df.loc[mask, 'is_pre_christmas'] = 1
+                    elif weeks_offset == 0:
+                        df.loc[mask, 'weeks_to_christmas'] = 0
+                    else:
+                        df.loc[mask, 'weeks_after_christmas'] = weeks_offset
+                        df.loc[mask, 'is_post_christmas'] = 1
+
+        except Exception as e:
+            logger.warning(f"Could not calculate holiday proximity for year {year}: {e}")
+
+    # Replace -999 with a neutral value (far from holiday)
+    df['weeks_to_thanksgiving'] = df['weeks_to_thanksgiving'].replace(-999, 99)
+    df['weeks_after_thanksgiving'] = df['weeks_after_thanksgiving'].replace(-999, 99)
+    df['weeks_to_christmas'] = df['weeks_to_christmas'].replace(-999, 99)
+    df['weeks_after_christmas'] = df['weeks_after_christmas'].replace(-999, 99)
+
+    # Log what we added
+    pre_thx_count = df['is_pre_thanksgiving'].sum()
+    post_thx_count = df['is_post_thanksgiving'].sum()
+    thx_week_count = (df['weeks_to_thanksgiving'] == 0).sum()
+
+    logger.info(f"Added holiday proximity features: "
+                f"Thanksgiving week={thx_week_count}, pre={pre_thx_count}, post={post_thx_count}")
 
     return added_cols
 
@@ -473,7 +599,15 @@ def get_derived_feature_columns(promo_cols: Optional[List[str]] = None) -> List[
     ]
     weekly_holiday_features = list(MAJOR_HOLIDAYS.values()) + ['is_super_bowl_week', 'is_black_friday_week']
 
-    return base_features + daily_holiday_features + weekly_holiday_features
+    # Holiday proximity features (for better Thanksgiving/Christmas predictions)
+    holiday_proximity_features = [
+        'weeks_to_thanksgiving', 'weeks_after_thanksgiving',
+        'weeks_to_christmas', 'weeks_after_christmas',
+        'is_pre_thanksgiving', 'is_post_thanksgiving',
+        'is_pre_christmas', 'is_post_christmas',
+    ]
+
+    return base_features + daily_holiday_features + weekly_holiday_features + holiday_proximity_features
 
 
 def prepare_future_features(

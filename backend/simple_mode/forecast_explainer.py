@@ -179,10 +179,10 @@ class ForecastExplainer:
             trend_pct = 0
             trend_direction = "stable"
 
-        # Confidence level
-        if mape <= 5:
+        # Confidence level (stricter thresholds for financial forecasting)
+        if mape <= 3:
             confidence = "High"
-        elif mape <= 10:
+        elif mape <= 5:
             confidence = "Medium"
         else:
             confidence = "Low"
@@ -325,15 +325,20 @@ All parameters were optimized for your specific data patterns."""
         factors = []
 
         # MAPE factor (40% weight)
-        if mape <= 5:
+        # Stricter thresholds aligned with financial forecasting requirements
+        # Target: Under 1% MAPE for production-grade forecasts
+        if mape <= 1:
             mape_score = 100
-            factors.append({'factor': 'Accuracy', 'score': 100, 'note': 'Excellent (MAPE ≤5%)'})
-        elif mape <= 10:
+            factors.append({'factor': 'Accuracy', 'score': 100, 'note': 'Excellent (MAPE ≤1%)'})
+        elif mape <= 3:
+            mape_score = 90
+            factors.append({'factor': 'Accuracy', 'score': 90, 'note': 'Very Good (MAPE 1-3%)'})
+        elif mape <= 5:
             mape_score = 75
-            factors.append({'factor': 'Accuracy', 'score': 75, 'note': 'Good (MAPE 5-10%)'})
-        elif mape <= 15:
+            factors.append({'factor': 'Accuracy', 'score': 75, 'note': 'Good (MAPE 3-5%)'})
+        elif mape <= 10:
             mape_score = 50
-            factors.append({'factor': 'Accuracy', 'score': 50, 'note': 'Fair (MAPE 10-15%)'})
+            factors.append({'factor': 'Accuracy', 'score': 50, 'note': 'Fair (MAPE 5-10%)'})
         else:
             mape_score = 25
             factors.append({'factor': 'Accuracy', 'score': 25, 'note': f'Low (MAPE {mape:.1f}%)'})

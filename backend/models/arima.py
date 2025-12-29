@@ -514,7 +514,8 @@ def train_arima_model(
     order: Tuple[int, int, int] = None,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    covariates: List[str] = None  # Kept for API compatibility but NOT used - ARIMA is univariate
+    covariates: List[str] = None,  # Kept for API compatibility but NOT used - ARIMA is univariate
+    hyperparameter_filters: Dict[str, Any] = None
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Tuple[int, int, int]]:
     """
     Train ARIMA model with hyperparameter tuning and MLflow logging
@@ -539,11 +540,20 @@ def train_arima_model(
     best_artifact_uri = None
     
     # Define grid search space if order is not provided
+    # Apply hyperparameter filters from data analysis if provided
+    arima_filters = (hyperparameter_filters or {}).get('ARIMA', {})
+
     if order is None:
         max_arima_combinations = int(os.environ.get('ARIMA_MAX_COMBINATIONS', '6'))
-        p_values = [0, 1, 2]
-        d_values = [0, 1]
-        q_values = [0, 1]
+
+        # Use filtered values if provided, otherwise use defaults
+        p_values = arima_filters.get('p_values', [0, 1, 2])
+        d_values = arima_filters.get('d_values', [0, 1])
+        q_values = arima_filters.get('q_values', [0, 1])
+
+        if arima_filters:
+            logger.info(f"📊 Using data-driven ARIMA filters: p={p_values}, d={d_values}, q={q_values}")
+
         all_orders = list(set(itertools.product(p_values, d_values, q_values)))
         if len(all_orders) > max_arima_combinations:
             all_orders.sort(key=lambda x: sum(x))
@@ -748,7 +758,8 @@ def train_sarimax_model(
     covariates: List[str] = None,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    country: str = 'US'
+    country: str = 'US',
+    hyperparameter_filters: Dict[str, Any] = None
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
     Train SARIMAX model with hyperparameter tuning and MLflow logging
@@ -805,14 +816,20 @@ def train_sarimax_model(
     best_run_id = None
     best_artifact_uri = None
 
-    # Grid search space
+    # Grid search space - apply hyperparameter filters from data analysis if provided
+    sarimax_filters = (hyperparameter_filters or {}).get('SARIMAX', {})
     max_combinations = int(os.environ.get('SARIMAX_MAX_COMBINATIONS', '8'))
-    p_values = [0, 1, 2]
-    d_values = [0, 1]
-    q_values = [0, 1]
-    P_values = [0, 1]
-    D_values = [0, 1]
-    Q_values = [0, 1]
+
+    # Use filtered values if provided, otherwise use defaults
+    p_values = sarimax_filters.get('p_values', [0, 1, 2])
+    d_values = sarimax_filters.get('d_values', [0, 1])
+    q_values = sarimax_filters.get('q_values', [0, 1])
+    P_values = sarimax_filters.get('P_values', [0, 1])
+    D_values = sarimax_filters.get('D_values', [0, 1])
+    Q_values = sarimax_filters.get('Q_values', [0, 1])
+
+    if sarimax_filters:
+        logger.info(f"📊 Using data-driven SARIMAX filters: p={p_values}, d={d_values}, q={q_values}, P={P_values}, D={D_values}, Q={Q_values}")
 
     all_orders = []
     for p, d, q in itertools.product(p_values, d_values, q_values):

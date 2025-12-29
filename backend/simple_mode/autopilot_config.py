@@ -68,18 +68,38 @@ class ForecastConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
+
+        def _convert_value(val):
+            """Convert numpy types to native Python types for JSON serialization."""
+            import numpy as np
+            if isinstance(val, np.bool_):
+                return bool(val)
+            elif isinstance(val, np.integer):
+                return int(val)
+            elif isinstance(val, np.floating):
+                return float(val)
+            elif isinstance(val, dict):
+                return {k: _convert_value(v) for k, v in val.items()}
+            elif isinstance(val, (list, tuple)):
+                return [_convert_value(v) for v in val]
+            return val
+
         return {
             'frequency': self.frequency,
             'date_column': self.date_column,
             'target_column': self.target_column,
             'covariate_columns': self.covariate_columns,
-            'horizon': self.horizon,
+            'horizon': int(self.horizon),
             'models': self.models,
             'model_configs': {
-                k: {'model_type': v.model_type, 'enabled': v.enabled, 'params': v.params}
+                k: {
+                    'model_type': v.model_type,
+                    'enabled': bool(v.enabled),
+                    'params': _convert_value(v.params)
+                }
                 for k, v in self.model_configs.items()
             },
-            'random_seed': self.random_seed,
+            'random_seed': int(self.random_seed),
             'config_version': self.config_version,
             'generated_at': self.generated_at,
             'generation_mode': self.generation_mode,
@@ -267,3 +287,168 @@ def generate_reproducibility_token(
     Same token = guaranteed same output.
     """
     return f"{data_hash}:{config_hash}:{model_version}"
+
+
+def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str, Any]]:
+    """
+    Generate intelligent hyperparameter filters based on data profile.
+
+    These filters are passed to model training functions to reduce the search space
+    based on data characteristics. This makes training faster and more targeted.
+
+    Args:
+        profile: DataProfile from DataProfiler with detected data characteristics
+
+    Returns:
+        Dictionary of model name -> hyperparameter constraints
+        Format matches what backend/models/*.py expect
+    """
+    filters = {}
+
+    # Calculate derived metrics
+    n_observations = profile.total_periods
+    n_years = profile.history_months / 12.0
+
+    logger.info(f"Generating hyperparameter filters for {n_observations} observations, {n_years:.1f} years")
+
+    # ============================================================
+    # PROPHET HYPERPARAMETERS
+    # ============================================================
+    prophet_hp = {}
+
+    # Adjust search space based on data size
+    if n_observations < 52:
+        # Small dataset: use simpler models to avoid overfitting
+        prophet_hp['changepoint_prior_scale'] = [0.01, 0.05, 0.1]
+        prophet_hp['seasonality_prior_scale'] = [0.1, 1.0]
+    elif n_observations < 104:
+        # Medium dataset: moderate search space
+        prophet_hp['changepoint_prior_scale'] = [0.01, 0.05, 0.1, 0.5]
+        prophet_hp['seasonality_prior_scale'] = [0.1, 1.0, 10.0]
+    else:
+        # Large dataset: can handle more flexibility
+        prophet_hp['changepoint_prior_scale'] = [0.01, 0.05, 0.1, 0.5, 1.0]
+        prophet_hp['seasonality_prior_scale'] = [0.1, 1.0, 10.0]
+
+    # Yearly seasonality: only enable if we have enough data
+    if n_years < 2:
+        prophet_hp['yearly_seasonality'] = [False]
+
+    # Weekly seasonality based on frequency
+    if profile.frequency == 'daily':
+        prophet_hp['weekly_seasonality'] = [True]
+    elif profile.frequency == 'monthly':
+        prophet_hp['weekly_seasonality'] = [False]
+
+    # Seasonality mode based on detected patterns
+    # Multiplicative: seasonal amplitude grows with trend (common in financial data)
+    # Additive: seasonal amplitude stays constant
+    if profile.has_trend and profile.has_seasonality:
+        prophet_hp['seasonality_mode'] = ['multiplicative']
+    elif profile.has_seasonality:
+        prophet_hp['seasonality_mode'] = ['additive', 'multiplicative']
+    else:
+        prophet_hp['seasonality_mode'] = ['additive']
+
+    filters['Prophet'] = prophet_hp
+
+    # ============================================================
+    # ARIMA HYPERPARAMETERS
+    # ============================================================
+    arima_hp = {}
+
+    if n_observations < 50:
+        # Small dataset: constrain search space
+        arima_hp['p_values'] = [0, 1, 2]
+        arima_hp['d_values'] = [0, 1]
+        arima_hp['q_values'] = [0, 1, 2]
+    elif n_observations < 100:
+        arima_hp['p_values'] = [0, 1, 2, 3]
+        arima_hp['d_values'] = [0, 1, 2]
+        arima_hp['q_values'] = [0, 1, 2, 3]
+    else:
+        # Larger dataset: allow fuller search
+        arima_hp['p_values'] = [0, 1, 2, 3, 4]
+        arima_hp['d_values'] = [0, 1, 2]
+        arima_hp['q_values'] = [0, 1, 2, 3, 4]
+
+    filters['ARIMA'] = arima_hp
+
+    # ============================================================
+    # SARIMAX HYPERPARAMETERS (for models with covariates)
+    # ============================================================
+    sarimax_hp = {}
+
+    if n_observations < 50:
+        sarimax_hp['p_values'] = [0, 1, 2]
+        sarimax_hp['d_values'] = [0, 1]
+        sarimax_hp['q_values'] = [0, 1, 2]
+    elif n_observations < 100:
+        sarimax_hp['p_values'] = [0, 1, 2, 3]
+        sarimax_hp['d_values'] = [0, 1, 2]
+        sarimax_hp['q_values'] = [0, 1, 2, 3]
+    else:
+        sarimax_hp['p_values'] = [0, 1, 2, 3]
+        sarimax_hp['d_values'] = [0, 1, 2]
+        sarimax_hp['q_values'] = [0, 1, 2, 3]
+
+    filters['SARIMAX'] = sarimax_hp
+
+    # ============================================================
+    # ETS (EXPONENTIAL SMOOTHING) HYPERPARAMETERS
+    # ============================================================
+    ets_hp = {}
+
+    # ETS trend options based on detected trend
+    if profile.has_trend:
+        ets_hp['trend'] = ['add', 'mul']  # Try both additive and multiplicative
+        ets_hp['damped_trend'] = [True, False]
+    else:
+        ets_hp['trend'] = [None, 'add']  # Simpler options
+        ets_hp['damped_trend'] = [False]
+
+    # ETS seasonal options based on detected seasonality
+    if profile.has_seasonality:
+        ets_hp['seasonal'] = ['add', 'mul']
+    else:
+        ets_hp['seasonal'] = [None]
+
+    # Seasonal periods if detected
+    if profile.seasonality_period:
+        ets_hp['seasonal_periods'] = [profile.seasonality_period]
+
+    filters['ETS'] = ets_hp
+
+    # ============================================================
+    # XGBOOST HYPERPARAMETERS
+    # ============================================================
+    xgb_hp = {}
+
+    if n_observations < 100:
+        # Small dataset: simpler models
+        xgb_hp['n_estimators'] = [50, 100]
+        xgb_hp['max_depth'] = [3]
+        xgb_hp['learning_rate'] = [0.1]
+    elif n_observations < 500:
+        # Medium dataset
+        xgb_hp['n_estimators'] = [100, 200]
+        xgb_hp['max_depth'] = [3, 5]
+        xgb_hp['learning_rate'] = [0.05, 0.1]
+    else:
+        # Large dataset: can handle more complexity
+        xgb_hp['n_estimators'] = [100, 200, 300]
+        xgb_hp['max_depth'] = [3, 5, 7]
+        xgb_hp['learning_rate'] = [0.01, 0.05, 0.1]
+
+    # If data has high variance, use lower learning rate
+    # (We don't have CV directly, but we can infer from data quality)
+    if profile.data_quality_score < 70:
+        xgb_hp['learning_rate'] = [0.01, 0.05]
+
+    filters['XGBoost'] = xgb_hp
+
+    logger.info(f"Generated hyperparameter filters: {list(filters.keys())}")
+    for model, params in filters.items():
+        logger.info(f"  {model}: {list(params.keys())}")
+
+    return filters

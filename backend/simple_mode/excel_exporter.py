@@ -47,7 +47,8 @@ class ExcelExporter:
         self,
         forecast_result: Dict[str, Any],
         explanation: ForecastExplanation,
-        input_data: Optional[pd.DataFrame] = None
+        input_data: Optional[pd.DataFrame] = None,
+        slice_forecasts: Optional[List[Dict[str, Any]]] = None
     ) -> bytes:
         """
         Generate Excel file with multiple sheets.
@@ -56,6 +57,7 @@ class ExcelExporter:
             forecast_result: Raw forecast results
             explanation: ForecastExplanation object
             input_data: Optional original input data
+            slice_forecasts: Optional list of slice forecast results (for by-slice mode)
 
         Returns:
             Excel file as bytes
@@ -74,7 +76,7 @@ class ExcelExporter:
         wb.remove(wb.active)
 
         # Sheet 1: Summary (executive view)
-        self._add_summary_sheet(wb, forecast_result, explanation)
+        self._add_summary_sheet(wb, forecast_result, explanation, slice_forecasts)
 
         # Sheet 2: Forecast Detail (period-by-period with formulas)
         self._add_forecast_detail_sheet(wb, explanation)
@@ -92,6 +94,12 @@ class ExcelExporter:
         if input_data is not None:
             self._add_raw_data_sheet(wb, input_data)
 
+        # Add individual slice forecast sheets (if by-slice mode)
+        if slice_forecasts and len(slice_forecasts) > 0:
+            logger.info(f"Adding {len(slice_forecasts)} slice forecast sheets...")
+            for slice_data in slice_forecasts:
+                self._add_slice_forecast_sheet(wb, slice_data)
+
         # Save to bytes
         output = io.BytesIO()
         wb.save(output)
@@ -102,7 +110,8 @@ class ExcelExporter:
         return output.getvalue()
 
     def _add_summary_sheet(
-        self, wb: Workbook, result: Dict[str, Any], explanation: ForecastExplanation
+        self, wb: Workbook, result: Dict[str, Any], explanation: ForecastExplanation,
+        slice_forecasts: Optional[List[Dict[str, Any]]] = None
     ):
         """Create executive summary sheet."""
 
@@ -124,6 +133,10 @@ class ExcelExporter:
         ws[f'A{row}'].fill = self.SUBHEADER_FILL
 
         row += 1
+
+        # Check if this is a by-slice forecast
+        is_by_slice = slice_forecasts and len(slice_forecasts) > 0
+
         metrics = [
             ("Total Forecast", f"${sum(result.get('forecast', [])):,.0f}"),
             ("Forecast Horizon", f"{len(result.get('forecast', []))} periods"),
@@ -133,11 +146,46 @@ class ExcelExporter:
             ("Confidence Score", f"{explanation.confidence.score:.0f}/100"),
         ]
 
+        # Add slice count for by-slice mode
+        if is_by_slice:
+            metrics.insert(2, ("Forecast Mode", f"By-Slice ({len(slice_forecasts)} segments)"))
+
         for label, value in metrics:
             ws[f'A{row}'] = label
             ws[f'B{row}'] = value
             ws[f'A{row}'].font = Font(bold=True)
             row += 1
+
+        # Add slice summary section if by-slice mode
+        if is_by_slice:
+            row += 1
+            ws[f'A{row}'] = "SLICE BREAKDOWN"
+            ws[f'A{row}'].font = Font(bold=True, size=12)
+            ws[f'A{row}'].fill = self.SUBHEADER_FILL
+
+            row += 1
+            # Headers
+            slice_headers = ["Slice", "Model", "MAPE", "Avg Forecast", "Data Points"]
+            for col, header in enumerate(slice_headers):
+                ws.cell(row=row, column=col+1, value=header)
+                ws.cell(row=row, column=col+1).fill = self.HEADER_FILL
+                ws.cell(row=row, column=col+1).font = self.HEADER_FONT
+
+            row += 1
+            for slice_data in slice_forecasts:
+                ws.cell(row=row, column=1, value=slice_data.get('slice_id', 'Unknown'))
+                ws.cell(row=row, column=2, value=slice_data.get('best_model', 'N/A'))
+                mape = slice_data.get('holdout_mape')
+                ws.cell(row=row, column=3, value=f"{mape:.1f}%" if mape else 'N/A')
+                forecast = slice_data.get('forecast', [])
+                avg_forecast = sum(forecast) / len(forecast) if forecast else 0
+                ws.cell(row=row, column=4, value=f"${avg_forecast:,.0f}")
+                ws.cell(row=row, column=5, value=slice_data.get('data_points', 0))
+                row += 1
+
+            row += 1
+            ws[f'A{row}'] = "Note: Each slice has its own forecast sheet below."
+            ws[f'A{row}'].font = Font(italic=True, color="666666")
 
         # Caveats section
         row += 1
@@ -443,11 +491,164 @@ class ExcelExporter:
                     pass
             ws.column_dimensions[column].width = min(max_length + 2, 30)
 
+    def _add_slice_forecast_sheet(self, wb: Workbook, slice_data: Dict[str, Any]):
+        """
+        Add individual slice forecast sheet.
+
+        Each slice gets its own sheet with:
+        - Slice metadata (filters, model, accuracy)
+        - Period-by-period forecast with confidence intervals
+        - Summary statistics
+        """
+        slice_id = slice_data.get('slice_id', 'Unknown')
+
+        # Create safe sheet name (Excel limits to 31 chars, no special chars)
+        safe_name = slice_id[:28].replace('/', '-').replace('\\', '-').replace(':', '-')
+        safe_name = safe_name.replace('[', '(').replace(']', ')').replace('*', '')
+        safe_name = safe_name.replace('?', '').replace("'", "")
+
+        # Handle duplicate sheet names by adding suffix
+        base_name = safe_name
+        counter = 1
+        while safe_name in wb.sheetnames:
+            safe_name = f"{base_name[:25]}_{counter}"
+            counter += 1
+
+        ws = wb.create_sheet(f"Slice - {safe_name}")
+
+        # Title
+        ws['A1'] = f"SLICE FORECAST: {slice_id}"
+        ws['A1'].font = Font(size=14, bold=True)
+        ws.merge_cells('A1:E1')
+
+        # Metadata section
+        row = 3
+        ws[f'A{row}'] = "SLICE DETAILS"
+        ws[f'A{row}'].font = Font(bold=True, size=12)
+        ws[f'A{row}'].fill = self.SUBHEADER_FILL
+
+        row += 1
+
+        # Slice filters
+        filters = slice_data.get('slice_filters', {})
+        if filters:
+            ws[f'A{row}'] = "Filters"
+            filter_str = " | ".join([f"{k}={v}" for k, v in filters.items()])
+            ws[f'B{row}'] = filter_str
+            ws[f'A{row}'].font = Font(bold=True)
+            row += 1
+
+        # Model info
+        ws[f'A{row}'] = "Best Model"
+        ws[f'B{row}'] = slice_data.get('best_model', 'N/A')
+        ws[f'A{row}'].font = Font(bold=True)
+        row += 1
+
+        # Accuracy
+        mape = slice_data.get('holdout_mape')
+        ws[f'A{row}'] = "Holdout MAPE"
+        ws[f'B{row}'] = f"{mape:.2f}%" if mape is not None else 'N/A'
+        ws[f'A{row}'].font = Font(bold=True)
+        row += 1
+
+        # Data points
+        ws[f'A{row}'] = "Training Data Points"
+        ws[f'B{row}'] = slice_data.get('data_points', 0)
+        ws[f'A{row}'].font = Font(bold=True)
+        row += 1
+
+        # Summary stats
+        forecast = slice_data.get('forecast', [])
+        if forecast:
+            ws[f'A{row}'] = "Total Forecast"
+            ws[f'B{row}'] = f"${sum(forecast):,.2f}"
+            ws[f'A{row}'].font = Font(bold=True)
+            row += 1
+
+            ws[f'A{row}'] = "Avg Period Forecast"
+            ws[f'B{row}'] = f"${sum(forecast)/len(forecast):,.2f}"
+            ws[f'A{row}'].font = Font(bold=True)
+            row += 1
+
+        # Forecast data section
+        row += 1
+        ws[f'A{row}'] = "FORECAST DATA"
+        ws[f'A{row}'].font = Font(bold=True, size=12)
+        ws[f'A{row}'].fill = self.SUBHEADER_FILL
+
+        row += 1
+
+        # Headers
+        headers = ["Date", "Forecast", "Lower Bound", "Upper Bound", "Range Width"]
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=row, column=col, value=header)
+            cell.fill = self.HEADER_FILL
+            cell.font = self.HEADER_FONT
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = self.BORDER
+
+        row += 1
+        data_start_row = row
+
+        # Forecast data
+        dates = slice_data.get('dates', [])
+        lower_bounds = slice_data.get('lower_bounds', [])
+        upper_bounds = slice_data.get('upper_bounds', [])
+
+        for i, date in enumerate(dates):
+            ws.cell(row=row, column=1, value=str(date))
+            ws.cell(row=row, column=1).border = self.BORDER
+
+            # Forecast
+            forecast_val = forecast[i] if i < len(forecast) else 0
+            ws.cell(row=row, column=2, value=forecast_val)
+            ws.cell(row=row, column=2).number_format = '#,##0.00'
+            ws.cell(row=row, column=2).border = self.BORDER
+
+            # Lower bound
+            lower = lower_bounds[i] if i < len(lower_bounds) else forecast_val
+            ws.cell(row=row, column=3, value=lower)
+            ws.cell(row=row, column=3).number_format = '#,##0.00'
+            ws.cell(row=row, column=3).border = self.BORDER
+
+            # Upper bound
+            upper = upper_bounds[i] if i < len(upper_bounds) else forecast_val
+            ws.cell(row=row, column=4, value=upper)
+            ws.cell(row=row, column=4).number_format = '#,##0.00'
+            ws.cell(row=row, column=4).border = self.BORDER
+
+            # Range width formula (shows uncertainty)
+            ws.cell(row=row, column=5, value=f"=D{row}-C{row}")
+            ws.cell(row=row, column=5).number_format = '#,##0.00'
+            ws.cell(row=row, column=5).border = self.BORDER
+
+            row += 1
+
+        # Add totals row
+        if len(dates) > 0:
+            ws.cell(row=row, column=1, value="TOTAL")
+            ws.cell(row=row, column=1).font = Font(bold=True)
+            ws.cell(row=row, column=1).border = self.BORDER
+
+            for col in range(2, 6):
+                ws.cell(row=row, column=col, value=f"=SUM({chr(64+col)}{data_start_row}:{chr(64+col)}{row-1})")
+                ws.cell(row=row, column=col).font = Font(bold=True)
+                ws.cell(row=row, column=col).number_format = '#,##0.00'
+                ws.cell(row=row, column=col).border = self.BORDER
+
+        # Column widths
+        ws.column_dimensions['A'].width = 15
+        ws.column_dimensions['B'].width = 15
+        ws.column_dimensions['C'].width = 15
+        ws.column_dimensions['D'].width = 15
+        ws.column_dimensions['E'].width = 15
+
 
 def export_forecast_to_excel(
     forecast_result: Dict[str, Any],
     explanation: ForecastExplanation,
-    input_data: Optional[pd.DataFrame] = None
+    input_data: Optional[pd.DataFrame] = None,
+    slice_forecasts: Optional[List[Dict[str, Any]]] = None
 ) -> bytes:
     """
     Convenience function to export forecast to Excel.
@@ -456,9 +657,10 @@ def export_forecast_to_excel(
         forecast_result: Raw forecast results
         explanation: ForecastExplanation object
         input_data: Optional original input data
+        slice_forecasts: Optional list of slice forecast results (for by-slice mode)
 
     Returns:
         Excel file as bytes
     """
     exporter = ExcelExporter()
-    return exporter.export(forecast_result, explanation, input_data)
+    return exporter.export(forecast_result, explanation, input_data, slice_forecasts)

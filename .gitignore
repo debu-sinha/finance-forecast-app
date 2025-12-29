@@ -48,6 +48,16 @@ build/
 .coverage
 htmlcov/
 .pytest_cache/
+backend/tests/test_simple_mode_e2e.py
+backend/tests/test_batch_e2e.py
+test_*.py
+test_*.csv
+
+# Development documentation (internal only)
+docs/
+
+# Local config files
+*.local.md
 
 # Temporary files
 tmp/

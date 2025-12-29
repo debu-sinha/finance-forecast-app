@@ -29,16 +29,21 @@ import {
   Upload,
   Target,
   CheckCircle2,
-  XCircle
+  XCircle,
+  Zap,
+  Wrench,
+  RefreshCw,
+  BarChart3
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { parseCSV } from './utils/csvParser';
-import { AppStep, DataRow, DatasetAnalysis, ForecastResult, CovariateImpact, ModelType, ModelRunResult, FutureRegressorMethod, Hyperparameters, TuningLog, ActualsComparisonResult, ActualsComparisonRow, MAPE_THRESHOLDS } from './types';
+import { AppStep, DataRow, DatasetAnalysis, ForecastResult, CovariateImpact, ModelType, ModelRunResult, FutureRegressorMethod, Hyperparameters, TuningLog, ActualsComparisonResult, ActualsComparisonRow, MAPE_THRESHOLDS, DataAnalysisResult } from './types';
 import { analyzeDataset, generateForecastInsights } from './services/analysisService';
-import { trainModelOnBackend, deployModel, generateExecutiveSummary, ActualsComparisonSummary, BatchTrainRequest, trainBatchOnBackend } from './services/databricksApi';
+import { trainModelOnBackend, deployModel, generateExecutiveSummary, ActualsComparisonSummary, BatchTrainRequest, trainBatchOnBackend, analyzeTrainingData } from './services/databricksApi';
 import { BatchTraining } from './components/BatchTraining';
 import { BatchComparison } from './components/BatchComparison';
 import { BatchResultsViewer } from './components/BatchResultsViewer';
+import { SimpleModePanel } from './components/SimpleModePanel';
 import { BatchTrainingSummary } from './types';
 import { NotebookCell } from './components/NotebookCell';
 import { ResultsChart } from './components/ResultsChart';
@@ -261,6 +266,9 @@ const detectFrequency = (data: DataRow[], dateCol: string): 'daily' | 'weekly' |
 const App = () => {
   const [step, setStep] = useState<AppStep>(AppStep.UPLOAD);
 
+  // Mode State - Simple (autopilot) or Expert (full control)
+  const [appMode, setAppMode] = useState<'simple' | 'expert'>('simple');
+
   // Data State
   const [mainData, setMainData] = useState<DataRow[]>([]);
   const [featureData, setFeatureData] = useState<DataRow[]>([]);
@@ -299,6 +307,11 @@ const App = () => {
   // Analysis State
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<DatasetAnalysis | null>(null);
+
+  // Data Intelligence Analysis State
+  const [isAnalyzingData, setIsAnalyzingData] = useState(false);
+  const [dataAnalysis, setDataAnalysis] = useState<DataAnalysisResult | null>(null);
+  const [showDataAnalysis, setShowDataAnalysis] = useState(false);
 
   // Training State
   const [isTraining, setIsTraining] = useState(false);
@@ -535,7 +548,16 @@ const App = () => {
     console.log('Aggregation Debug:');
     console.log('  filteredData.length:', filteredData.length);
 
-    const groups = new Map<string, DataRow>();
+    // Detect if target column is an average-type column (should use mean instead of sum)
+    const isAverageColumn = targetCol.toLowerCase().includes('avg') ||
+                            targetCol.toLowerCase().includes('average') ||
+                            targetCol.toLowerCase().includes('mean') ||
+                            targetCol.toLowerCase().includes('rate') ||
+                            targetCol.toLowerCase().includes('ue');
+    console.log('  isAverageColumn:', isAverageColumn, '(target:', targetCol, ')');
+
+    // Track both sum and count for proper averaging
+    const groups = new Map<string, { row: DataRow; sum: number; count: number }>();
 
     filteredData.forEach(row => {
       const rawDate = row[timeCol];
@@ -548,19 +570,25 @@ const App = () => {
 
       if (groups.has(dateKey)) {
         const existing = groups.get(dateKey)!;
-        existing[targetCol] = Number(existing[targetCol]) + val;
-        console.log('  DUPLICATE DATE FOUND:', dateKey, 'Old value:', existing[targetCol] - val, 'New value:', existing[targetCol]);
+        existing.sum += val;
+        existing.count += 1;
+        console.log('  DUPLICATE DATE FOUND:', dateKey, 'Count:', existing.count, 'Sum:', existing.sum);
       } else {
-        groups.set(dateKey, { ...row, [timeCol]: dateKey, [targetCol]: val });
+        groups.set(dateKey, { row: { ...row, [timeCol]: dateKey }, sum: val, count: 1 });
       }
     });
 
-    const result = Array.from(groups.values()).sort((a, b) =>
+    // Apply aggregation: use average for AVG columns, sum for others
+    const result = Array.from(groups.entries()).map(([dateKey, { row, sum, count }]) => {
+      const aggregatedValue = isAverageColumn ? (sum / count) : sum;
+      return { ...row, [targetCol]: aggregatedValue };
+    }).sort((a, b) =>
       new Date(String(a[timeCol])).getTime() - new Date(String(b[timeCol])).getTime()
     );
 
     console.log('  aggregatedData.length:', result.length);
     console.log('  Unique dates:', groups.size);
+    console.log('  Aggregation method:', isAverageColumn ? 'AVERAGE' : 'SUM');
 
     return result;
   }, [filteredData, timeCol, targetCol]);
@@ -570,7 +598,14 @@ const App = () => {
 
     if (frequency === 'daily') return aggregatedData;
 
-    const groups = new Map<string, DataRow>();
+    // Detect if target column is an average-type column (should use mean instead of sum)
+    const isAverageColumn = targetCol.toLowerCase().includes('avg') ||
+                            targetCol.toLowerCase().includes('average') ||
+                            targetCol.toLowerCase().includes('mean') ||
+                            targetCol.toLowerCase().includes('rate') ||
+                            targetCol.toLowerCase().includes('ue');
+
+    const groups = new Map<string, { row: DataRow; sum: number; count: number }>();
 
     aggregatedData.forEach(row => {
       const date = new Date(String(row[timeCol]));
@@ -590,13 +625,18 @@ const App = () => {
 
       if (groups.has(key)) {
         const existing = groups.get(key)!;
-        existing[targetCol] = Number(existing[targetCol]) + val;
+        existing.sum += val;
+        existing.count += 1;
       } else {
-        groups.set(key, { ...row, [timeCol]: key, [targetCol]: val });
+        groups.set(key, { row: { ...row, [timeCol]: key }, sum: val, count: 1 });
       }
     });
 
-    return Array.from(groups.values()).sort((a, b) =>
+    // Apply aggregation: use average for AVG columns, sum for others
+    return Array.from(groups.entries()).map(([key, { row, sum, count }]) => {
+      const aggregatedValue = isAverageColumn ? (sum / count) : sum;
+      return { ...row, [targetCol]: aggregatedValue };
+    }).sort((a, b) =>
       new Date(String(a[timeCol])).getTime() - new Date(String(b[timeCol])).getTime()
     );
   }, [aggregatedData, frequency, timeCol, targetCol]);
@@ -1374,6 +1414,52 @@ const App = () => {
     return errors;
   };
 
+  // Analyze data and get model/hyperparameter recommendations
+  const handleAnalyzeData = async () => {
+    if (!timeCol || !targetCol || filteredData.length === 0) {
+      return;
+    }
+
+    setIsAnalyzingData(true);
+    try {
+      const result = await analyzeTrainingData(
+        filteredData,
+        timeCol,
+        targetCol,
+        frequency
+      );
+      setDataAnalysis(result);
+      setShowDataAnalysis(true);
+      console.log('📊 Data analysis result:', result);
+    } catch (error) {
+      console.error('Data analysis failed:', error);
+    } finally {
+      setIsAnalyzingData(false);
+    }
+  };
+
+  // Apply recommended models from data analysis
+  const applyRecommendedModels = () => {
+    if (!dataAnalysis) return;
+
+    // Map backend model names to frontend model types
+    const modelNameMap: Record<string, ModelType> = {
+      'Prophet': 'prophet',
+      'ARIMA': 'arima',
+      'SARIMAX': 'sarimax',
+      'ETS': 'exponential_smoothing',
+      'XGBoost': 'xgboost'
+    };
+
+    const recommendedModelTypes = dataAnalysis.recommendedModels
+      .map(m => modelNameMap[m])
+      .filter((m): m is ModelType => m !== undefined);
+
+    if (recommendedModelTypes.length > 0) {
+      setSelectedModels(recommendedModelTypes);
+    }
+  };
+
   const handleTrainModel = async () => {
     console.log('🚀 handleTrainModel called!');
 
@@ -1481,6 +1567,12 @@ const App = () => {
       }
 
 
+      // Pass hyperparameter filters from data analysis to reduce model search space
+      const hyperparameterFilters = dataAnalysis?.hyperparameterFilters || undefined;
+      if (hyperparameterFilters) {
+        console.log('📊 Using data-driven hyperparameter filters:', Object.keys(hyperparameterFilters));
+      }
+
       const backendResponse = await trainModelOnBackend(
         cleanHistoryData,
         timeCol,
@@ -1499,7 +1591,8 @@ const App = () => {
         trainingStartDate || undefined,  // from_date
         trainingEndDate || undefined,     // to_date
         randomSeed,                        // random_seed
-        futureFeatures.length > 0 ? futureFeatures : undefined  // future_features
+        futureFeatures.length > 0 ? futureFeatures : undefined,  // future_features
+        hyperparameterFilters  // hyperparameter_filters from data analysis
       );
 
       setTrainingProgress(80);
@@ -1713,6 +1806,30 @@ const App = () => {
 
   const getUniqueValues = (col: string) => Array.from(new Set(mergedData.map(row => String(row[col])))).sort();
 
+  // Generic display label mapping for columns
+  // Auto-detects binary columns and provides meaningful labels based on column name patterns
+  const getDisplayLabel = (col: string, val: string): string => {
+    const colLower = col.toLowerCase();
+    const uniqueVals = getUniqueValues(col);
+
+    // Check if this is a binary column (only has values 0 and 1, or "0" and "1")
+    const isBinaryColumn = uniqueVals.length === 2 &&
+      uniqueVals.every(v => v === '0' || v === '1');
+
+    if (isBinaryColumn) {
+      // For columns starting with "IS_" or "HAS_" or "FLAG_", provide Yes/No labels
+      if (colLower.startsWith('is_') || colLower.startsWith('has_') || colLower.startsWith('flag_')) {
+        if (val === '0') return `No (0)`;
+        if (val === '1') return `Yes (1)`;
+      }
+      // Generic binary column
+      if (val === '0') return `False (0)`;
+      if (val === '1') return `True (1)`;
+    }
+
+    return val;
+  };
+
   const activeResult = trainingResult?.results.find(r => r.modelType === activeModelType) || trainingResult?.results[0];
 
   return (
@@ -1733,6 +1850,44 @@ const App = () => {
             </button>
           </nav>
         </div>
+
+        {/* Mode Toggle */}
+        <div className="p-4 border-t border-gray-700">
+          <div className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Mode</div>
+          <div className="space-y-1">
+            <button
+              onClick={() => setAppMode('simple')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-md transition-colors ${
+                appMode === 'simple'
+                  ? 'bg-green-600 text-white'
+                  : 'text-gray-400 hover:bg-[#384554] hover:text-white'
+              }`}
+            >
+              <Zap className="w-4 h-4" />
+              <div className="text-left">
+                <span className="block text-sm font-medium">Simple Mode</span>
+                <span className="block text-[10px] opacity-75">Autopilot for Finance</span>
+              </div>
+              <span className="ml-auto bg-amber-500 text-white text-[8px] px-1 py-0.5 rounded-full leading-tight">
+                Dev
+              </span>
+            </button>
+            <button
+              onClick={() => setAppMode('expert')}
+              className={`w-full flex items-center space-x-3 px-3 py-2 rounded-md transition-colors ${
+                appMode === 'expert'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-400 hover:bg-[#384554] hover:text-white'
+              }`}
+            >
+              <Wrench className="w-4 h-4" />
+              <div className="text-left">
+                <span className="block text-sm font-medium">Expert Mode</span>
+                <span className="block text-[10px] opacity-75">Full Control</span>
+              </div>
+            </button>
+          </div>
+        </div>
       </div>
 
       <div className="flex-1 flex flex-col">
@@ -1740,8 +1895,19 @@ const App = () => {
           <div className="flex items-center space-x-4">
             <h1 className="font-semibold text-gray-700">Finance Forecast App, Powered by Mosaic AI on Databricks</h1>
             <span className="px-2 py-0.5 bg-gray-100 text-gray-500 text-xs rounded border border-gray-200">Python (Databricks App)</span>
-            {step === AppStep.RESULTS && <span className="px-2 py-0.5 bg-green-50 text-green-600 text-xs rounded border border-green-200 flex items-center"><Check className="w-3 h-3 mr-1" /> Saved to MLflow</span>}
-            {batchTrainingSummary && (
+            {/* Mode Badge */}
+            {appMode === 'simple' ? (
+              <span className="px-2 py-0.5 bg-green-50 text-green-700 text-xs rounded border border-green-200 flex items-center">
+                <Zap className="w-3 h-3 mr-1" /> Simple Mode
+                <span className="ml-1.5 bg-amber-500 text-white text-[9px] px-1 py-0.5 rounded-full leading-tight">Dev</span>
+              </span>
+            ) : (
+              <span className="px-2 py-0.5 bg-blue-50 text-blue-700 text-xs rounded border border-blue-200 flex items-center">
+                <Wrench className="w-3 h-3 mr-1" /> Expert Mode
+              </span>
+            )}
+            {appMode === 'expert' && step === AppStep.RESULTS && <span className="px-2 py-0.5 bg-green-50 text-green-600 text-xs rounded border border-green-200 flex items-center"><Check className="w-3 h-3 mr-1" /> Saved to MLflow</span>}
+            {appMode === 'expert' && batchTrainingSummary && (
               <div className="flex items-center space-x-2">
                 <button
                   onClick={() => setShowBatchResultsViewer(true)}
@@ -1760,10 +1926,10 @@ const App = () => {
                 </button>
               </div>
             )}
-            <button onClick={resetApp} className="text-xs text-red-500 hover:text-red-700 underline ml-4 font-medium">Reset All</button>
+            {appMode === 'expert' && <button onClick={resetApp} className="text-xs text-red-500 hover:text-red-700 underline ml-4 font-medium">Reset All</button>}
           </div>
 
-          {step === AppStep.CONFIG && (
+          {appMode === 'expert' && step === AppStep.CONFIG && (
             <div className="flex items-center space-x-2">
               <div className="relative group">
                 <button
@@ -1775,11 +1941,9 @@ const App = () => {
                 >
                   <Layers className="w-4 h-4 mr-2" />
                   Batch Training
-                  {groupCols.length > 0 && (
-                    <span className="ml-2 bg-purple-400 text-white text-[10px] px-1.5 py-0.5 rounded-full">
-                      Recommended
-                    </span>
-                  )}
+                  <span className="ml-2 bg-amber-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">
+                    Development in Progress
+                  </span>
                 </button>
                 <div className="absolute top-full left-0 mt-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-50 shadow-lg">
                   Train separate models for each segment (region, product, etc.)
@@ -1799,6 +1963,14 @@ const App = () => {
 
         <main className="flex-1 overflow-y-auto p-8 max-w-6xl mx-auto w-full">
 
+          {/* Simple Mode - Autopilot for Finance Users */}
+          {appMode === 'simple' && (
+            <SimpleModePanel />
+          )}
+
+          {/* Expert Mode - Full Control */}
+          {appMode === 'expert' && (
+          <>
           {/* 1. Data Ingestion */}
           <NotebookCell
             title="Data Ingestion & Feature Store"
@@ -1990,18 +2162,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                           <span>Consider reducing horizon. Recommended: &lt;{Math.floor(aggregatedData.length / 2)} periods for {aggregatedData.length} rows.</span>
                         </div>
                       )}
-                      <div>
-                        <label className="block text-xs text-gray-500 mb-1">Seasonality Mode</label>
-                        <select
-                          className="w-full bg-white border border-gray-300 rounded-md px-3 py-2 text-sm text-gray-900"
-                          value={seasonalityMode}
-                          onChange={(e) => setSeasonalityMode(e.target.value as 'additive' | 'multiplicative')}
-                        >
-                          <option value="multiplicative">Multiplicative</option>
-                          <option value="additive">Additive</option>
-                        </select>
-                        <p className="text-[10px] text-gray-400 mt-1">Multiplicative: seasonal effect scales with trend. Additive: constant seasonal effect.</p>
-                      </div>
+                      {/* Seasonality Mode is now auto-detected from data analysis */}
 
                     </div>
 
@@ -2022,60 +2183,173 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       </div>
                     )}
 
+                    {/* Data Intelligence - Analyze & Recommend */}
+                    <div className="pt-4 border-t border-gray-100">
+                      <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Data Intelligence</label>
+                      <button
+                        onClick={handleAnalyzeData}
+                        disabled={isAnalyzingData || !timeCol || !targetCol || filteredData.length === 0}
+                        className="w-full px-3 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center space-x-2 text-sm font-medium"
+                      >
+                        {isAnalyzingData ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Analyzing Data...</span>
+                          </>
+                        ) : (
+                          <>
+                            <BarChart3 className="w-4 h-4" />
+                            <span>Analyze Data & Get Recommendations</span>
+                          </>
+                        )}
+                      </button>
+                      <p className="text-[10px] text-gray-400 mt-1">Analyze your data to get intelligent model and hyperparameter recommendations</p>
+
+                      {/* Data Analysis Results */}
+                      {dataAnalysis && showDataAnalysis && (
+                        <div className="mt-3 border border-purple-200 rounded-md bg-purple-50 p-3">
+                          {/* Data Quality Badge */}
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs font-bold text-gray-600">Data Quality</span>
+                            <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                              dataAnalysis.dataQuality.level === 'excellent' ? 'bg-green-100 text-green-700' :
+                              dataAnalysis.dataQuality.level === 'good' ? 'bg-blue-100 text-blue-700' :
+                              dataAnalysis.dataQuality.level === 'fair' ? 'bg-yellow-100 text-yellow-700' :
+                              dataAnalysis.dataQuality.level === 'poor' ? 'bg-orange-100 text-orange-700' :
+                              'bg-red-100 text-red-700'
+                            }`}>
+                              {dataAnalysis.dataQuality.level.toUpperCase()} ({dataAnalysis.dataQuality.score.toFixed(0)}/100)
+                            </span>
+                          </div>
+
+                          {/* Data Stats */}
+                          <div className="text-[10px] text-gray-600 mb-2 grid grid-cols-2 gap-1">
+                            <span>{dataAnalysis.dataStats.observations} observations</span>
+                            <span>{dataAnalysis.dataStats.yearsOfData.toFixed(1)} years</span>
+                            <span>Trend: {dataAnalysis.patterns.trend.type}</span>
+                            <span>Seasonality: {dataAnalysis.patterns.seasonality.type}</span>
+                          </div>
+
+                          {/* Warnings */}
+                          {dataAnalysis.warnings.length > 0 && (
+                            <div className="mb-2">
+                              {dataAnalysis.warnings.slice(0, 2).map((w, i) => (
+                                <p key={i} className="text-[10px] text-orange-600 flex items-start">
+                                  <AlertTriangle className="w-3 h-3 mr-1 flex-shrink-0 mt-0.5" />
+                                  {w}
+                                </p>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Model Recommendations */}
+                          <div className="mb-2">
+                            <span className="text-[10px] font-bold text-gray-600 block mb-1">Model Recommendations:</span>
+                            <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                              {dataAnalysis.modelRecommendations.map((rec) => (
+                                <div
+                                  key={rec.model}
+                                  className={`text-[10px] p-1.5 rounded border ${
+                                    rec.recommended
+                                      ? 'bg-green-50 border-green-200'
+                                      : 'bg-gray-50 border-gray-200'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <span className={`font-semibold ${rec.recommended ? 'text-green-700' : 'text-gray-500'}`}>
+                                      {rec.recommended ? '✓' : '✗'} {rec.model}
+                                    </span>
+                                    <span className={`text-[9px] px-1 py-0.5 rounded ${
+                                      rec.confidence >= 0.7 ? 'bg-green-200 text-green-800' :
+                                      rec.confidence >= 0.5 ? 'bg-yellow-200 text-yellow-800' :
+                                      'bg-gray-200 text-gray-600'
+                                    }`}>
+                                      {(rec.confidence * 100).toFixed(0)}% confidence
+                                    </span>
+                                  </div>
+                                  <p className={`mt-0.5 text-[9px] ${rec.recommended ? 'text-green-600' : 'text-gray-500'}`}>
+                                    {rec.reason}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Apply Button */}
+                          <button
+                            onClick={applyRecommendedModels}
+                            className="w-full mt-2 px-2 py-1.5 bg-purple-600 text-white rounded text-xs hover:bg-purple-700 flex items-center justify-center space-x-1"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>Apply Recommended Models</span>
+                          </button>
+
+                          {/* Close button */}
+                          <button
+                            onClick={() => setShowDataAnalysis(false)}
+                            className="w-full mt-1 px-2 py-1 text-gray-500 text-[10px] hover:text-gray-700"
+                          >
+                            Hide Analysis
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
                     {/* Model Selection */}
                     <div className="pt-4 border-t border-gray-100">
                       <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Models to Train & Compare</label>
                       <div className="border border-gray-200 rounded-md p-2 bg-gray-50 space-y-2">
-                        <label className="flex items-center space-x-2 p-1.5 hover:bg-gray-200 rounded cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={selectedModels.includes('prophet')}
-                            onChange={() => setSelectedModels(prev => prev.includes('prophet') ? prev.filter(m => m !== 'prophet') : [...prev, 'prophet'])}
-                            className="rounded text-[#1b57b1]"
-                          />
-                          <span className="text-sm text-gray-700 font-medium">Prophet</span>
-                          <span className="text-[10px] text-green-600 font-semibold px-1 py-0.5 bg-green-50 rounded">✓ Supports Covariates</span>
-                        </label>
-                        <label className="flex items-center space-x-2 p-1.5 hover:bg-gray-200 rounded cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={selectedModels.includes('arima')}
-                            onChange={() => setSelectedModels(prev => prev.includes('arima') ? prev.filter(m => m !== 'arima') : [...prev, 'arima'])}
-                            className="rounded text-[#1b57b1]"
-                          />
-                          <span className="text-sm text-gray-700 font-medium">ARIMA</span>
-                          <span className="text-[10px] text-orange-600 font-semibold px-1 py-0.5 bg-orange-50 rounded">Univariate Only</span>
-                        </label>
-                        <label className="flex items-center space-x-2 p-1.5 hover:bg-gray-200 rounded cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={selectedModels.includes('exponential_smoothing')}
-                            onChange={() => setSelectedModels(prev => prev.includes('exponential_smoothing') ? prev.filter(m => m !== 'exponential_smoothing') : [...prev, 'exponential_smoothing'])}
-                            className="rounded text-[#1b57b1]"
-                          />
-                          <span className="text-sm text-gray-700 font-medium">Exponential Smoothing</span>
-                          <span className="text-[10px] text-orange-600 font-semibold px-1 py-0.5 bg-orange-50 rounded">Univariate Only</span>
-                        </label>
-                        <label className="flex items-center space-x-2 p-1.5 hover:bg-gray-200 rounded cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={selectedModels.includes('sarimax')}
-                            onChange={() => setSelectedModels(prev => prev.includes('sarimax') ? prev.filter(m => m !== 'sarimax') : [...prev, 'sarimax'])}
-                            className="rounded text-[#1b57b1]"
-                          />
-                          <span className="text-sm text-gray-700 font-medium">SARIMAX</span>
-                          <span className="text-[10px] text-green-600 font-semibold px-1 py-0.5 bg-green-50 rounded">✓ Supports Covariates</span>
-                        </label>
-                        <label className="flex items-center space-x-2 p-1.5 hover:bg-gray-200 rounded cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={selectedModels.includes('xgboost')}
-                            onChange={() => setSelectedModels(prev => prev.includes('xgboost') ? prev.filter(m => m !== 'xgboost') : [...prev, 'xgboost'])}
-                            className="rounded text-[#1b57b1]"
-                          />
-                          <span className="text-sm text-gray-700 font-medium">XGBoost</span>
-                          <span className="text-[10px] text-blue-600 font-semibold px-1 py-0.5 bg-blue-50 rounded">✓ Best for Holidays</span>
-                        </label>
+                        {/* Helper function to get recommendation for a model */}
+                        {(() => {
+                          const getModelRec = (backendName: string) =>
+                            dataAnalysis?.modelRecommendations?.find(r => r.model === backendName);
+
+                          const modelConfigs = [
+                            { id: 'prophet', name: 'Prophet', backendName: 'Prophet', badge: '✓ Supports Covariates', badgeColor: 'green' },
+                            { id: 'arima', name: 'ARIMA', backendName: 'ARIMA', badge: 'Univariate Only', badgeColor: 'orange' },
+                            { id: 'exponential_smoothing', name: 'Exponential Smoothing', backendName: 'ETS', badge: 'Univariate Only', badgeColor: 'orange' },
+                            { id: 'sarimax', name: 'SARIMAX', backendName: 'SARIMAX', badge: '✓ Supports Covariates', badgeColor: 'green' },
+                            { id: 'xgboost', name: 'XGBoost', backendName: 'XGBoost', badge: '✓ Best for Holidays', badgeColor: 'blue' },
+                          ];
+
+                          return modelConfigs.map(model => {
+                            const rec = getModelRec(model.backendName);
+                            return (
+                              <div key={model.id} className="p-1.5 hover:bg-gray-200 rounded">
+                                <label className="flex items-center space-x-2 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedModels.includes(model.id as ModelType)}
+                                    onChange={() => setSelectedModels(prev =>
+                                      prev.includes(model.id as ModelType)
+                                        ? prev.filter(m => m !== model.id)
+                                        : [...prev, model.id as ModelType]
+                                    )}
+                                    className="rounded text-[#1b57b1]"
+                                  />
+                                  <span className="text-sm text-gray-700 font-medium">{model.name}</span>
+                                  <span className={`text-[10px] font-semibold px-1 py-0.5 rounded ${
+                                    model.badgeColor === 'green' ? 'text-green-600 bg-green-50' :
+                                    model.badgeColor === 'blue' ? 'text-blue-600 bg-blue-50' :
+                                    'text-orange-600 bg-orange-50'
+                                  }`}>{model.badge}</span>
+                                  {rec && (
+                                    <span className={`ml-auto text-[9px] px-1 py-0.5 rounded ${
+                                      rec.recommended ? 'bg-green-200 text-green-800' : 'bg-gray-200 text-gray-600'
+                                    }`}>
+                                      {rec.recommended ? '✓ Recommended' : 'Not recommended'}
+                                    </span>
+                                  )}
+                                </label>
+                                {rec && (
+                                  <p className={`ml-6 mt-0.5 text-[9px] ${rec.recommended ? 'text-green-600' : 'text-gray-500'}`}>
+                                    {rec.reason}
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          });
+                        })()}
                       </div>
                       {covariates.length > 0 && (selectedModels.includes('arima') || selectedModels.includes('exponential_smoothing')) && (
                         <p className="text-[10px] text-orange-600 mt-1 flex items-center">
@@ -2174,7 +2448,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                               onChange={(e) => updateFilter(col, e.target.value)}
                             >
                               <option value="">All (Aggregated)</option>
-                              {getUniqueValues(col).map(val => <option key={val} value={val}>{val}</option>)}
+                              {getUniqueValues(col).map(val => <option key={val} value={val}>{getDisplayLabel(col, val)}</option>)}
                             </select>
                           </div>
                         ))}
@@ -2365,7 +2639,9 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       </div>
                       <div className="bg-white p-2 rounded border border-gray-100">
                         <div className="text-gray-500 uppercase text-[10px] font-semibold">Seasonality</div>
-                        <div className="text-gray-800 font-medium capitalize">{seasonalityMode}</div>
+                        <div className="text-gray-800 font-medium capitalize">
+                          {dataAnalysis?.hyperparameterFilters?.Prophet?.seasonality_mode?.[0] || 'Auto-detect'}
+                        </div>
                       </div>
                       <div className="bg-white p-2 rounded border border-gray-100">
                         <div className="text-gray-500 uppercase text-[10px] font-semibold">Date Range</div>
@@ -3347,6 +3623,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
             )
           }
 
+          </>
+          )}
         </main>
         <footer className="bg-white border-t border-gray-200 py-3 text-center text-xs text-gray-400">
           Created by Debu Sinha

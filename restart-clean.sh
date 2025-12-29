@@ -28,6 +28,18 @@ echo ""
 echo "⏳ Waiting for ports to be released..."
 sleep 3
 
+# Clean up temp files to free file handles
+echo ""
+echo "🗑️  Cleaning up temp files..."
+rm -f /tmp/*.csv /tmp/*.pkl /tmp/*.json 2>/dev/null || true
+rm -rf /tmp/tmp* 2>/dev/null || true
+echo "  ✓ Temp files cleaned"
+
+# Increase file descriptor limit (helps with long-running MLflow training)
+echo ""
+echo "📈 Increasing file descriptor limits..."
+ulimit -n 4096 2>/dev/null && echo "  ✓ File limit set to 4096" || echo "  • Could not increase file limit (may require sudo)"
+
 # Load environment variables
 if [ ! -f ".env.local" ]; then
     echo "❌ .env.local not found! Run ./setup-local.sh first"

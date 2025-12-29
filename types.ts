@@ -20,6 +20,55 @@ export interface DatasetAnalysis {
   seasonality?: string;
 }
 
+// Data quality and model recommendation types
+export interface DataQuality {
+  level: 'excellent' | 'good' | 'fair' | 'poor' | 'insufficient';
+  score: number;
+  description: string;
+}
+
+export interface DataStats {
+  observations: number;
+  yearsOfData: number;
+  dateRange: string;
+  frequency: string;
+  hasGaps: boolean;
+  gapCount: number;
+}
+
+export interface PatternInfo {
+  trend: {
+    type: string;
+    strength: number;
+  };
+  seasonality: {
+    type: string;
+    strength: number;
+  };
+  hasOutliers: boolean;
+  outlierPercentage: number;
+}
+
+export interface ModelRecommendation {
+  model: string;
+  recommended: boolean;
+  confidence: number;
+  reason: string;
+}
+
+export interface DataAnalysisResult {
+  dataQuality: DataQuality;
+  dataStats: DataStats;
+  patterns: PatternInfo;
+  modelRecommendations: ModelRecommendation[];
+  recommendedModels: string[];
+  excludedModels: string[];
+  warnings: string[];
+  notes: string[];
+  overallRecommendation: string;
+  hyperparameterFilters: Record<string, Record<string, any>>;
+}
+
 export interface ForecastMetrics {
   mape: string;
   rmse: string;

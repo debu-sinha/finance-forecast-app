@@ -212,13 +212,28 @@ random.seed({random_seed})
     
     return "Code generation logic placeholder - will be filled by subsequent tool call"
 
-def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id):
-    client = MlflowClient()
-    run = client.create_run(experiment_id=experiment_id, tags={"mlflow.parentRunId": parent_run_id, "mlflow.runName": f"Prophet_{params}"})
-    run_id = run.info.run_id
+# Environment variable to control child run logging
+# Set MLFLOW_SKIP_CHILD_RUNS=true to only log the best model (reduces MLflow overhead)
+SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
+
+
+def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False):
+    """
+    Evaluate a single hyperparameter combination.
+
+    Args:
+        skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
+    """
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
+
+    if not skip_mlflow_logging:
+        run = client.create_run(experiment_id=experiment_id, tags={"mlflow.parentRunId": parent_run_id, "mlflow.runName": f"Prophet_{params}"})
+        run_id = run.info.run_id
 
     try:
-        for k, v in params.items(): client.log_param(run_id, k, str(v))
+        if not skip_mlflow_logging:
+            for k, v in params.items(): client.log_param(run_id, k, str(v))
 
         model = Prophet(seasonality_mode=params['seasonality_mode'], yearly_seasonality=params['yearly_seasonality'],
                         weekly_seasonality=params['weekly_seasonality'], daily_seasonality=False,
@@ -256,17 +271,19 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         # Use test_df_local which has NaN-filled lag columns
         test_future = test_df_local[['ds'] + added_regressors].copy()
         metrics = compute_metrics(test_df_local['y'].values, model.predict(test_future)['yhat'].values)
-        
-        for k, v in metrics.items(): client.log_metric(run_id, k, v)
-        client.set_terminated(run_id)
-        
+
+        if not skip_mlflow_logging:
+            for k, v in metrics.items(): client.log_metric(run_id, k, v)
+            client.set_terminated(run_id)
+
         return {"params": params, "metrics": metrics, "run_id": run_id, "model": model, "status": "SUCCESS"}
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
-        client.set_terminated(run_id, status="FAILED")
+        if not skip_mlflow_logging and run_id:
+            client.set_terminated(run_id, status="FAILED")
         return {"params": params, "metrics": None, "run_id": run_id, "status": "FAILED", "error": str(e)}
 
-def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None):
+def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None):
     # Set global random seeds for reproducibility
     np.random.seed(random_seed)
     import random
@@ -339,9 +356,25 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     logger.info(f"Preprocessing added {len(covariates) - len(original_covariates)} derived features: {[c for c in covariates if c not in original_covariates]}")
 
     history_df = df.dropna(subset=['y']).copy()
-    
-    if test_size is None: test_size = min(horizon, len(history_df) // 5)
-    train_df, test_df = history_df.iloc[:-test_size].copy(), history_df.iloc[-test_size:].copy()
+
+    # Use pre-split data from main.py if provided, otherwise do our own split
+    if train_df_override is not None and test_df_override is not None:
+        # Align with the split dates from main.py
+        # The override DataFrames have 'ds' and 'y' columns already
+        train_end_date = train_df_override['ds'].max()
+        test_start_date = test_df_override['ds'].min()
+
+        train_df = history_df[history_df['ds'] <= train_end_date].copy()
+        test_df = history_df[(history_df['ds'] >= test_start_date) & (history_df['ds'] <= test_df_override['ds'].max())].copy()
+        test_size = len(test_df)
+
+        logger.info(f"📊 Using pre-split data from main.py: train={len(train_df)}, eval={len(test_df)}")
+        logger.info(f"   Train ends: {train_end_date}, Eval starts: {test_start_date}")
+    else:
+        # Legacy behavior: do our own split
+        if test_size is None: test_size = min(horizon, len(history_df) // 5)
+        train_df, test_df = history_df.iloc[:-test_size].copy(), history_df.iloc[-test_size:].copy()
+        logger.info(f"📊 Prophet doing internal split: train={len(train_df)}, eval={len(test_df)}")
 
     valid_covariates = []
     for cov in covariates:
@@ -397,14 +430,33 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         except Exception as e:
             logger.warning(f"Could not log datasets: {e}")
 
-        # Hyperparameter tuning
-        param_grid = {
+        # Hyperparameter tuning - use filtered values if provided from data analysis
+        prophet_filters = (hyperparameter_filters or {}).get('Prophet', {})
+
+        # Default param_grid values
+        default_param_grid = {
             'changepoint_prior_scale': [0.001, 0.01, 0.05, 0.1, 0.5],
             'seasonality_prior_scale': [0.01, 0.1, 1.0, 10.0],
             'seasonality_mode': ['additive', 'multiplicative'] if seasonality_mode == 'multiplicative' else ['additive'],
             'yearly_seasonality': [True, False],
             'weekly_seasonality': [True, False]
         }
+
+        # Apply filters from data analysis if provided
+        param_grid = {}
+        for param_name, default_values in default_param_grid.items():
+            if param_name in prophet_filters:
+                filtered_values = prophet_filters[param_name]
+                # Ensure filtered values is a list
+                if not isinstance(filtered_values, list):
+                    filtered_values = [filtered_values]
+                param_grid[param_name] = filtered_values
+                logger.info(f"📊 Using data-driven filter for {param_name}: {filtered_values}")
+            else:
+                param_grid[param_name] = default_values
+
+        if prophet_filters:
+            logger.info(f"📊 Applied {len(prophet_filters)} hyperparameter filters from data analysis")
         
         keys, values = zip(*param_grid.items())
         param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
@@ -421,13 +473,17 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         best_model = None
         
         # Parallel execution
+        # If MLFLOW_SKIP_CHILD_RUNS=true, we only log the best model (reduces MLflow overhead significantly)
         max_workers = int(os.environ.get("MLFLOW_MAX_WORKERS", "4"))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
-                    evaluate_param_set, 
-                    params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id
-                ) 
+                    evaluate_param_set,
+                    params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id,
+                    skip_mlflow_logging=SKIP_CHILD_RUNS
+                )
                 for params in param_combinations
             ]
             

@@ -35,7 +35,7 @@ class DataProfile:
 
     # Date range info
     date_range: Tuple[date, date]
-    total_periods: int
+    total_periods: int  # Unique time periods in the data
     history_months: float
 
     # Data quality metrics
@@ -61,11 +61,23 @@ class DataProfile:
 
     # Data fingerprint for reproducibility
     data_hash: str
-    row_count: int
+    row_count: int  # Total rows in the file (may include duplicates from slices)
 
     # Recommendations
     recommended_horizon: int
     recommended_models: List[str]
+
+    # Multi-slice data detection
+    unique_periods: int = 0  # Number of unique time periods
+    has_multiple_slices: bool = False  # True if duplicate dates exist (multiple segments/stores)
+    slice_count: int = 1  # Estimated number of slices/segments
+
+    # Future covariate rows (dates with covariates but no target value)
+    future_rows_count: int = 0
+    future_rows_date_range: Optional[Tuple[date, date]] = None
+    has_future_covariates: bool = False
+    future_covariates_valid: bool = True
+    future_covariates_issues: List[str] = field(default_factory=list)
 
 
 class DataProfiler:
@@ -122,9 +134,17 @@ class DataProfiler:
         target_column = self._detect_target_column(df, date_column)
         logger.info(f"Detected target column: {target_column}")
 
-        # Step 4: Analyze date range
+        # Step 4: Analyze date range and detect multi-slice data
         date_range = self._get_date_range(df, date_column)
         history_months = self._calculate_history_months(date_range)
+
+        # Detect if data has multiple slices (duplicate dates)
+        unique_dates = df[date_column].nunique()
+        total_rows = len(df)
+        has_multiple_slices = unique_dates < total_rows
+        slice_count = total_rows // unique_dates if unique_dates > 0 else 1
+
+        logger.info(f"Unique periods: {unique_dates}, Total rows: {total_rows}, Multiple slices: {has_multiple_slices}")
 
         # Step 5: Find data quality issues
         missing_values = df[target_column].isna().sum()
@@ -146,16 +166,25 @@ class DataProfiler:
             df, date_column, target_column
         )
 
-        # Step 9: Calculate quality score
+        # Step 9: Calculate quality score (use unique_dates for accurate calculation)
         quality_score = self._calculate_quality_score(
-            df, target_column, missing_values, len(missing_periods), len(outliers)
+            df, target_column, missing_values, len(missing_periods), len(outliers),
+            unique_periods=unique_dates
         )
 
         # Step 10: Generate warnings
         warnings = self._generate_warnings(
             history_months, holiday_coverage, missing_values,
-            len(missing_periods), quality_score, frequency
+            missing_periods, quality_score, frequency
         )
+
+        # Add warning for multi-slice data
+        if has_multiple_slices:
+            warnings.append(Warning(
+                level="medium",
+                message=f"Data contains multiple segments (~{slice_count} slices with {unique_dates} unique dates each). Total rows: {total_rows}.",
+                recommendation="Select a specific segment/slice to forecast, or use batch forecasting for all segments."
+            ))
 
         # Step 11: Generate recommendations
         recommended_horizon = self._recommend_horizon(frequency)
@@ -166,6 +195,35 @@ class DataProfiler:
         # Step 12: Compute data hash for reproducibility
         data_hash = self._compute_data_hash(df)
 
+        # Step 13: Detect and validate future covariate rows
+        future_rows_count, future_rows_date_range, has_future_covariates, future_valid, future_issues = self._detect_future_rows(
+            df, date_column, target_column, covariate_columns
+        )
+
+        # Add warning if future covariates detected
+        if has_future_covariates:
+            if future_valid:
+                warnings.append(Warning(
+                    level="low",
+                    message=f"Detected {future_rows_count} rows with future covariate values (dates with predictors but no actuals).",
+                    recommendation="These will be used for more accurate forecasting using your planned/known future values."
+                ))
+            else:
+                warnings.append(Warning(
+                    level="high",
+                    message=f"Future covariate data has validation issues: {'; '.join([i for i in future_issues if not i.startswith('Warning')])}",
+                    recommendation="Please fix the issues in your future covariate rows before forecasting."
+                ))
+
+            # Add any warnings from validation
+            for issue in future_issues:
+                if issue.startswith("Warning:"):
+                    warnings.append(Warning(
+                        level="medium",
+                        message=issue.replace("Warning: ", ""),
+                        recommendation="Review your future covariate data."
+                    ))
+
         return DataProfile(
             # Auto-detected config
             frequency=frequency,
@@ -174,23 +232,23 @@ class DataProfiler:
 
             # Date range
             date_range=date_range,
-            total_periods=len(df),
-            history_months=history_months,
+            total_periods=int(unique_dates),  # Unique time periods, not total rows
+            history_months=float(history_months),
 
-            # Quality metrics
-            missing_values=missing_values,
+            # Quality metrics - convert numpy types to native Python types
+            missing_values=int(missing_values),
             missing_periods=missing_periods,
             outliers=outliers,
-            data_quality_score=quality_score,
+            data_quality_score=float(quality_score),
 
             # Holiday coverage
             holidays_in_data=holidays_in_data,
-            holiday_coverage_score=holiday_coverage,
+            holiday_coverage_score=float(holiday_coverage),
 
-            # Patterns
-            has_trend=has_trend,
-            has_seasonality=has_seasonality,
-            seasonality_period=seasonality_period,
+            # Patterns - ensure native Python bool
+            has_trend=bool(has_trend),
+            has_seasonality=bool(has_seasonality),
+            seasonality_period=int(seasonality_period) if seasonality_period else None,
 
             # Covariates
             covariate_columns=covariate_columns,
@@ -200,11 +258,23 @@ class DataProfiler:
 
             # Reproducibility
             data_hash=data_hash,
-            row_count=len(df),
+            row_count=int(total_rows),  # Total rows in the file
 
             # Recommendations
-            recommended_horizon=recommended_horizon,
+            recommended_horizon=int(recommended_horizon),
             recommended_models=recommended_models,
+
+            # Multi-slice detection
+            unique_periods=int(unique_dates),
+            has_multiple_slices=bool(has_multiple_slices),
+            slice_count=int(slice_count),
+
+            # Future covariate rows
+            future_rows_count=future_rows_count,
+            future_rows_date_range=future_rows_date_range,
+            has_future_covariates=has_future_covariates,
+            future_covariates_valid=future_valid,
+            future_covariates_issues=future_issues,
         )
 
     def _detect_date_column(self, df: pd.DataFrame) -> str:
@@ -247,12 +317,17 @@ class DataProfiler:
 
         dates = pd.to_datetime(df[date_column]).sort_values()
 
-        if len(dates) < 2:
+        # Use UNIQUE dates to handle multi-slice data correctly
+        unique_dates = dates.drop_duplicates().sort_values()
+
+        if len(unique_dates) < 2:
             return "daily"  # Default
 
-        # Calculate median gap between consecutive dates
-        gaps = dates.diff().dropna()
+        # Calculate median gap between consecutive UNIQUE dates
+        gaps = unique_dates.diff().dropna()
         median_gap_days = gaps.median().days
+
+        logger.info(f"Frequency detection: {len(unique_dates)} unique dates, median gap = {median_gap_days} days")
 
         if median_gap_days <= 1:
             return "daily"
@@ -320,26 +395,51 @@ class DataProfiler:
         """Find gaps in the time series."""
 
         dates = pd.to_datetime(df[date_column]).sort_values()
+        unique_dates = dates.drop_duplicates()
 
-        freq_map = {
-            'daily': 'D',
-            'weekly': 'W',
-            'monthly': 'MS'
-        }
+        if len(unique_dates) < 2:
+            return []
+
+        # Determine the appropriate frequency code
+        if frequency == 'daily':
+            freq_code = 'D'
+        elif frequency == 'weekly':
+            # Detect which day of week the data uses (e.g., Monday, Sunday)
+            # by looking at the most common day of week in the data
+            day_of_week = unique_dates.dt.dayofweek.mode()
+            if len(day_of_week) > 0:
+                dow = day_of_week.iloc[0]
+                # Map to pandas weekly frequency anchored to that day
+                # 0=Monday -> W-MON, 1=Tuesday -> W-TUE, etc.
+                dow_map = {0: 'W-MON', 1: 'W-TUE', 2: 'W-WED', 3: 'W-THU',
+                          4: 'W-FRI', 5: 'W-SAT', 6: 'W-SUN'}
+                freq_code = dow_map.get(dow, 'W-MON')
+                logger.info(f"Detected weekly data on day {dow} ({freq_code})")
+            else:
+                freq_code = 'W-MON'  # Default to Monday
+        elif frequency == 'monthly':
+            freq_code = 'MS'
+        else:
+            freq_code = 'D'
 
         # Generate expected date range
-        expected = pd.date_range(
-            start=dates.min(),
-            end=dates.max(),
-            freq=freq_map.get(frequency, 'D')
-        )
+        try:
+            expected = pd.date_range(
+                start=unique_dates.min(),
+                end=unique_dates.max(),
+                freq=freq_code
+            )
+        except Exception as e:
+            logger.warning(f"Failed to generate expected date range with freq={freq_code}: {e}")
+            return []
 
-        # Find missing dates
-        actual_dates = set(dates.dt.normalize())
-        expected_dates = set(expected.normalize())
+        # Find missing dates by comparing unique actual dates to expected
+        actual_dates_set = set(unique_dates.dt.normalize())
+        expected_dates_set = set(expected.normalize())
 
-        missing = expected_dates - actual_dates
-        return sorted([d.date() for d in missing])[:10]  # Return first 10
+        missing = expected_dates_set - actual_dates_set
+        # Return all missing dates (sorted), we'll limit display elsewhere
+        return sorted([d.date() for d in missing])
 
     def _detect_outliers(
         self, df: pd.DataFrame, target_column: str
@@ -438,7 +538,7 @@ class DataProfiler:
         # Trend detection: simple linear regression slope
         x = np.arange(len(values))
         slope, _ = np.polyfit(x, values, 1)
-        has_trend = abs(slope) > (np.std(values) * 0.01)
+        has_trend = bool(abs(slope) > (np.std(values) * 0.01))
 
         # Seasonality detection using autocorrelation
         has_seasonality = False
@@ -461,9 +561,9 @@ class DataProfiler:
 
                 if autocorr > 0.3:  # Significant autocorrelation
                     has_seasonality = True
-                    seasonality_period = expected_period
+                    seasonality_period = int(expected_period)
 
-        return has_trend, has_seasonality, seasonality_period
+        return bool(has_trend), bool(has_seasonality), seasonality_period
 
     def _find_covariate_columns(
         self, df: pd.DataFrame, date_column: str, target_column: str
@@ -492,39 +592,58 @@ class DataProfiler:
 
     def _calculate_quality_score(
         self, df: pd.DataFrame, target_column: str,
-        missing_values: int, missing_periods: int, outlier_count: int
+        missing_values: int, missing_periods: int, outlier_count: int,
+        unique_periods: int = None
     ) -> float:
-        """Calculate overall data quality score (0-100)."""
+        """Calculate overall data quality score (0-100).
 
+        Args:
+            df: DataFrame
+            target_column: Name of target column
+            missing_values: Number of missing values in target
+            missing_periods: Number of missing time periods
+            outlier_count: Number of outliers detected
+            unique_periods: Number of unique time periods (for multi-slice data)
+        """
         total_rows = len(df)
+
+        # Use unique_periods if provided (for multi-slice data), otherwise use total_rows
+        actual_periods = unique_periods if unique_periods is not None else total_rows
+
+        # Expected total periods = actual unique periods + missing periods
+        expected_periods = actual_periods + missing_periods
 
         # Start at 100, deduct for issues
         score = 100.0
 
         # Missing values penalty (up to 30 points)
-        missing_pct = missing_values / total_rows
-        score -= min(missing_pct * 100, 30)
-
-        # Missing periods penalty (up to 20 points)
+        # For multi-slice data, divide by total_rows (since missing values spans all slices)
         if total_rows > 0:
-            missing_period_pct = missing_periods / total_rows
-            score -= min(missing_period_pct * 100, 20)
+            missing_pct = missing_values / total_rows
+            score -= min(missing_pct * 100, 30)
+
+        # Missing periods penalty (up to 30 points) - based on expected vs actual unique periods
+        # This is a significant data quality issue
+        if expected_periods > 0:
+            missing_period_pct = missing_periods / expected_periods
+            # Apply heavier penalty: 5 missing periods = ~10 points, 10+ = 20+ points
+            score -= min(missing_period_pct * 150, 30)
 
         # Outlier penalty (up to 10 points)
         outlier_pct = outlier_count / total_rows if total_rows > 0 else 0
         score -= min(outlier_pct * 50, 10)
 
-        # Bonus for having enough data
-        if total_rows >= 104:  # 2 years weekly
+        # Bonus for having enough unique time periods (up to 10 points)
+        if actual_periods >= 104:  # 2 years weekly
             score = min(score + 10, 100)
-        elif total_rows >= 52:  # 1 year weekly
+        elif actual_periods >= 52:  # 1 year weekly
             score = min(score + 5, 100)
 
         return round(max(score, 0), 1)
 
     def _generate_warnings(
         self, history_months: float, holiday_coverage: float,
-        missing_values: int, missing_periods: int,
+        missing_values: int, missing_periods_list: List[date],
         quality_score: float, frequency: str
     ) -> List[Warning]:
         """Generate user-friendly warnings about data issues."""
@@ -561,11 +680,29 @@ class DataProfiler:
                 recommendation="Missing values will be interpolated. Consider filling them manually for better accuracy."
             ))
 
-        if missing_periods > 0:
+        # Missing periods warning - NOW WITH ACTUAL DATES
+        missing_count = len(missing_periods_list)
+        if missing_count > 0:
+            # Determine severity based on percentage of missing data
+            level = "low"
+            if missing_count >= 10:
+                level = "high"
+            elif missing_count >= 5:
+                level = "medium"
+
+            # Show actual missing dates (up to 10)
+            if missing_count <= 10:
+                dates_str = ", ".join([str(d) for d in missing_periods_list])
+                message = f"{missing_count} missing date(s) in the time series: {dates_str}"
+            else:
+                # Show first 10 and indicate more
+                dates_str = ", ".join([str(d) for d in missing_periods_list[:10]])
+                message = f"{missing_count} missing dates in the time series. First 10: {dates_str} (and {missing_count - 10} more)"
+
             warnings.append(Warning(
-                level="low" if missing_periods < 3 else "medium",
-                message=f"{missing_periods} gaps in the time series.",
-                recommendation="Ensure continuous data without gaps for best results."
+                level=level,
+                message=message,
+                recommendation="These dates are missing from your data. Consider adding rows for these dates, or the model will interpolate them."
             ))
 
         # Quality score warning
@@ -622,3 +759,147 @@ class DataProfiler:
 
         # Compute SHA256
         return hashlib.sha256(csv_string.encode()).hexdigest()[:16]
+
+    def _detect_future_rows(
+        self,
+        df: pd.DataFrame,
+        date_column: str,
+        target_column: str,
+        covariate_columns: List[str]
+    ) -> Tuple[int, Optional[Tuple[date, date]], bool, bool, List[str]]:
+        """
+        Detect and validate rows that have future dates with covariates but no target values.
+
+        This is common in forecasting when users know future values of predictors
+        (e.g., planned promotions, scheduled events) but not the actual target.
+
+        Args:
+            df: DataFrame with data
+            date_column: Name of date column
+            target_column: Name of target column
+            covariate_columns: List of covariate column names
+
+        Returns:
+            Tuple of (count, date_range, has_future_covariates, is_valid, issues_list)
+        """
+        issues = []
+
+        if not covariate_columns:
+            return 0, None, False, True, []
+
+        # Find rows where target is NaN/null but at least one covariate has a value
+        target_missing = df[target_column].isna() | df[target_column].isnull()
+
+        # Check if any covariate has non-null value in these rows
+        has_covariate_value = pd.Series(False, index=df.index)
+        for cov in covariate_columns:
+            if cov in df.columns:
+                has_covariate_value |= df[cov].notna()
+
+        # Future rows: target is missing BUT covariates have values
+        future_mask = target_missing & has_covariate_value
+
+        future_rows = df[future_mask]
+        count = len(future_rows)
+
+        if count == 0:
+            return 0, None, False, True, []
+
+        # ============================================================
+        # VALIDATION CHECKS
+        # ============================================================
+        is_valid = True
+
+        # Parse dates for validation
+        try:
+            df_dates = pd.to_datetime(df[date_column])
+            future_dates = pd.to_datetime(future_rows[date_column])
+            historical_dates = df_dates[~future_mask]
+
+            min_future_date = future_dates.min()
+            max_future_date = future_dates.max()
+            max_historical_date = historical_dates.max() if len(historical_dates) > 0 else None
+
+            date_range = (min_future_date.date(), max_future_date.date())
+
+        except Exception as e:
+            issues.append(f"Could not parse dates in future rows: {str(e)}")
+            return count, None, True, False, issues
+
+        # VALIDATION 1: Future rows should come AFTER historical data
+        if max_historical_date and min_future_date < max_historical_date:
+            # Check if there are interspersed rows
+            interspersed_count = (future_dates < max_historical_date).sum()
+            if interspersed_count > 0:
+                issues.append(
+                    f"Found {interspersed_count} future covariate rows with dates BEFORE the last historical date "
+                    f"({max_historical_date.date()}). Future rows should come after historical data."
+                )
+                is_valid = False
+
+        # VALIDATION 2: Future rows should have valid (parseable) dates
+        invalid_dates = future_dates.isna().sum()
+        if invalid_dates > 0:
+            issues.append(f"Found {invalid_dates} future rows with invalid/unparseable dates.")
+            is_valid = False
+
+        # VALIDATION 3: Check for gaps in future dates (warn, not error)
+        if len(future_dates) > 1:
+            sorted_dates = future_dates.sort_values()
+            date_diffs = sorted_dates.diff().dropna()
+            if len(date_diffs) > 0:
+                median_diff = date_diffs.median()
+                large_gaps = date_diffs[date_diffs > median_diff * 3]
+                if len(large_gaps) > 0:
+                    issues.append(
+                        f"Warning: Found {len(large_gaps)} large gaps in future dates. "
+                        "This may indicate missing future periods."
+                    )
+                    # This is a warning, not an error - still valid
+
+        # VALIDATION 4: Check covariate completeness in future rows
+        for cov in covariate_columns:
+            if cov in future_rows.columns:
+                null_count = future_rows[cov].isna().sum()
+                if null_count > 0 and null_count < count:
+                    issues.append(
+                        f"Warning: Covariate '{cov}' has {null_count} missing values in future rows. "
+                        "Missing values will be imputed with historical mean."
+                    )
+
+        # VALIDATION 5: Check that future covariates have reasonable values
+        for cov in covariate_columns:
+            if cov in future_rows.columns and cov in df.columns:
+                future_vals = future_rows[cov].dropna()
+                hist_vals = df[~future_mask][cov].dropna()
+
+                if len(future_vals) > 0 and len(hist_vals) > 0:
+                    hist_min, hist_max = hist_vals.min(), hist_vals.max()
+                    hist_mean, hist_std = hist_vals.mean(), hist_vals.std()
+
+                    # Check for values far outside historical range
+                    if hist_std > 0:
+                        extreme_low = future_vals < (hist_mean - 5 * hist_std)
+                        extreme_high = future_vals > (hist_mean + 5 * hist_std)
+                        extreme_count = extreme_low.sum() + extreme_high.sum()
+
+                        if extreme_count > 0:
+                            issues.append(
+                                f"Warning: Covariate '{cov}' has {extreme_count} extreme values in future rows "
+                                f"(>5 std from historical mean). Verify these are intentional."
+                            )
+
+        # VALIDATION 6: Check horizon alignment
+        if max_historical_date:
+            days_into_future = (max_future_date - max_historical_date).days
+            if days_into_future > 365 * 2:  # More than 2 years
+                issues.append(
+                    f"Warning: Future covariates extend {days_into_future} days ({days_into_future // 365} years) "
+                    "beyond historical data. Long-range forecasts have higher uncertainty."
+                )
+
+        logger.info(f"Detected {count} future covariate rows with date range {date_range}")
+        if issues:
+            logger.info(f"Future covariate validation issues: {issues}")
+
+        return count, date_range, True, is_valid, issues
