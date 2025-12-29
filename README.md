@@ -9,6 +9,21 @@
   <img src="https://img.shields.io/badge/XGBoost-FF6600?style=for-the-badge" />
 </div>
 
+---
+
+## Quick Links
+
+| I want to... | Go to... |
+|-------------|----------|
+| **Start forecasting now** | [Quick Start](#quick-start-recommended) |
+| **Understand the modes (Simple vs Expert)** | [USER_GUIDE.md](USER_GUIDE.md#-understanding-the-modes) |
+| **Learn step-by-step usage** | [USER_GUIDE.md](USER_GUIDE.md) |
+| **Extend or deploy the platform** | [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) |
+| **Add a new forecasting model** | [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#-adding-new-models) |
+| **Troubleshoot an issue** | [USER_GUIDE.md](USER_GUIDE.md#-troubleshooting) |
+
+---
+
 ## Overview
 
 A comprehensive **prototype and reference implementation** for an AI-powered time series forecasting application built on Databricks. This accelerator demonstrates how to combine modern data science workflows (MLflow, Unity Catalog, Databricks Apps) with an intuitive notebook-style UI to make financial forecasting accessible to business users.
@@ -101,8 +116,9 @@ databricks-forecast-for-finance/
 ├── .env.example                   # Environment template (copy to .env.local)
 ├── .env.local                     # Local environment variables (not in git)
 │
-├── DEVELOPER_GUIDE.md             # Detailed developer documentation
-└── README.md                      # This file
+├── README.md                      # This file (overview & quick start)
+├── USER_GUIDE.md                  # Step-by-step guide for users
+└── DEVELOPER_GUIDE.md             # Technical docs for developers
 ```
 
 ---
