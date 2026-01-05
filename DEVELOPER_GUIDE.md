@@ -82,18 +82,27 @@ Open http://localhost:3000
 
 ## Architecture Overview
 
-```
-+------------------+     +------------------+     +------------------+
-|                  |     |                  |     |                  |
-|    Frontend      |---->|    Backend       |---->|   Databricks     |
-|    (React)       |     |    (FastAPI)     |     |   (MLflow/UC)    |
-|                  |     |                  |     |                  |
-+------------------+     +------------------+     +------------------+
-        |                        |                        |
-        v                        v                        v
-   - App.tsx              - main.py               - MLflow Tracking
-   - Components           - Models                - Unity Catalog
-   - Services             - Preprocessing         - Model Serving
+```mermaid
+flowchart LR
+    subgraph frontend["Frontend (React)"]
+        app["App.tsx"]
+        components["Components"]
+        services["Services"]
+    end
+
+    subgraph backend["Backend (FastAPI)"]
+        main["main.py"]
+        models["Models"]
+        preprocess["Preprocessing"]
+    end
+
+    subgraph databricks["Databricks"]
+        mlflow["MLflow Tracking"]
+        uc["Unity Catalog"]
+        serving["Model Serving"]
+    end
+
+    frontend --> backend --> databricks
 ```
 
 ### Directory Structure
@@ -264,42 +273,38 @@ env:
 
 ### Pipeline Flow
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Training Pipeline                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. Data Ingestion                                               │
-│     └─> Parse CSV, validate columns, detect frequency            │
-│                                                                  │
-│  2. Feature Engineering                                          │
-│     └─> Calendar features, holiday proximity, YoY lags           │
-│                                                                  │
-│  3. Train/Eval/Holdout Split                                     │
-│     └─> 70% train, 15% eval, 15% holdout (chronological)        │
-│                                                                  │
-│  4. Hyperparameter Tuning                                        │
-│     └─> Grid search with intelligent filters                     │
-│                                                                  │
-│  5. Model Training                                               │
-│     └─> Fit on train, evaluate on eval, log to MLflow           │
-│                                                                  │
-│  6. Forecasting                                                  │
-│     └─> Generate future predictions with confidence intervals    │
-│                                                                  │
-│  7. Results                                                       │
-│     └─> Return metrics, forecasts, register model                │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["1. Data Ingestion"] --> B["2. Feature Engineering"]
+    B --> C["3. Train/Eval/Holdout Split"]
+    C --> D["4. Hyperparameter Tuning"]
+    D --> E["5. Model Training"]
+    E --> F["6. Forecasting"]
+    F --> G["7. Results"]
+
+    A -.-> A1["Parse CSV, validate columns, detect frequency"]
+    B -.-> B1["Calendar features, holiday proximity, YoY lags"]
+    C -.-> C1["70% train, 15% eval, 15% holdout"]
+    D -.-> D1["Grid search with intelligent filters"]
+    E -.-> E1["Fit on train, evaluate on eval, log to MLflow"]
+    F -.-> F1["Generate predictions with confidence intervals"]
+    G -.-> G1["Return metrics, forecasts, register model"]
 ```
 
 ### Data Splits
 
-```
-|<---------- Training (70%) ---------->|<-- Eval (15%) -->|<-- Holdout (15%) -->|
-|                                       |                  |                     |
-|        Model learns here              | Hyperparameter   |  Final validation   |
-|                                       | selection        |  (never touched)    |
+```mermaid
+flowchart LR
+    subgraph train["Training (70%)"]
+        t1["Model learns here"]
+    end
+    subgraph eval["Eval (15%)"]
+        e1["Hyperparameter selection"]
+    end
+    subgraph holdout["Holdout (15%)"]
+        h1["Final validation (never touched)"]
+    end
+    train --> eval --> holdout
 ```
 
 ---
