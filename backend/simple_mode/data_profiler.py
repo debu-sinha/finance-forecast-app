@@ -93,11 +93,16 @@ class DataProfiler:
         'report_date', 'transaction_date', 'order_date'
     ]
 
-    # Common target column names
+    # Common target column names (ordered by specificity - most specific first)
+    # Note: 'y' is a common ML convention but matches too broadly in partial matching
     TARGET_COLUMN_PATTERNS = [
-        'y', 'value', 'target', 'amount', 'revenue', 'sales', 'quantity',
-        'total', 'count', 'volume', 'actual', 'demand', 'orders'
+        'revenue', 'sales', 'quantity', 'amount', 'volume', 'demand', 'orders',
+        'target', 'actual', 'value', 'total', 'count', 'tot_sub', 'tot_vol',
+        'subtotal', 'subscription'
     ]
+
+    # Exact match only patterns (avoid partial matching issues)
+    TARGET_COLUMN_EXACT = ['y', 'Y']
 
     # Columns to exclude from target detection
     EXCLUDE_FROM_TARGET = [
@@ -360,19 +365,27 @@ class DataProfiler:
                 "a numeric column for forecasting (e.g., 'revenue', 'sales', 'value')."
             )
 
-        # First, try exact matches with common names
+        # Step 1: Try exact matches with short patterns (like 'y')
+        for col in numeric_cols:
+            if col in self.TARGET_COLUMN_EXACT:
+                return col
+
+        # Step 2: Try exact matches with common names (case-insensitive)
         for col in numeric_cols:
             if col.lower() in self.TARGET_COLUMN_PATTERNS:
                 return col
 
-        # Second, try partial matches
+        # Step 3: Try partial matches with longer patterns
+        # Only match if pattern is a substantial part of the column name
         for col in numeric_cols:
             col_lower = col.lower()
             for pattern in self.TARGET_COLUMN_PATTERNS:
-                if pattern in col_lower:
+                # Require pattern to be at least 3 chars to avoid false positives
+                if len(pattern) >= 3 and pattern in col_lower:
                     return col
 
-        # Third, pick the column with highest variance (likely the target)
+        # Step 4: Pick the column with highest variance (likely the target)
+        # This is a strong heuristic - target columns typically have high variance
         variances = {col: df[col].var() for col in numeric_cols}
         return max(variances, key=variances.get)
 

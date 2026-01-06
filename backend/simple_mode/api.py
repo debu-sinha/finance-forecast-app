@@ -686,15 +686,42 @@ def _parse_file(content: bytes, filename: str) -> pd.DataFrame:
     """Parse uploaded file into DataFrame."""
 
     if filename.endswith('.csv'):
-        return pd.read_csv(io.BytesIO(content))
+        df = pd.read_csv(io.BytesIO(content))
     elif filename.endswith(('.xlsx', '.xls')):
-        return pd.read_excel(io.BytesIO(content))
+        df = pd.read_excel(io.BytesIO(content))
     else:
         # Try CSV first, then Excel
         try:
-            return pd.read_csv(io.BytesIO(content))
+            df = pd.read_csv(io.BytesIO(content))
         except:
-            return pd.read_excel(io.BytesIO(content))
+            df = pd.read_excel(io.BytesIO(content))
+
+    # Clean comma-formatted numbers (e.g., "1,234,567" -> 1234567)
+    df = _clean_numeric_columns(df)
+
+    return df
+
+
+def _clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean columns that contain comma-formatted numbers.
+    E.g., "1,234,567" should be converted to 1234567.0
+    """
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Check if this column looks like comma-formatted numbers
+            sample = df[col].dropna().head(10)
+            if len(sample) > 0:
+                # Check if values match pattern like "1,234" or "1,234,567"
+                looks_like_number = sample.astype(str).str.match(r'^-?[\d,]+\.?\d*$').all()
+                if looks_like_number:
+                    try:
+                        # Remove commas and convert to float
+                        df[col] = df[col].astype(str).str.replace(',', '').astype(float)
+                        logger.info(f"Cleaned comma-formatted numbers in column: {col}")
+                    except (ValueError, TypeError):
+                        pass  # Not actually numeric, leave as-is
+    return df
 
 
 async def _run_forecast(
