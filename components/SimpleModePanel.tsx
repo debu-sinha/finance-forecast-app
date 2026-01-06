@@ -298,9 +298,9 @@ const AI_GUIDANCE = {
     intro: "Your data contains multiple segments (like regions, products, or customer types).",
     description: "Think of slices as different \"groups\" in your data that might have different patterns:",
     examples: [
-      { type: "Regional slices", values: "North, South, East, West", impact: "each may have different seasonal patterns" },
-      { type: "Product slices", values: "Product A vs Product B", impact: "may respond differently to promotions" },
-      { type: "Channel slices", values: "Online vs Retail", impact: "may have different growth trends" },
+      { type: "Business segment", values: "Enterprise, SMB, Subscription", impact: "each may have different growth patterns" },
+      { type: "Channel type", values: "Pickup vs Classic vs Subscription", impact: "may respond differently to seasonality" },
+      { type: "Customer type", values: "CGNA vs Non-CGNA", impact: "may have different volume trends" },
     ],
   },
   aggregateMode: {
