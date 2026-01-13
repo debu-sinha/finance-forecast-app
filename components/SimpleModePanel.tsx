@@ -872,13 +872,25 @@ export const SimpleModePanel: React.FC = () => {
 
     const { numericColumns, holidayColumns } = detectColumnTypes(state.columns, state.rawData);
 
-    // Start with original detected slices, but filter based on overrides
+    // Start with original detected slices, but filter based on overrides AND auto-detected types
     let effectiveSlices = state.detectedSlices.filter(slice => {
       const override = state.columnOverrides[slice.column];
-      // If user reclassified to something other than 'slice', remove it
-      if (override && override !== 'slice') {
+
+      // If user explicitly reclassified, respect that
+      if (override) {
+        return override === 'slice';
+      }
+
+      // If auto-detected as holiday, don't show in segment list
+      if (holidayColumns.includes(slice.column)) {
         return false;
       }
+
+      // If auto-detected as numeric, don't show in segment list
+      if (numericColumns.includes(slice.column)) {
+        return false;
+      }
+
       return true;
     });
 
