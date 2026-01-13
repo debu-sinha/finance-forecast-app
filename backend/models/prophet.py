@@ -581,18 +581,62 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Let's assume we use the simple logic for now to save space, 
         # or I can copy `create_future_dataframe` if I have it.
         # I'll use a simplified version here.
+        # =========================================================================
+        # CRITICAL FIX: Generate proper future features instead of using means
+        # Using means for covariates causes FLAT FORECASTS because:
+        # - Holiday indicators should be 1/0, not 0.02 (mean)
+        # - Calendar features should vary, not be constant
+        # =========================================================================
+        logger.info(f"📅 Generating future features for {len(future)} forecast periods...")
+
+        # First, generate calendar and holiday features for future dates
+        future_with_features = future.copy()
+        future_with_features['y'] = 0  # Placeholder for feature generation
+
+        try:
+            # Use the same preprocessing as training to generate derived features
+            future_with_features = enhance_features_for_forecasting(
+                df=future_with_features,
+                date_col='ds',
+                target_col='y',
+                promo_cols=[],  # Don't process user covariates here
+                frequency=frequency
+            )
+            logger.info(f"✅ Generated {len(future_with_features.columns)} features for future dates")
+
+            # Copy generated features to future dataframe
+            for col in future_with_features.columns:
+                if col not in ['ds', 'y'] and col in history_df.columns:
+                    future[col] = future_with_features[col].values
+                    logger.info(f"   Added derived feature '{col}' to future")
+
+        except Exception as e:
+            logger.warning(f"Could not generate future derived features: {e}. Using historical means.")
+
+        # For user-provided covariates that weren't auto-generated, use mapping or means
         for cov in covariates:
-            if cov in history_df.columns:
+            if cov in history_df.columns and cov not in future.columns:
                 # If we have future values in df (from future_features), use them
-                # Map from df to future based on ds
                 future = future.set_index('ds')
                 # Create a map from df
                 cov_map = df.set_index('ds')[cov]
                 # Update future with values from df where available
                 future[cov] = future.index.map(cov_map)
-                # Fill remaining NaNs with mean
-                future[cov] = future[cov].fillna(history_df[cov].mean())
+                # Fill remaining NaNs with mean (only for truly unknown covariates)
+                if future[cov].isna().any():
+                    mean_val = history_df[cov].mean()
+                    future[cov] = future[cov].fillna(mean_val)
+                    logger.info(f"   User covariate '{cov}': filled NaN with mean={mean_val:.4f}")
                 future = future.reset_index()
+
+        # Log a sample of future features to verify they vary
+        if len(future) > 0:
+            sample_cols = [c for c in ['is_thanksgiving_week', 'is_christmas_week', 'is_weekend', 'day_of_week', 'month'] if c in future.columns]
+            if sample_cols:
+                logger.info(f"📊 Future feature sample (first 3 rows):")
+                for col in sample_cols[:3]:
+                    vals = future[col].head(3).tolist()
+                    logger.info(f"   {col}: {vals}")
 
         forecast = final_model.predict(future)
         
