@@ -987,13 +987,42 @@ async def _run_forecast(
         train_eval_df = processed_df.iloc[:train_size + eval_size].copy()
 
         # Train each selected model
-        for model_type in models_to_train:
+        logger.info("=" * 70)
+        logger.info("🚂 MODEL TRAINING LOOP - Starting")
+        logger.info("=" * 70)
+        logger.info(f"[TRAIN LOOP] Models to train: {models_to_train}")
+        logger.info(f"[TRAIN LOOP] Train df shape: {train_df.shape}")
+        logger.info(f"[TRAIN LOOP] Eval df shape: {eval_df.shape}")
+        logger.info(f"[TRAIN LOOP] Holdout df shape: {holdout_df.shape}")
+        logger.info(f"[TRAIN LOOP] Covariates: {covariates}")
+        logger.info(f"[TRAIN LOOP] Horizon: {config.horizon}")
+        logger.info(f"[TRAIN LOOP] Frequency: {config.frequency}")
+
+        models_attempted = []
+        models_succeeded = []
+        models_failed = []
+
+        for model_idx, model_type in enumerate(models_to_train):
+            logger.info("-" * 50)
+            logger.info(f"🔄 [{model_idx + 1}/{len(models_to_train)}] ATTEMPTING: {model_type.upper()}")
+            logger.info("-" * 50)
+            models_attempted.append(model_type)
+
             try:
-                logger.info(f"Training {model_type}...")
+                logger.info(f"[{model_type.upper()}] Starting training...")
 
                 if model_type == 'prophet':
                     # IMPORTANT: data_list has columns already renamed to 'ds' and 'y'
                     # So we pass 'ds' and 'y' as the column names, not the original names
+                    logger.info(f"[PROPHET] Calling train_prophet_model with:")
+                    logger.info(f"[PROPHET]   data_list length: {len(data_list)}")
+                    logger.info(f"[PROPHET]   time_col: 'ds'")
+                    logger.info(f"[PROPHET]   target_col: 'y'")
+                    logger.info(f"[PROPHET]   covariates: {covariates}")
+                    logger.info(f"[PROPHET]   horizon: {config.horizon}")
+                    logger.info(f"[PROPHET]   frequency: {config.frequency}")
+                    logger.info(f"[PROPHET]   eval_size: {eval_size}")
+                    logger.info(f"[PROPHET]   hyperparameter_filters: {list(hyperparameter_filters.get('prophet', {}).keys()) if hyperparameter_filters else 'None'}")
                     mlflow_run_id, _, metrics, validation, forecast, uri, impacts = train_prophet_model(
                         data_list,
                         'ds',  # data_list already has columns renamed
@@ -1022,6 +1051,13 @@ async def _run_forecast(
                     }
 
                 elif model_type == 'arima':
+                    logger.info(f"[ARIMA] Calling train_arima_model with:")
+                    logger.info(f"[ARIMA]   train_df shape: {train_df.shape}")
+                    logger.info(f"[ARIMA]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[ARIMA]   horizon: {config.horizon}")
+                    logger.info(f"[ARIMA]   frequency: {config.frequency}")
+                    logger.info(f"[ARIMA]   covariates: {covariates}")
+                    logger.info(f"[ARIMA]   hyperparameter_filters: {list(hyperparameter_filters.get('arima', {}).keys()) if hyperparameter_filters else 'None'}")
                     mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_arima_model(
                         train_df, eval_df, config.horizon, config.frequency,
                         None, config.random_seed,
@@ -1029,6 +1065,7 @@ async def _run_forecast(
                         hyperparameter_filters=hyperparameter_filters,
                         forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
+                    logger.info(f"[ARIMA] Training complete. Params: {params}")
 
                     result = {
                         'model_type': f'ARIMA{params}' if params else 'ARIMA',
@@ -1041,6 +1078,13 @@ async def _run_forecast(
                     }
 
                 elif model_type == 'xgboost':
+                    logger.info(f"[XGBOOST] Calling train_xgboost_model with:")
+                    logger.info(f"[XGBOOST]   train_df shape: {train_df.shape}")
+                    logger.info(f"[XGBOOST]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[XGBOOST]   horizon: {config.horizon}")
+                    logger.info(f"[XGBOOST]   frequency: {config.frequency}")
+                    logger.info(f"[XGBOOST]   covariates: {covariates}")
+                    logger.info(f"[XGBOOST]   hyperparameter_filters: {list(hyperparameter_filters.get('xgboost', {}).keys()) if hyperparameter_filters else 'None'}")
                     mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_xgboost_model(
                         train_df, eval_df, config.horizon, config.frequency,
                         covariates=covariates, random_seed=config.random_seed,
@@ -1048,6 +1092,7 @@ async def _run_forecast(
                         hyperparameter_filters=hyperparameter_filters,
                         forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
+                    logger.info(f"[XGBOOST] Training complete. Params: {params}")
 
                     result = {
                         'model_type': f'XGBoost(depth={params.get("max_depth", "?")})' if params else 'XGBoost',
@@ -1079,17 +1124,70 @@ async def _run_forecast(
                     'overfit_warning': holdout_mape > result['eval_mape'] * 1.5
                 })
 
-                logger.info(f"  {model_type}: Eval MAPE={result['eval_mape']:.2f}%, Holdout MAPE={holdout_mape:.2f}%")
+                models_succeeded.append(model_type)
+                logger.info(f"✅ [{model_type.upper()}] TRAINING SUCCEEDED!")
+                logger.info(f"[{model_type.upper()}] Result model_type: {result['model_type']}")
+                logger.info(f"[{model_type.upper()}] Eval MAPE: {result['eval_mape']:.2f}%")
+                logger.info(f"[{model_type.upper()}] Holdout MAPE: {holdout_mape:.2f}%")
+                logger.info(f"[{model_type.upper()}] Metrics: {result.get('metrics', {})}")
 
                 # Select best model based on HOLDOUT performance
                 if holdout_mape < best_holdout_mape:
                     best_holdout_mape = holdout_mape
                     best_result = result
-                    logger.info(f"  New best model: {result['model_type']} (Holdout MAPE: {best_holdout_mape:.2f}%)")
+                    logger.info(f"🏆 [{model_type.upper()}] NEW BEST MODEL! (Holdout MAPE: {best_holdout_mape:.2f}%)")
 
             except Exception as model_error:
-                logger.warning(f"  {model_type} failed: {model_error}")
+                import traceback
+                error_traceback = traceback.format_exc()
+                models_failed.append({
+                    'model': model_type,
+                    'error': str(model_error),
+                    'traceback': error_traceback
+                })
+                logger.error("=" * 50)
+                logger.error(f"❌ [{model_type.upper()}] TRAINING FAILED!")
+                logger.error("=" * 50)
+                logger.error(f"[{model_type.upper()}] Error type: {type(model_error).__name__}")
+                logger.error(f"[{model_type.upper()}] Error message: {str(model_error)}")
+                logger.error(f"[{model_type.upper()}] Full traceback:")
+                for line in error_traceback.split('\n'):
+                    if line.strip():
+                        logger.error(f"[{model_type.upper()}]   {line}")
+                logger.error("=" * 50)
                 continue
+
+        # ============================================================
+        # MODEL TRAINING SUMMARY
+        # ============================================================
+        logger.info("=" * 70)
+        logger.info("📊 MODEL TRAINING SUMMARY")
+        logger.info("=" * 70)
+        logger.info(f"[SUMMARY] Models attempted: {models_attempted}")
+        logger.info(f"[SUMMARY] Models succeeded: {models_succeeded}")
+        logger.info(f"[SUMMARY] Models failed: {[f['model'] for f in models_failed]}")
+
+        if models_failed:
+            logger.info("[SUMMARY] Failed model details:")
+            for fail in models_failed:
+                logger.info(f"[SUMMARY]   ❌ {fail['model']}: {fail['error'][:100]}...")
+
+        if model_comparison:
+            logger.info("[SUMMARY] Model comparison (sorted by holdout MAPE):")
+            sorted_comparison = sorted(model_comparison, key=lambda x: x['holdout_mape'])
+            for mc in sorted_comparison:
+                logger.info(f"[SUMMARY]   {mc['model']}: Eval={mc['eval_mape']:.2f}%, Holdout={mc['holdout_mape']:.2f}%, Overfit={mc['overfit_warning']}")
+
+        if best_result:
+            logger.info(f"[SUMMARY] 🏆 BEST MODEL: {best_result['model_type']} (Holdout MAPE: {best_holdout_mape:.2f}%)")
+        else:
+            logger.error("[SUMMARY] ⚠️ NO MODEL SUCCEEDED! All models failed.")
+            logger.error("[SUMMARY] This is likely due to:")
+            logger.error("[SUMMARY]   - Insufficient data for training")
+            logger.error("[SUMMARY]   - Data quality issues (NaN, invalid values)")
+            logger.error("[SUMMARY]   - Configuration issues (wrong column names)")
+
+        logger.info("=" * 70)
 
         # ============================================================
         # RETRAIN BEST MODEL ON FULL DATA FOR FINAL FORECAST
@@ -1319,23 +1417,48 @@ def _select_models_for_data(profile: DataProfile, data_length: int) -> List[str]
 
     Returns a list of model types to train, ordered by likelihood of success.
     """
+    logger.info("=" * 70)
+    logger.info("🎯 MODEL SELECTION - _select_models_for_data")
+    logger.info("=" * 70)
+    logger.info(f"[MODEL SELECT] Input data_length: {data_length}")
+    logger.info(f"[MODEL SELECT] Profile frequency: {profile.frequency}")
+    logger.info(f"[MODEL SELECT] Profile history_months: {profile.history_months}")
+    logger.info(f"[MODEL SELECT] Profile data_quality_score: {profile.data_quality_score}")
+
     models = []
+    selection_reasons = []
 
     # Prophet: Good for most cases, especially with seasonality
     if data_length >= 12:  # Minimum for Prophet
         models.append('prophet')
+        selection_reasons.append(f"✅ Prophet: data_length ({data_length}) >= 12")
+    else:
+        selection_reasons.append(f"❌ Prophet SKIPPED: data_length ({data_length}) < 12 minimum")
 
     # XGBoost: Good with covariates and enough data
     if data_length >= 30:
         models.append('xgboost')
+        selection_reasons.append(f"✅ XGBoost: data_length ({data_length}) >= 30")
+    else:
+        selection_reasons.append(f"❌ XGBoost SKIPPED: data_length ({data_length}) < 30 minimum")
 
     # ARIMA: Good for shorter series without strong seasonality
     if data_length >= 20:
         models.append('arima')
+        selection_reasons.append(f"✅ ARIMA: data_length ({data_length}) >= 20")
+    else:
+        selection_reasons.append(f"❌ ARIMA SKIPPED: data_length ({data_length}) < 20 minimum")
 
     # If no models selected, at least try Prophet
     if not models:
         models = ['prophet']
+        selection_reasons.append("⚠️ No models qualified - FALLBACK to Prophet")
+
+    logger.info("[MODEL SELECT] Selection decisions:")
+    for reason in selection_reasons:
+        logger.info(f"[MODEL SELECT]   {reason}")
+    logger.info(f"[MODEL SELECT] FINAL MODELS TO TRAIN: {models}")
+    logger.info("=" * 70)
 
     return models
 
