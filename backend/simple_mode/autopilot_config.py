@@ -128,16 +128,34 @@ class AutopilotConfig:
         Returns:
             ForecastConfig with optimal settings
         """
-        logger.info("Generating autopilot configuration...")
+        logger.info("=" * 70)
+        logger.info("⚙️ AUTOPILOT CONFIG - START")
+        logger.info("=" * 70)
+        logger.info(f"[INPUT] profile.frequency: {profile.frequency}")
+        logger.info(f"[INPUT] profile.date_column: {profile.date_column}")
+        logger.info(f"[INPUT] profile.target_column: {profile.target_column}")
+        logger.info(f"[INPUT] profile.covariate_columns: {profile.covariate_columns}")
+        logger.info(f"[INPUT] profile.total_periods: {profile.total_periods}")
+        logger.info(f"[INPUT] profile.history_months: {profile.history_months}")
+        logger.info(f"[INPUT] profile.has_trend: {profile.has_trend}")
+        logger.info(f"[INPUT] profile.has_seasonality: {profile.has_seasonality}")
+        logger.info(f"[INPUT] profile.recommended_horizon: {profile.recommended_horizon}")
+        logger.info(f"[INPUT] profile.recommended_models: {profile.recommended_models}")
+        logger.info(f"[INPUT] horizon override: {horizon}")
+        logger.info("-" * 70)
 
         # Use profile recommendations or override
         final_horizon = horizon if horizon else profile.recommended_horizon
         models = profile.recommended_models
+        logger.info(f"[CONFIG] final_horizon: {final_horizon}")
+        logger.info(f"[CONFIG] models to configure: {models}")
 
         # Generate optimal config for each model
         model_configs = {}
         for model in models:
+            logger.info(f"[CONFIG] Generating optimal params for model: {model}")
             model_configs[model] = self._get_optimal_params(model, profile)
+            logger.info(f"[CONFIG] {model} params: {model_configs[model].params}")
 
         config = ForecastConfig(
             # Auto-determined settings
@@ -160,8 +178,18 @@ class AutopilotConfig:
             generation_mode="autopilot",
         )
 
-        logger.info(f"Generated config: {len(models)} models, horizon={final_horizon}")
-        logger.info(f"Config hash: {config.config_hash}")
+        logger.info("=" * 70)
+        logger.info("⚙️ AUTOPILOT CONFIG - FINAL OUTPUT")
+        logger.info("=" * 70)
+        logger.info(f"[OUTPUT] frequency: {config.frequency}")
+        logger.info(f"[OUTPUT] date_column: {config.date_column}")
+        logger.info(f"[OUTPUT] target_column: {config.target_column}")
+        logger.info(f"[OUTPUT] covariate_columns: {config.covariate_columns}")
+        logger.info(f"[OUTPUT] horizon: {config.horizon}")
+        logger.info(f"[OUTPUT] models: {config.models}")
+        logger.info(f"[OUTPUT] random_seed: {config.random_seed}")
+        logger.info(f"[OUTPUT] config_hash: {config.config_hash}")
+        logger.info("=" * 70)
 
         return config
 
@@ -303,13 +331,24 @@ def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str,
         Dictionary of model name -> hyperparameter constraints
         Format matches what backend/models/*.py expect
     """
+    logger.info("=" * 70)
+    logger.info("🎛️ HYPERPARAMETER FILTERS - START")
+    logger.info("=" * 70)
+    logger.info(f"[INPUT] profile.total_periods: {profile.total_periods}")
+    logger.info(f"[INPUT] profile.history_months: {profile.history_months}")
+    logger.info(f"[INPUT] profile.frequency: {profile.frequency}")
+    logger.info(f"[INPUT] profile.has_trend: {profile.has_trend}")
+    logger.info(f"[INPUT] profile.has_seasonality: {profile.has_seasonality}")
+    logger.info(f"[INPUT] profile.data_quality_score: {profile.data_quality_score}")
+    logger.info("-" * 70)
+
     filters = {}
 
     # Calculate derived metrics
     n_observations = profile.total_periods
     n_years = profile.history_months / 12.0
 
-    logger.info(f"Generating hyperparameter filters for {n_observations} observations, {n_years:.1f} years")
+    logger.info(f"[CALC] n_observations: {n_observations}, n_years: {n_years:.2f}")
 
     # ============================================================
     # PROPHET HYPERPARAMETERS
@@ -447,8 +486,14 @@ def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str,
 
     filters['XGBoost'] = xgb_hp
 
-    logger.info(f"Generated hyperparameter filters: {list(filters.keys())}")
+    logger.info("=" * 70)
+    logger.info("🎛️ HYPERPARAMETER FILTERS - FINAL OUTPUT")
+    logger.info("=" * 70)
+    logger.info(f"[OUTPUT] Generated filters for models: {list(filters.keys())}")
     for model, params in filters.items():
-        logger.info(f"  {model}: {list(params.keys())}")
+        logger.info(f"[OUTPUT] {model}:")
+        for param_name, param_values in params.items():
+            logger.info(f"[OUTPUT]   {param_name}: {param_values}")
+    logger.info("=" * 70)
 
     return filters

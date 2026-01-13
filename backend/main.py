@@ -672,7 +672,8 @@ async def train_model(request: TrainRequest):
                             request.regressor_method, request.country, seed, request.future_features,
                             request.hyperparameter_filters,
                             train_df_override=train_df,  # Pass pre-split data
-                            test_df_override=test_df     # Pass pre-split data
+                            test_df_override=test_df,    # Pass pre-split data
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         result = ModelResult(
                             model_type='prophet', model_name='Prophet (MLflow)', run_id=run_id,
@@ -688,7 +689,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_arima_model(
                             train_df, test_df, request.horizon, request.frequency, None, seed,
                             original_data=request.data, covariates=safe_covariates,
-                            hyperparameter_filters=request.hyperparameter_filters
+                            hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -711,7 +713,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_exponential_smoothing_model(
                             train_df, test_df, request.horizon, request.frequency, seasonal_periods, seed,
                             original_data=request.data, covariates=safe_covariates,
-                            hyperparameter_filters=request.hyperparameter_filters
+                            hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -729,7 +732,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_sarimax_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country, hyperparameter_filters=request.hyperparameter_filters
+                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -749,7 +753,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_xgboost_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country, hyperparameter_filters=request.hyperparameter_filters
+                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})

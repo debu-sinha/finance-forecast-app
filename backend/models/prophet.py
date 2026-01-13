@@ -283,7 +283,7 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
             client.set_terminated(run_id, status="FAILED")
         return {"params": params, "metrics": None, "run_id": run_id, "status": "FAILED", "error": str(e)}
 
-def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None):
+def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None, forecast_start_date=None):
     # Set global random seeds for reproducibility
     np.random.seed(random_seed)
     import random
@@ -522,9 +522,18 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 final_model.add_regressor(cov)
         
         final_model.fit(history_df)
-        
-        # Forecast
-        future = final_model.make_future_dataframe(periods=horizon, freq=freq_code)
+
+        # Forecast - generate dates starting from forecast_start_date if provided
+        # This ensures forecasts start from user's specified end_date, not from training data end
+        if forecast_start_date is not None:
+            # Use user-specified forecast start date
+            start_date = pd.to_datetime(forecast_start_date).normalize()
+            future_dates = pd.date_range(start=start_date, periods=horizon + 1, freq=freq_code)[1:]
+            future = pd.DataFrame({'ds': future_dates})
+            logger.info(f"📅 Forecast dates: {start_date} + {horizon} periods -> {future['ds'].min()} to {future['ds'].max()}")
+        else:
+            # Fallback to Prophet's default behavior (from end of training data)
+            future = final_model.make_future_dataframe(periods=horizon, freq=freq_code)
         
         # Add future covariates
         # Use simple mean for now, or use provided future_df if available

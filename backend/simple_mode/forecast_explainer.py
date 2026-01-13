@@ -140,14 +140,51 @@ class ForecastExplainer:
         Returns:
             ForecastExplanation with all transparency layers
         """
-        logger.info("Generating forecast explanation...")
+        logger.info("=" * 70)
+        logger.info("📝 FORECAST EXPLAINER - START")
+        logger.info("=" * 70)
+        logger.info(f"[INPUT] forecast_result keys: {list(forecast_result.keys())}")
+        logger.info(f"[INPUT] forecast_result.best_model: {forecast_result.get('best_model')}")
+        logger.info(f"[INPUT] forecast_result.metrics: {forecast_result.get('metrics')}")
+        forecast_vals = forecast_result.get('forecast', [])
+        logger.info(f"[INPUT] forecast values count: {len(forecast_vals)}")
+        if forecast_vals:
+            logger.info(f"[INPUT] forecast values (first 5): {forecast_vals[:5]}")
+            logger.info(f"[INPUT] forecast values (last 5): {forecast_vals[-5:]}")
+        logger.info(f"[INPUT] config keys: {list(config.keys())}")
+        logger.info(f"[INPUT] config.horizon: {config.get('horizon')}")
+        logger.info(f"[INPUT] data_profile keys: {list(data_profile.keys())}")
+        logger.info(f"[INPUT] data_profile.history_months: {data_profile.get('history_months')}")
+        logger.info(f"[INPUT] data_profile.data_quality_score: {data_profile.get('data_quality_score')}")
+        logger.info("-" * 70)
 
         # Generate each component
+        logger.info("[STEP 1] Generating summary...")
         summary = self._generate_summary(forecast_result, config)
+        logger.info(f"[STEP 1 OUTPUT] Summary length: {len(summary)} chars")
+
+        logger.info("[STEP 2] Decomposing forecast into components...")
         components = self._decompose_forecast(forecast_result)
+        logger.info(f"[STEP 2 OUTPUT] Components - base: {components.total_base}, trend: {components.total_trend}, seasonal: {components.total_seasonal}, holiday: {components.total_holiday}")
+        logger.info(f"[STEP 2 OUTPUT] Period breakdown count: {len(components.period_breakdown)}")
+
+        logger.info("[STEP 3] Assessing confidence...")
         confidence = self._assess_confidence(forecast_result, data_profile)
+        logger.info(f"[STEP 3 OUTPUT] Confidence level: {confidence.level}, score: {confidence.score}, MAPE: {confidence.mape}")
+
+        logger.info("[STEP 4] Generating caveats...")
         caveats = self._generate_caveats(forecast_result, data_profile)
+        logger.info(f"[STEP 4 OUTPUT] Caveats count: {len(caveats)}")
+        for i, caveat in enumerate(caveats):
+            logger.info(f"[STEP 4 OUTPUT] Caveat {i+1}: {caveat[:80]}...")
+
+        logger.info("[STEP 5] Building audit trail...")
         audit_trail = self._build_audit_trail(forecast_result, config, data_profile)
+        logger.info(f"[STEP 5 OUTPUT] Audit trail - run_id: {audit_trail.run_id}, model: {audit_trail.model_type}")
+
+        logger.info("=" * 70)
+        logger.info("📝 FORECAST EXPLAINER - COMPLETE")
+        logger.info("=" * 70)
 
         return ForecastExplanation(
             summary=summary,

@@ -751,18 +751,38 @@ async def _run_forecast(
     import numpy as np
     import random
 
+    logger.info("=" * 70)
+    logger.info("🔮 _run_forecast - START")
+    logger.info("=" * 70)
+    logger.info(f"[INPUT] run_id: {run_id}")
+    logger.info(f"[INPUT] df.shape: {df.shape}")
+    logger.info(f"[INPUT] df.columns: {list(df.columns)}")
+    logger.info(f"[INPUT] df.dtypes:\n{df.dtypes.to_string()}")
+    logger.info(f"[INPUT] config.date_column: {config.date_column}")
+    logger.info(f"[INPUT] config.target_column: {config.target_column}")
+    logger.info(f"[INPUT] config.covariate_columns: {config.covariate_columns}")
+    logger.info(f"[INPUT] config.horizon: {config.horizon}")
+    logger.info(f"[INPUT] config.frequency: {config.frequency}")
+    logger.info(f"[INPUT] config.models: {config.models}")
+    logger.info(f"[INPUT] profile.has_multiple_slices: {profile.has_multiple_slices}")
+    logger.info(f"[INPUT] profile.has_future_covariates: {profile.has_future_covariates}")
+    logger.info(f"[INPUT] hyperparameter_filters provided: {hyperparameter_filters is not None}")
+    logger.info("-" * 70)
+
     # CRITICAL: Set random seeds for reproducibility FIRST
     seed = config.random_seed  # Default: 42
     random.seed(seed)
     np.random.seed(seed)
-    logger.info(f"Set random seed {seed} for reproducibility")
+    logger.info(f"[SETUP] Set random seed {seed} for reproducibility")
 
     # Prepare data in expected format
+    logger.info("[DATA PREP] Preparing data...")
     data = df.copy()
 
     # Get covariates if any (exclude target column to prevent data leakage)
     covariates = [c for c in config.covariate_columns
                   if c in df.columns and c != config.target_column]
+    logger.info(f"[DATA PREP] Covariates after filtering: {covariates}")
 
     # ============================================================
     # AUTO-AGGREGATE MULTI-SLICE DATA
@@ -770,9 +790,10 @@ async def _run_forecast(
     # If data has multiple segments (duplicate dates), aggregate by date
     # This prevents the model from getting confused by mixed segment data
     # ============================================================
+    logger.info("[AGGREGATION] Checking for multi-slice data...")
     aggregation_applied = False
     if profile.has_multiple_slices:
-        logger.info(f"⚠️ Multi-slice data detected ({profile.slice_count} segments). Auto-aggregating by date...")
+        logger.info(f"[AGGREGATION] ⚠️ Multi-slice data detected ({profile.slice_count} segments). Auto-aggregating by date...")
 
         # Convert date column to datetime for grouping
         data[config.date_column] = pd.to_datetime(data[config.date_column])
@@ -791,7 +812,9 @@ async def _run_forecast(
 
         data = data.groupby(config.date_column).agg(agg_dict).reset_index()
         aggregation_applied = True
-        logger.info(f"✅ Aggregated to {len(data)} unique time periods (was {profile.row_count} rows)")
+        logger.info(f"[AGGREGATION] ✅ Aggregated to {len(data)} unique time periods (was {profile.row_count} rows)")
+        logger.info(f"[AGGREGATION] After aggregation - columns: {list(data.columns)}")
+        logger.info(f"[AGGREGATION] After aggregation - target stats: min={data[config.target_column].min()}, max={data[config.target_column].max()}, mean={data[config.target_column].mean():.2f}")
 
     # ============================================================
     # SEPARATE FUTURE COVARIATE ROWS FROM HISTORICAL DATA
@@ -836,20 +859,31 @@ async def _run_forecast(
             logger.info(f"📊 Historical data: {len(data)} rows (after removing future rows)")
 
     # Rename columns to standard format expected by training functions
+    logger.info("[COLUMN RENAME] Renaming columns to standard format...")
+    logger.info(f"[COLUMN RENAME] Before rename - columns: {list(data.columns)}")
     column_mapping = {
         config.date_column: 'ds',
         config.target_column: 'y'
     }
+    logger.info(f"[COLUMN RENAME] Mapping: {column_mapping}")
     data = data.rename(columns=column_mapping)
     data['ds'] = pd.to_datetime(data['ds'])
     data = data.sort_values('ds').reset_index(drop=True)
+    logger.info(f"[COLUMN RENAME] After rename - columns: {list(data.columns)}")
+    logger.info(f"[COLUMN RENAME] Date range: {data['ds'].min()} to {data['ds'].max()}")
+    logger.info(f"[COLUMN RENAME] Target 'y' - first 5 values: {data['y'].head(5).tolist()}")
+    logger.info(f"[COLUMN RENAME] Target 'y' - last 5 values: {data['y'].tail(5).tolist()}")
 
     # Prepare data as list of dicts (expected format for training API)
     # Use the sorted, renamed 'data' DataFrame, not the original 'df'
     # The data is already filtered (future rows removed) and sorted by date
     data_list = data.to_dict('records')
+    logger.info(f"[DATA LIST] Converted to list of dicts: {len(data_list)} records")
+    if data_list:
+        logger.info(f"[DATA LIST] First record: {data_list[0]}")
+        logger.info(f"[DATA LIST] Last record: {data_list[-1]}")
 
-    logger.info(f"Simple Mode AutoML: Training with {len(data)} rows, horizon={config.horizon}, covariates={covariates}")
+    logger.info(f"[AUTOML] Simple Mode AutoML: Training with {len(data)} rows, horizon={config.horizon}, covariates={covariates}")
 
     # Log hyperparameter filters if provided
     if hyperparameter_filters:
@@ -858,8 +892,9 @@ async def _run_forecast(
             logger.info(f"   - {model_name}: {list(filters.keys())}")
 
     # Determine which models to train based on data characteristics
+    logger.info("[MODEL SELECTION] Determining models to train...")
     models_to_train = _select_models_for_data(profile, len(data))
-    logger.info(f"Selected models for training: {models_to_train}")
+    logger.info(f"[MODEL SELECTION] Selected models: {models_to_train}")
 
     # ============================================================
     # TRAIN / EVAL / HOLDOUT SPLIT
@@ -869,8 +904,10 @@ async def _run_forecast(
     # - Tune/validate on EVAL set (15%)
     # - Select best model on HOLDOUT set (15%) - never seen during training!
     # ============================================================
+    logger.info("[DATA SPLIT] Calculating train/eval/holdout split...")
 
     n = len(data)
+    logger.info(f"[DATA SPLIT] Total data points: {n}")
 
     # Calculate percentage-based splits (70/15/15)
     # But ensure minimum sizes for meaningful evaluation
@@ -906,9 +943,10 @@ async def _run_forecast(
         'holdout_date_range': None,
     }
 
-    logger.info(f"Data split: Train={train_size} ({split_info['train_pct']}%), "
-                f"Eval={eval_size} ({split_info['eval_pct']}%), "
-                f"Holdout={holdout_size} ({split_info['holdout_pct']}%)")
+    logger.info(f"[DATA SPLIT] FINAL SPLIT:")
+    logger.info(f"[DATA SPLIT]   Train: {train_size} rows ({split_info['train_pct']}%)")
+    logger.info(f"[DATA SPLIT]   Eval: {eval_size} rows ({split_info['eval_pct']}%)")
+    logger.info(f"[DATA SPLIT]   Holdout: {holdout_size} rows ({split_info['holdout_pct']}%)")
 
     best_result = None
     best_holdout_mape = float('inf')
@@ -1170,6 +1208,22 @@ async def _run_forecast(
                 f"Then we retrained {result_to_use['model_type']} on ALL {n} data points for the final forecast."
             )
 
+            logger.info("=" * 70)
+            logger.info("🔮 _run_forecast - FINAL OUTPUT")
+            logger.info("=" * 70)
+            logger.info(f"[OUTPUT] best_model: {result_to_use['model_type']}")
+            logger.info(f"[OUTPUT] forecast count: {len(forecasts)}")
+            logger.info(f"[OUTPUT] forecast values (first 5): {forecasts[:5]}")
+            logger.info(f"[OUTPUT] forecast values (last 5): {forecasts[-5:]}")
+            logger.info(f"[OUTPUT] dates (first 5): {[str(d) for d in dates[:5]]}")
+            logger.info(f"[OUTPUT] dates (last 5): {[str(d) for d in dates[-5:]]}")
+            logger.info(f"[OUTPUT] metrics: {result_to_use['metrics']}")
+            logger.info(f"[OUTPUT] holdout_mape: {result_to_use.get('holdout_mape')}")
+            logger.info(f"[OUTPUT] eval_mape: {result_to_use.get('eval_mape')}")
+            logger.info(f"[OUTPUT] all_models_trained: {[r['model_type'] for r in all_results]}")
+            logger.info(f"[OUTPUT] mlflow_run_id: {result_to_use.get('mlflow_run_id')}")
+            logger.info("=" * 70)
+
             return {
                 'run_id': run_id,
                 'best_model': result_to_use['model_type'],
@@ -1202,12 +1256,14 @@ async def _run_forecast(
             }
 
     except ImportError as e:
-        logger.warning(f"Could not import full training infrastructure: {e}. Using fallback.")
+        logger.warning(f"[FALLBACK] Could not import full training infrastructure: {e}. Using fallback.")
     except Exception as e:
-        logger.error(f"AutoML training failed: {e}. Using fallback.")
+        logger.error(f"[FALLBACK] AutoML training failed: {e}. Using fallback.")
+        import traceback
+        logger.error(f"[FALLBACK] Full traceback:\n{traceback.format_exc()}")
 
     # Fallback: simple moving average forecast (when full training unavailable)
-    logger.info("Using fallback moving average forecast")
+    logger.info("[FALLBACK] Using fallback moving average forecast")
     y = data['y'].values
     last_values = y[-min(12, len(y)):]
     mean_val = np.mean(last_values)

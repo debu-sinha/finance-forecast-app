@@ -120,68 +120,104 @@ class DataProfiler:
         Returns:
             DataProfile with all detected settings and recommendations
         """
-        logger.info(f"Profiling data: {len(df)} rows, {len(df.columns)} columns")
+        logger.info("=" * 70)
+        logger.info("📊 DATA PROFILER - START")
+        logger.info("=" * 70)
+        logger.info(f"[INPUT] DataFrame shape: {df.shape}")
+        logger.info(f"[INPUT] Columns: {list(df.columns)}")
+        logger.info(f"[INPUT] Dtypes:\n{df.dtypes.to_string()}")
+        logger.info(f"[INPUT] First 3 rows:\n{df.head(3).to_string()}")
+        logger.info(f"[INPUT] Last 3 rows:\n{df.tail(3).to_string()}")
+        logger.info("-" * 70)
 
         # Step 1: Detect date column
+        logger.info("[STEP 1] Detecting date column...")
         date_column = self._detect_date_column(df)
-        logger.info(f"Detected date column: {date_column}")
+        logger.info(f"[STEP 1 OUTPUT] date_column = '{date_column}'")
+        logger.info(f"[STEP 1 OUTPUT] Sample values: {df[date_column].head(5).tolist()}")
 
         # Ensure date column is datetime
         df = df.copy()
         df[date_column] = pd.to_datetime(df[date_column])
         df = df.sort_values(date_column).reset_index(drop=True)
+        logger.info(f"[STEP 1 OUTPUT] After datetime conversion - min: {df[date_column].min()}, max: {df[date_column].max()}")
 
         # Step 2: Detect frequency
+        logger.info("[STEP 2] Detecting frequency...")
         frequency = self._detect_frequency(df, date_column)
-        logger.info(f"Detected frequency: {frequency}")
+        logger.info(f"[STEP 2 OUTPUT] frequency = '{frequency}'")
 
         # Step 3: Detect target column
+        logger.info("[STEP 3] Detecting target column...")
         target_column = self._detect_target_column(df, date_column)
-        logger.info(f"Detected target column: {target_column}")
+        logger.info(f"[STEP 3 OUTPUT] target_column = '{target_column}'")
+        logger.info(f"[STEP 3 OUTPUT] Target stats - min: {df[target_column].min()}, max: {df[target_column].max()}, mean: {df[target_column].mean():.2f}")
 
         # Step 4: Analyze date range and detect multi-slice data
+        logger.info("[STEP 4] Analyzing date range and multi-slice detection...")
         date_range = self._get_date_range(df, date_column)
         history_months = self._calculate_history_months(date_range)
+        logger.info(f"[STEP 4 OUTPUT] date_range = {date_range}")
+        logger.info(f"[STEP 4 OUTPUT] history_months = {history_months:.2f}")
 
         # Detect if data has multiple slices (duplicate dates)
         unique_dates = df[date_column].nunique()
         total_rows = len(df)
         has_multiple_slices = unique_dates < total_rows
         slice_count = total_rows // unique_dates if unique_dates > 0 else 1
-
-        logger.info(f"Unique periods: {unique_dates}, Total rows: {total_rows}, Multiple slices: {has_multiple_slices}")
+        logger.info(f"[STEP 4 OUTPUT] unique_dates = {unique_dates}, total_rows = {total_rows}")
+        logger.info(f"[STEP 4 OUTPUT] has_multiple_slices = {has_multiple_slices}, slice_count = {slice_count}")
 
         # Step 5: Find data quality issues
+        logger.info("[STEP 5] Finding data quality issues...")
         missing_values = df[target_column].isna().sum()
         missing_periods = self._find_missing_periods(df, date_column, frequency)
         outliers = self._detect_outliers(df, target_column)
+        logger.info(f"[STEP 5 OUTPUT] missing_values = {missing_values}")
+        logger.info(f"[STEP 5 OUTPUT] missing_periods count = {len(missing_periods)}")
+        if missing_periods:
+            logger.info(f"[STEP 5 OUTPUT] missing_periods (first 10): {missing_periods[:10]}")
+        logger.info(f"[STEP 5 OUTPUT] outliers count = {len(outliers)}")
 
         # Step 6: Analyze holiday coverage
+        logger.info("[STEP 6] Analyzing holiday coverage...")
         holidays_in_data, holiday_coverage = self._analyze_holiday_coverage(
             df, date_column, frequency
         )
+        logger.info(f"[STEP 6 OUTPUT] holidays_in_data = {holidays_in_data}")
+        logger.info(f"[STEP 6 OUTPUT] holiday_coverage = {holiday_coverage}")
 
         # Step 7: Detect patterns
+        logger.info("[STEP 7] Detecting patterns (trend, seasonality)...")
         has_trend, has_seasonality, seasonality_period = self._detect_patterns(
             df, target_column, frequency
         )
+        logger.info(f"[STEP 7 OUTPUT] has_trend = {has_trend}, has_seasonality = {has_seasonality}, seasonality_period = {seasonality_period}")
 
         # Step 8: Find covariate columns
+        logger.info("[STEP 8] Finding covariate columns...")
         covariate_columns = self._find_covariate_columns(
             df, date_column, target_column
         )
+        logger.info(f"[STEP 8 OUTPUT] covariate_columns = {covariate_columns}")
 
         # Step 9: Calculate quality score (use unique_dates for accurate calculation)
+        logger.info("[STEP 9] Calculating quality score...")
         quality_score = self._calculate_quality_score(
             df, target_column, missing_values, len(missing_periods), len(outliers),
             unique_periods=unique_dates
         )
+        logger.info(f"[STEP 9 OUTPUT] quality_score = {quality_score}")
 
         # Step 10: Generate warnings
+        logger.info("[STEP 10] Generating warnings...")
         warnings = self._generate_warnings(
             history_months, holiday_coverage, missing_values,
             missing_periods, quality_score, frequency
         )
+        logger.info(f"[STEP 10 OUTPUT] warnings count = {len(warnings)}")
+        for w in warnings:
+            logger.info(f"[STEP 10 OUTPUT] Warning: [{w.level}] {w.message}")
 
         # Add warning for multi-slice data
         if has_multiple_slices:
@@ -190,20 +226,30 @@ class DataProfiler:
                 message=f"Data contains multiple segments (~{slice_count} slices with {unique_dates} unique dates each). Total rows: {total_rows}.",
                 recommendation="Select a specific segment/slice to forecast, or use batch forecasting for all segments."
             ))
+            logger.info(f"[STEP 10 OUTPUT] Added multi-slice warning")
 
         # Step 11: Generate recommendations
+        logger.info("[STEP 11] Generating recommendations...")
         recommended_horizon = self._recommend_horizon(frequency)
         recommended_models = self._recommend_models(
             history_months, has_seasonality, len(covariate_columns) > 0
         )
+        logger.info(f"[STEP 11 OUTPUT] recommended_horizon = {recommended_horizon}")
+        logger.info(f"[STEP 11 OUTPUT] recommended_models = {recommended_models}")
 
         # Step 12: Compute data hash for reproducibility
+        logger.info("[STEP 12] Computing data hash...")
         data_hash = self._compute_data_hash(df)
+        logger.info(f"[STEP 12 OUTPUT] data_hash = {data_hash}")
 
         # Step 13: Detect and validate future covariate rows
+        logger.info("[STEP 13] Detecting future covariate rows...")
         future_rows_count, future_rows_date_range, has_future_covariates, future_valid, future_issues = self._detect_future_rows(
             df, date_column, target_column, covariate_columns
         )
+        logger.info(f"[STEP 13 OUTPUT] future_rows_count = {future_rows_count}")
+        logger.info(f"[STEP 13 OUTPUT] has_future_covariates = {has_future_covariates}")
+        logger.info(f"[STEP 13 OUTPUT] future_valid = {future_valid}")
 
         # Add warning if future covariates detected
         if has_future_covariates:
@@ -228,6 +274,28 @@ class DataProfiler:
                         message=issue.replace("Warning: ", ""),
                         recommendation="Review your future covariate data."
                     ))
+
+        # Final output summary
+        logger.info("=" * 70)
+        logger.info("📊 DATA PROFILER - FINAL OUTPUT SUMMARY")
+        logger.info("=" * 70)
+        logger.info(f"[OUTPUT] frequency: {frequency}")
+        logger.info(f"[OUTPUT] date_column: {date_column}")
+        logger.info(f"[OUTPUT] target_column: {target_column}")
+        logger.info(f"[OUTPUT] date_range: {date_range}")
+        logger.info(f"[OUTPUT] total_periods (unique): {unique_dates}")
+        logger.info(f"[OUTPUT] row_count (total): {total_rows}")
+        logger.info(f"[OUTPUT] history_months: {history_months:.2f}")
+        logger.info(f"[OUTPUT] data_quality_score: {quality_score}")
+        logger.info(f"[OUTPUT] holiday_coverage_score: {holiday_coverage}")
+        logger.info(f"[OUTPUT] has_trend: {has_trend}, has_seasonality: {has_seasonality}")
+        logger.info(f"[OUTPUT] covariate_columns: {covariate_columns}")
+        logger.info(f"[OUTPUT] recommended_horizon: {recommended_horizon}")
+        logger.info(f"[OUTPUT] recommended_models: {recommended_models}")
+        logger.info(f"[OUTPUT] has_multiple_slices: {has_multiple_slices}, slice_count: {slice_count}")
+        logger.info(f"[OUTPUT] warnings count: {len(warnings)}")
+        logger.info(f"[OUTPUT] data_hash: {data_hash}")
+        logger.info("=" * 70)
 
         return DataProfile(
             # Auto-detected config

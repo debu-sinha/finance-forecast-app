@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import {
   Upload,
   Loader2,
@@ -31,6 +31,12 @@ import {
   Package,
   Zap,
   LineChart,
+  Search,
+  DollarSign,
+  Megaphone,
+  Globe,
+  Hash,
+  ChevronRight,
 } from 'lucide-react';
 import {
   ComposedChart,
@@ -221,6 +227,38 @@ interface CombinedSliceInfo {
   sampleCombinations: string[];
 }
 
+// NEW: Column grouping for wide datasets
+interface ColumnGroup {
+  type: 'date' | 'target' | 'slice' | 'holiday' | 'numeric' | 'other';
+  label: string;
+  icon: string;
+  columns: string[];
+  color: string;
+  bgColor: string;
+  description: string;
+}
+
+// NEW: Slice combination with selection state
+interface SliceCombination {
+  id: string;
+  values: Record<string, string>;
+  displayName: string;
+  rowCount: number;
+  targetSum: number;
+  targetAvg: number;
+  isSelected: boolean;
+}
+
+// NEW: Covariate category for organized selection
+interface CovariateCategory {
+  type: 'holiday' | 'pricing' | 'promotion' | 'external' | 'numeric' | 'other';
+  label: string;
+  icon: string;
+  columns: string[];
+  color: string;
+  description: string;
+}
+
 // AI Guidance for choices
 interface ChoiceGuidance {
   title: string;
@@ -255,6 +293,19 @@ interface SimpleModeState {
   forecastMode: 'aggregate' | 'by_slice';
   // Slice view selection (for results page)
   selectedSliceView: string; // "all" or slice_id
+  // NEW: Enhanced UI state for wide datasets
+  selectedSliceCombinations: string[];  // IDs of selected slice combinations
+  sliceSearchQuery: string;  // Search filter for slices
+  covariateSearchQuery: string;  // Search filter for covariates
+  expandedColumnGroups: string[];  // Which column groups are expanded
+  expandedCovariateGroups: string[];  // Which covariate categories are expanded
+  sliceSelectionExplicit: boolean;  // True when user has explicitly modified slice selection
+  // User overrides for column classification
+  columnOverrides: Record<string, 'date' | 'slice' | 'holiday' | 'numeric' | 'other'>;
+  reclassifyingColumn: string | null;  // Column currently being reclassified
+  draggingColumn: string | null;  // Column currently being dragged
+  dragOverGroup: string | null;  // Group being hovered over during drag
+  holidaysAutoSelected: boolean;  // Track if holidays have been auto-selected as covariates
 }
 
 // Data format examples
@@ -399,6 +450,18 @@ export const SimpleModePanel: React.FC = () => {
     combinedSliceInfo: null,
     forecastMode: 'aggregate',
     selectedSliceView: 'all',
+    // NEW: Enhanced UI state
+    selectedSliceCombinations: [],
+    sliceSearchQuery: '',
+    covariateSearchQuery: '',
+    expandedColumnGroups: ['slice', 'holiday'],  // Default expanded
+    expandedCovariateGroups: ['holiday', 'pricing'],  // Default expanded
+    sliceSelectionExplicit: false,  // Becomes true when user explicitly selects/clears
+    columnOverrides: {},  // User overrides for column classification
+    reclassifyingColumn: null,  // Column currently being reclassified
+    draggingColumn: null,  // Column currently being dragged
+    dragOverGroup: null,  // Group being hovered over during drag
+    holidaysAutoSelected: false,  // Track if holidays have been auto-selected
   });
 
   const [showComponents, setShowComponents] = useState(false);
@@ -428,27 +491,72 @@ export const SimpleModePanel: React.FC = () => {
 
   // Detect column types
   const detectColumnTypes = (headers: string[], rows: any[]) => {
-    const datePatterns = ['date', 'ds', 'time', 'week', 'month', 'day', 'period'];
-    const targetPatterns = ['revenue', 'sales', 'volume', 'amount', 'value', 'total', 'count', 'y'];
-    const promoPatterns = ['promo', 'promotion', 'campaign', 'event', 'holiday', 'discount', 'marketing'];
+    // Holiday patterns - check these FIRST to avoid false positives with "day" pattern
+    const holidayPatterns = [
+      /valentine/i, /patrick/i, /mother/i, /father/i, /easter/i, /christmas/i,
+      /thanksgiving/i, /halloween/i, /july.?4/i, /independence/i, /memorial/i,
+      /labor/i, /veterans/i, /mlk/i, /president/i, /black.?friday/i, /cyber/i,
+      /super.?bowl/i, /cinco/i, /new.?year/i, /holiday/i, /eve$/i
+    ];
+
+    // Date patterns - more specific to avoid matching holiday names
+    const datePatterns = [
+      /^date$/i, /^ds$/i, /^time$/i, /^week$/i, /^month$/i, /^period$/i,
+      /^year$/i, /_date$/i, /_time$/i, /_week$/i, /_month$/i, /^datetime/i,
+      /timestamp/i, /^dt$/i
+    ];
 
     const dateColumns: string[] = [];
     const numericColumns: string[] = [];
     const categoricalColumns: string[] = [];
+    const holidayColumns: string[] = [];
 
     headers.forEach(col => {
       const colLower = col.toLowerCase();
 
-      // Check if it's a date column
-      if (datePatterns.some(p => colLower.includes(p))) {
+      // Sample values to determine type by content
+      const sampleValues = rows.slice(0, 20).map(r => r[col]).filter(v => v !== null && v !== undefined && v !== '');
+
+      // Check if it's a binary column (likely a holiday indicator)
+      const isBinary = sampleValues.length > 0 && sampleValues.every(v => {
+        const val = String(v).trim();
+        return val === '0' || val === '1' || val === 'true' || val === 'false';
+      });
+
+      // Check if column name matches holiday patterns
+      const isHolidayName = holidayPatterns.some(p => p.test(col));
+
+      // If it's binary OR matches holiday name patterns, it's likely a holiday column
+      if (isHolidayName || (isBinary && !datePatterns.some(p => p.test(col)))) {
+        holidayColumns.push(col);
+        // Also count as numeric if binary
+        if (isBinary) {
+          numericColumns.push(col);
+        }
+        return;
+      }
+
+      // Check if it's a date column by name pattern
+      if (datePatterns.some(p => p.test(col))) {
         dateColumns.push(col);
         return;
       }
 
-      // Sample values to determine type
-      const sampleValues = rows.slice(0, 10).map(r => r[col]).filter(Boolean);
-      const numericCount = sampleValues.filter(v => !isNaN(parseFloat(v))).length;
+      // Check if values look like dates
+      if (sampleValues.length > 0) {
+        const looksLikeDate = sampleValues.slice(0, 5).every(v => {
+          const str = String(v);
+          // Check for date-like patterns: YYYY-MM-DD, MM/DD/YYYY, etc.
+          return !isNaN(Date.parse(str)) && str.length >= 8 && /[-\/]/.test(str);
+        });
+        if (looksLikeDate) {
+          dateColumns.push(col);
+          return;
+        }
+      }
 
+      // Check if numeric
+      const numericCount = sampleValues.filter(v => !isNaN(parseFloat(String(v)))).length;
       if (numericCount >= sampleValues.length * 0.8) {
         numericColumns.push(col);
       } else {
@@ -456,16 +564,16 @@ export const SimpleModePanel: React.FC = () => {
       }
     });
 
-    // If no date column found by name, try to parse first column as date
+    // If no date column found, try first column
     if (dateColumns.length === 0 && rows.length > 0) {
       const firstCol = headers[0];
       const sampleDate = rows[0][firstCol];
-      if (sampleDate && !isNaN(Date.parse(sampleDate))) {
+      if (sampleDate && !isNaN(Date.parse(String(sampleDate)))) {
         dateColumns.push(firstCol);
       }
     }
 
-    return { dateColumns, numericColumns, categoricalColumns };
+    return { dateColumns, numericColumns, categoricalColumns, holidayColumns };
   };
 
   // Detect slice/segment columns (categorical with reasonable cardinality)
@@ -577,6 +685,448 @@ export const SimpleModePanel: React.FC = () => {
 
     return stats;
   }, [state.rawData, state.selectedSliceCols, state.selectedTargetCol]);
+
+  // NEW: Group columns by type for organized display (with user overrides)
+  const getColumnGroups = useMemo((): ColumnGroup[] => {
+    if (!state.columns.length || !state.rawData) return [];
+
+    const { dateColumns, numericColumns, categoricalColumns, holidayColumns } = detectColumnTypes(state.columns, state.rawData);
+    const sliceColumns = state.detectedSlices.map(s => s.column);
+
+    // Build initial classification for each column
+    const columnClassification: Record<string, 'date' | 'slice' | 'holiday' | 'numeric' | 'other'> = {};
+
+    state.columns.forEach(col => {
+      // Check user override first
+      if (state.columnOverrides[col]) {
+        columnClassification[col] = state.columnOverrides[col];
+        return;
+      }
+
+      // Auto-classification logic
+      if (holidayColumns.includes(col)) {
+        columnClassification[col] = 'holiday';
+      } else if (dateColumns.includes(col)) {
+        columnClassification[col] = 'date';
+      } else if (sliceColumns.includes(col)) {
+        columnClassification[col] = 'slice';
+      } else if (numericColumns.includes(col)) {
+        columnClassification[col] = 'numeric';
+      } else {
+        columnClassification[col] = 'other';
+      }
+    });
+
+    // Group columns by their classification
+    const groupedColumns: Record<string, string[]> = {
+      date: [],
+      slice: [],
+      holiday: [],
+      numeric: [],
+      other: [],
+    };
+
+    state.columns.forEach(col => {
+      const type = columnClassification[col];
+      groupedColumns[type].push(col);
+    });
+
+    // Build groups array
+    const groups: ColumnGroup[] = [];
+
+    if (groupedColumns.date.length > 0) {
+      groups.push({
+        type: 'date',
+        label: 'Date Columns',
+        icon: 'Calendar',
+        columns: groupedColumns.date,
+        color: 'text-blue-600',
+        bgColor: 'bg-blue-50',
+        description: 'Time/date columns for your time series'
+      });
+    }
+
+    if (groupedColumns.slice.length > 0) {
+      groups.push({
+        type: 'slice',
+        label: 'Segment Columns',
+        icon: 'Layers',
+        columns: groupedColumns.slice,
+        color: 'text-purple-600',
+        bgColor: 'bg-purple-50',
+        description: 'Categorical columns that segment your data (region, product, etc.)'
+      });
+    }
+
+    if (groupedColumns.holiday.length > 0) {
+      groups.push({
+        type: 'holiday',
+        label: 'Holidays & Events',
+        icon: 'Calendar',
+        columns: groupedColumns.holiday,
+        color: 'text-orange-600',
+        bgColor: 'bg-orange-50',
+        description: 'Binary indicators for holidays and special events'
+      });
+    }
+
+    if (groupedColumns.numeric.length > 0) {
+      groups.push({
+        type: 'numeric',
+        label: 'Numeric Columns',
+        icon: 'TrendingUp',
+        columns: groupedColumns.numeric,
+        color: 'text-green-600',
+        bgColor: 'bg-green-50',
+        description: 'Numeric values including your target and potential covariates'
+      });
+    }
+
+    if (groupedColumns.other.length > 0) {
+      groups.push({
+        type: 'other',
+        label: 'Other Columns',
+        icon: 'FileText',
+        columns: groupedColumns.other,
+        color: 'text-gray-600',
+        bgColor: 'bg-gray-50',
+        description: 'Text and other non-categorized columns'
+      });
+    }
+
+    return groups;
+  }, [state.columns, state.rawData, state.detectedSlices, state.columnOverrides]);
+
+  // Auto-select holiday columns as covariates when data is loaded
+  useEffect(() => {
+    // Only run once when column groups are computed and holidays haven't been auto-selected yet
+    if (getColumnGroups.length > 0 && !state.holidaysAutoSelected && state.step === 'configure') {
+      const holidayGroup = getColumnGroups.find(g => g.type === 'holiday');
+      if (holidayGroup && holidayGroup.columns.length > 0) {
+        // Auto-select all holiday columns as covariates
+        const holidayCols = holidayGroup.columns.filter(col =>
+          col !== state.selectedDateCol &&
+          col !== state.selectedTargetCol
+        );
+
+        if (holidayCols.length > 0) {
+          setState(s => ({
+            ...s,
+            selectedCovariates: [...new Set([...s.selectedCovariates, ...holidayCols])],
+            holidaysAutoSelected: true,
+          }));
+          console.log(`🎄 Auto-selected ${holidayCols.length} holiday columns as covariates:`, holidayCols);
+        } else {
+          setState(s => ({ ...s, holidaysAutoSelected: true }));
+        }
+      } else {
+        // No holidays found, mark as done
+        setState(s => ({ ...s, holidaysAutoSelected: true }));
+      }
+    }
+  }, [getColumnGroups, state.holidaysAutoSelected, state.step, state.selectedDateCol, state.selectedTargetCol]);
+
+  // NEW: Get all slice combinations with stats for selection UI
+  const getSliceCombinations = useMemo((): SliceCombination[] => {
+    if (!state.rawData || state.selectedSliceCols.length === 0) return [];
+
+    const sliceCols = state.selectedSliceCols;
+    const targetCol = state.selectedTargetCol;
+    const combinations: Map<string, SliceCombination> = new Map();
+
+    state.rawData.forEach(row => {
+      const values: Record<string, string> = {};
+      sliceCols.forEach(col => {
+        values[col] = String(row[col] || 'Unknown');
+      });
+      const id = sliceCols.map(col => values[col]).join(' | ');
+      const displayName = id;
+      const targetValue = targetCol ? parseFloat(row[targetCol]) || 0 : 0;
+
+      if (!combinations.has(id)) {
+        combinations.set(id, {
+          id,
+          values,
+          displayName,
+          rowCount: 0,
+          targetSum: 0,
+          targetAvg: 0,
+          isSelected: state.selectedSliceCombinations.includes(id) || state.selectedSliceCombinations.length === 0,
+        });
+      }
+
+      const combo = combinations.get(id)!;
+      combo.rowCount++;
+      combo.targetSum += targetValue;
+    });
+
+    // Calculate averages and convert to array
+    return Array.from(combinations.values())
+      .map(c => ({ ...c, targetAvg: c.targetSum / c.rowCount }))
+      .sort((a, b) => b.targetSum - a.targetSum);
+  }, [state.rawData, state.selectedSliceCols, state.selectedTargetCol, state.selectedSliceCombinations]);
+
+  // NEW: Categorize covariates for organized selection
+  const getCovariateCategories = useMemo((): CovariateCategory[] => {
+    if (!state.columns.length || !state.rawData) return [];
+
+    const categories: CovariateCategory[] = [];
+    const { dateColumns, numericColumns } = detectColumnTypes(state.columns, state.rawData);
+    const sliceColumns = state.detectedSlices.map(s => s.column);
+
+    // Get available covariates (exclude date, target, slice columns)
+    const availableCovariates = numericColumns.filter(c =>
+      c !== state.selectedDateCol &&
+      c !== state.selectedTargetCol &&
+      !sliceColumns.includes(c)
+    );
+
+    // Categorization patterns
+    const patterns = {
+      holiday: [
+        /holiday/i, /easter/i, /christmas/i, /thanksgiving/i, /halloween/i,
+        /new.?year/i, /memorial/i, /labor/i, /independence/i, /veterans/i,
+        /black.?friday/i, /cyber/i, /super.?bowl/i, /cinco/i, /valentine/i,
+        /mother/i, /father/i, /mlk/i, /president/i
+      ],
+      pricing: [/price/i, /cost/i, /fee/i, /rate/i, /discount/i, /margin/i],
+      promotion: [/promo/i, /campaign/i, /marketing/i, /ad/i, /event/i],
+      external: [/weather/i, /temp/i, /econ/i, /gdp/i, /index/i, /rate/i, /competitor/i],
+    };
+
+    const categorized: Record<string, string[]> = {
+      holiday: [],
+      pricing: [],
+      promotion: [],
+      external: [],
+      numeric: [],
+    };
+
+    availableCovariates.forEach(col => {
+      let found = false;
+      for (const [category, patternList] of Object.entries(patterns)) {
+        if (patternList.some(p => p.test(col))) {
+          categorized[category].push(col);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        // Check if it's a binary column (likely a holiday/flag)
+        const isBinary = state.rawData!.slice(0, 50).every(row => {
+          const val = row[col];
+          return val === '0' || val === '1' || val === 0 || val === 1 || val === '' || val === null || val === undefined;
+        });
+        if (isBinary) {
+          categorized.holiday.push(col);
+        } else {
+          categorized.numeric.push(col);
+        }
+      }
+    });
+
+    // Build category objects
+    if (categorized.holiday.length > 0) {
+      categories.push({
+        type: 'holiday',
+        label: `Holidays & Events (${categorized.holiday.length})`,
+        icon: 'Calendar',
+        columns: categorized.holiday,
+        color: 'text-orange-600',
+        description: 'Binary indicators for holidays and special events'
+      });
+    }
+
+    if (categorized.pricing.length > 0) {
+      categories.push({
+        type: 'pricing',
+        label: `Pricing Features (${categorized.pricing.length})`,
+        icon: 'DollarSign',
+        columns: categorized.pricing,
+        color: 'text-green-600',
+        description: 'Price-related variables that may affect demand'
+      });
+    }
+
+    if (categorized.promotion.length > 0) {
+      categories.push({
+        type: 'promotion',
+        label: `Promotions & Marketing (${categorized.promotion.length})`,
+        icon: 'Megaphone',
+        columns: categorized.promotion,
+        color: 'text-pink-600',
+        description: 'Marketing campaigns and promotional activities'
+      });
+    }
+
+    if (categorized.external.length > 0) {
+      categories.push({
+        type: 'external',
+        label: `External Factors (${categorized.external.length})`,
+        icon: 'Globe',
+        columns: categorized.external,
+        color: 'text-blue-600',
+        description: 'Weather, economic indicators, and other external data'
+      });
+    }
+
+    if (categorized.numeric.length > 0) {
+      categories.push({
+        type: 'numeric',
+        label: `Other Numeric (${categorized.numeric.length})`,
+        icon: 'Hash',
+        columns: categorized.numeric,
+        color: 'text-gray-600',
+        description: 'Other numeric columns that may be useful predictors'
+      });
+    }
+
+    return categories;
+  }, [state.columns, state.rawData, state.detectedSlices, state.selectedDateCol, state.selectedTargetCol]);
+
+  // NEW: Filter slice combinations by search query
+  const filteredSliceCombinations = useMemo(() => {
+    if (!state.sliceSearchQuery.trim()) return getSliceCombinations;
+    const query = state.sliceSearchQuery.toLowerCase();
+    return getSliceCombinations.filter(c =>
+      c.displayName.toLowerCase().includes(query)
+    );
+  }, [getSliceCombinations, state.sliceSearchQuery]);
+
+  // NEW: Toggle slice combination selection
+  const toggleSliceCombination = (id: string) => {
+    setState(s => {
+      const isCurrentlySelected = s.selectedSliceCombinations.includes(id);
+      const newSelection = isCurrentlySelected
+        ? s.selectedSliceCombinations.filter(x => x !== id)
+        : [...s.selectedSliceCombinations, id];
+      return { ...s, selectedSliceCombinations: newSelection };
+    });
+  };
+
+  // NEW: Select/deselect all slice combinations
+  const selectAllSliceCombinations = (selectAll: boolean) => {
+    setState(s => ({
+      ...s,
+      selectedSliceValues: selectAll ? getSliceCombinations.map(c => c.id) : [],
+      selectedSliceCombinations: selectAll ? getSliceCombinations.map(c => c.id) : [],
+      sliceSelectionExplicit: true,  // User has explicitly modified selection
+      // Clear forecast when selection changes
+      forecast: null,
+    }));
+  };
+
+  // NEW: Toggle covariate category (select all in category)
+  const toggleCovariateCategory = (category: CovariateCategory) => {
+    setState(s => {
+      const categoryColumns = category.columns;
+      const allSelected = categoryColumns.every(c => s.selectedCovariates.includes(c));
+
+      if (allSelected) {
+        // Deselect all in category
+        return {
+          ...s,
+          selectedCovariates: s.selectedCovariates.filter(c => !categoryColumns.includes(c))
+        };
+      } else {
+        // Select all in category
+        const newSelection = new Set([...s.selectedCovariates, ...categoryColumns]);
+        return { ...s, selectedCovariates: Array.from(newSelection) };
+      }
+    });
+  };
+
+  // NEW: Generate dynamic examples based on actual uploaded data
+  const getDynamicExamples = useMemo(() => {
+    if (!state.rawData || !state.selectedDateCol || !state.selectedTargetCol) {
+      return null;
+    }
+
+    const dateCol = state.selectedDateCol;
+    const targetCol = state.selectedTargetCol;
+    const sliceCols = state.selectedSliceCols;
+
+    // Get sample data from actual uploaded file
+    const sampleRows = state.rawData.slice(0, 4);
+
+    // Get unique dates for examples
+    const uniqueDates = [...new Set(state.rawData.map(r => r[dateCol]))].slice(0, 2);
+
+    // Format target value for display
+    const formatValue = (val: any) => {
+      const num = parseFloat(String(val).replace(/,/g, ''));
+      if (isNaN(num)) return val;
+      if (num >= 1000000) return `$${(num / 1000000).toFixed(1)}M`;
+      if (num >= 1000) return `$${(num / 1000).toFixed(0)}K`;
+      return `$${num.toFixed(0)}`;
+    };
+
+    // Build dynamic before/after examples
+    const beforeData: any[] = [];
+    const afterData: { [key: string]: { date: string; total: number } } = {};
+
+    if (sliceCols.length > 0) {
+      // Get unique slice values
+      const sliceValues = [...new Set(state.rawData.map(r =>
+        sliceCols.map(col => r[col]).join(' | ')
+      ))].slice(0, 2);
+
+      // Build before data with slices
+      uniqueDates.forEach((date, dateIdx) => {
+        sliceValues.forEach(slice => {
+          const matchingRow = state.rawData!.find(r =>
+            r[dateCol] === date &&
+            sliceCols.map(col => r[col]).join(' | ') === slice
+          );
+          if (matchingRow) {
+            beforeData.push({
+              slice,
+              date: `Period ${dateIdx + 1}`,
+              value: matchingRow[targetCol]
+            });
+          }
+        });
+      });
+
+      // Calculate aggregated totals
+      uniqueDates.forEach((date, dateIdx) => {
+        const total = state.rawData!
+          .filter(r => r[dateCol] === date)
+          .reduce((sum, r) => sum + (parseFloat(String(r[targetCol]).replace(/,/g, '')) || 0), 0);
+        afterData[`Period ${dateIdx + 1}`] = { date: `Period ${dateIdx + 1}`, total };
+      });
+    }
+
+    // Generate slice-specific examples for by_slice mode
+    const sliceExamples = sliceCols.length > 0
+      ? [...new Set(state.rawData.map(r =>
+          sliceCols.map(col => r[col]).join(' | ')
+        ))].slice(0, 3).map(slice => ({
+          slice,
+          description: `Own trend + seasonality`
+        }))
+      : [];
+
+    return {
+      dateColumn: dateCol,
+      targetColumn: targetCol,
+      sliceColumns: sliceCols,
+      sliceColumnLabel: sliceCols.join(' + ') || 'Segment',
+      beforeData,
+      afterData: Object.values(afterData),
+      sliceExamples,
+      formatValue,
+      // Generate meaningful use cases based on column names
+      aggregateUseCase: targetCol.toLowerCase().includes('revenue')
+        ? `Perfect for: Company-wide ${targetCol} budgeting, total financial planning, executive dashboards`
+        : targetCol.toLowerCase().includes('volume') || targetCol.toLowerCase().includes('order')
+        ? `Perfect for: Total ${targetCol} forecasting, capacity planning, operations dashboards`
+        : `Perfect for: Overall ${targetCol} trends, high-level planning, aggregate budgeting`,
+      sliceUseCase: sliceCols.length > 0
+        ? `Perfect for: ${sliceCols.map(c => c.replace(/_/g, ' ')).join(' and ')}-specific planning, granular budgeting, segment performance tracking`
+        : `Perfect for: Segment-specific planning, granular predictions, detailed analysis`,
+    };
+  }, [state.rawData, state.selectedDateCol, state.selectedTargetCol, state.selectedSliceCols]);
 
   // Validate data
   const validateData = (headers: string[], rows: any[]): ValidationResult => {
@@ -869,6 +1419,18 @@ export const SimpleModePanel: React.FC = () => {
       combinedSliceInfo: null,
       forecastMode: 'aggregate',
       selectedSliceView: 'all',
+      // Reset enhanced UI state
+      selectedSliceCombinations: [],
+      sliceSearchQuery: '',
+      covariateSearchQuery: '',
+      expandedColumnGroups: ['slice', 'holiday'],
+      expandedCovariateGroups: ['holiday', 'pricing'],
+      sliceSelectionExplicit: false,
+      columnOverrides: {},
+      reclassifyingColumn: null,
+      draggingColumn: null,
+      dragOverGroup: null,
+      holidaysAutoSelected: false,
     });
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -884,6 +1446,7 @@ export const SimpleModePanel: React.FC = () => {
       selectedSliceValues: s.selectedSliceValues.includes(value)
         ? s.selectedSliceValues.filter(v => v !== value)
         : [...s.selectedSliceValues, value],
+      sliceSelectionExplicit: true,  // User has explicitly modified selection
       // Clear old forecast results when slice selection changes
       forecast: null,
       step: 'configure',
@@ -941,6 +1504,105 @@ export const SimpleModePanel: React.FC = () => {
       case 'medium': return <AlertTriangle className="w-4 h-4 text-yellow-500" />;
       default: return <Info className="w-4 h-4 text-blue-500" />;
     }
+  };
+
+  // Helper to get category icon by type
+  const getCategoryIcon = (type: string, className: string = "w-4 h-4") => {
+    switch (type) {
+      case 'holiday': return <Calendar className={className} />;
+      case 'pricing': return <DollarSign className={className} />;
+      case 'promotion': return <Megaphone className={className} />;
+      case 'external': return <Globe className={className} />;
+      case 'numeric': return <Hash className={className} />;
+      case 'date': return <Calendar className={className} />;
+      case 'slice': return <Layers className={className} />;
+      case 'target': return <Target className={className} />;
+      default: return <FileText className={className} />;
+    }
+  };
+
+  // Reclassify a column to a different type
+  // Also updates covariates: holiday columns are auto-added as covariates
+  const reclassifyColumn = (column: string, newType: 'date' | 'slice' | 'holiday' | 'numeric' | 'other') => {
+    setState(s => {
+      // Determine current type of the column
+      const currentType = s.columnOverrides[column] || getCurrentColumnType(column);
+      const wasHoliday = currentType === 'holiday';
+      const willBeHoliday = newType === 'holiday';
+
+      let newCovariates = [...s.selectedCovariates];
+
+      // If moving TO holiday category, add to covariates (if not already there)
+      if (willBeHoliday && !wasHoliday) {
+        if (!newCovariates.includes(column)) {
+          newCovariates.push(column);
+        }
+      }
+      // If moving FROM holiday category, remove from covariates
+      else if (wasHoliday && !willBeHoliday) {
+        newCovariates = newCovariates.filter(c => c !== column);
+      }
+
+      return {
+        ...s,
+        columnOverrides: {
+          ...s.columnOverrides,
+          [column]: newType,
+        },
+        selectedCovariates: newCovariates,
+        reclassifyingColumn: null,
+      };
+    });
+  };
+
+  // Helper to get current column type (before any override)
+  const getCurrentColumnType = (column: string): 'date' | 'slice' | 'holiday' | 'numeric' | 'other' => {
+    if (!state.rawData) return 'other';
+    const { dateColumns, numericColumns, holidayColumns } = detectColumnTypes(state.columns, state.rawData);
+    const sliceColumns = state.detectedSlices.map(s => s.column);
+
+    if (holidayColumns.includes(column)) return 'holiday';
+    if (dateColumns.includes(column)) return 'date';
+    if (sliceColumns.includes(column)) return 'slice';
+    if (numericColumns.includes(column)) return 'numeric';
+    return 'other';
+  };
+
+  // Drag-and-drop handlers for column reclassification
+  const handleDragStart = (e: React.DragEvent, column: string) => {
+    e.dataTransfer.setData('text/plain', column);
+    e.dataTransfer.effectAllowed = 'move';
+    setState(s => ({ ...s, draggingColumn: column }));
+  };
+
+  const handleDragEnd = () => {
+    setState(s => ({ ...s, draggingColumn: null, dragOverGroup: null }));
+  };
+
+  const handleDragOver = (e: React.DragEvent, groupType: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (state.dragOverGroup !== groupType) {
+      setState(s => ({ ...s, dragOverGroup: groupType }));
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    // Only clear if leaving the group entirely
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const { clientX, clientY } = e;
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+      setState(s => ({ ...s, dragOverGroup: null }));
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent, groupType: 'date' | 'slice' | 'holiday' | 'numeric' | 'other') => {
+    e.preventDefault();
+    const column = e.dataTransfer.getData('text/plain');
+    if (column) {
+      reclassifyColumn(column, groupType);
+    }
+    setState(s => ({ ...s, draggingColumn: null, dragOverGroup: null }));
   };
 
   // Get available numeric columns for covariate selection (excluding date, target, and slice columns)
@@ -1207,6 +1869,142 @@ export const SimpleModePanel: React.FC = () => {
             )}
           </div>
 
+          {/* Column Overview for Wide Datasets - with Drag & Drop */}
+          {getColumnGroups.length > 0 && state.columns.length > 8 && (
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-semibold text-gray-800 flex items-center">
+                  <Layers className="w-5 h-5 mr-2 text-blue-600" />
+                  Column Overview
+                  <span className="ml-2 text-xs font-normal text-gray-500">({state.columns.length} columns detected)</span>
+                </h3>
+                <div className="flex items-center space-x-3">
+                  {Object.keys(state.columnOverrides).length > 0 && (
+                    <button
+                      onClick={() => setState(s => ({ ...s, columnOverrides: {} }))}
+                      className="text-xs text-gray-500 hover:text-gray-700 flex items-center"
+                    >
+                      <RefreshCw className="w-3 h-3 mr-1" />
+                      Reset Classifications
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setState(s => ({
+                      ...s,
+                      expandedColumnGroups: s.expandedColumnGroups.length === getColumnGroups.length
+                        ? []
+                        : getColumnGroups.map(g => g.type)
+                    }))}
+                    className="text-xs text-blue-600 hover:text-blue-800"
+                  >
+                    {state.expandedColumnGroups.length === getColumnGroups.length ? 'Collapse All' : 'Expand All'}
+                  </button>
+                </div>
+              </div>
+
+              <p className="text-sm text-gray-500 mb-4">
+                <span className="font-medium text-gray-700">Drag and drop</span> column chips between categories to reclassify them.
+                {Object.keys(state.columnOverrides).length > 0 && (
+                  <span className="ml-2 text-blue-600">({Object.keys(state.columnOverrides).length} manually reclassified)</span>
+                )}
+              </p>
+
+              <div className="grid md:grid-cols-2 gap-3">
+                {getColumnGroups.map(group => {
+                  const isExpanded = state.expandedColumnGroups.includes(group.type);
+                  const isDragOver = state.dragOverGroup === group.type;
+
+                  return (
+                    <div
+                      key={group.type}
+                      className={`rounded-lg border-2 overflow-hidden transition-all ${group.bgColor} ${
+                        isDragOver
+                          ? 'border-blue-400 ring-2 ring-blue-200 scale-[1.02]'
+                          : 'border-gray-200'
+                      }`}
+                      onDragOver={(e) => handleDragOver(e, group.type)}
+                      onDragLeave={handleDragLeave}
+                      onDrop={(e) => handleDrop(e, group.type as 'date' | 'slice' | 'holiday' | 'numeric' | 'other')}
+                    >
+                      <button
+                        onClick={() => setState(s => ({
+                          ...s,
+                          expandedColumnGroups: isExpanded
+                            ? s.expandedColumnGroups.filter(g => g !== group.type)
+                            : [...s.expandedColumnGroups, group.type]
+                        }))}
+                        className="w-full px-3 py-2 flex items-center justify-between hover:bg-white/50 transition-colors"
+                      >
+                        <div className="flex items-center space-x-2">
+                          {getCategoryIcon(group.type, `w-4 h-4 ${group.color}`)}
+                          <span className={`font-medium text-sm ${group.color}`}>{group.label}</span>
+                          <span className="text-xs text-gray-500 bg-white/50 px-1.5 py-0.5 rounded">
+                            {group.columns.length}
+                          </span>
+                        </div>
+                        {isExpanded ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronRight className="w-4 h-4 text-gray-400" />}
+                      </button>
+
+                      {isExpanded && (
+                        <div className={`px-3 pb-3 pt-1 bg-white/30 min-h-[60px] ${isDragOver ? 'bg-blue-50/50' : ''}`}>
+                          <p className="text-xs text-gray-500 mb-2">{group.description}</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {group.columns.map(col => {
+                              const isOverridden = state.columnOverrides[col] !== undefined;
+                              const isDragging = state.draggingColumn === col;
+
+                              return (
+                                <span
+                                  key={col}
+                                  draggable
+                                  onDragStart={(e) => handleDragStart(e, col)}
+                                  onDragEnd={handleDragEnd}
+                                  className={`px-2 py-1 text-xs rounded-full cursor-grab active:cursor-grabbing select-none transition-all ${
+                                    isDragging
+                                      ? 'opacity-50 scale-95 bg-gray-200'
+                                      : col === state.selectedDateCol
+                                      ? 'ring-2 ring-blue-400 text-blue-700 bg-white'
+                                      : col === state.selectedTargetCol
+                                      ? 'ring-2 ring-green-400 text-green-700 bg-white'
+                                      : state.selectedCovariates.includes(col)
+                                      ? 'ring-2 ring-purple-400 text-purple-700 bg-white'
+                                      : isOverridden
+                                      ? 'bg-yellow-100 text-yellow-800 border border-yellow-300'
+                                      : 'bg-white text-gray-600 hover:bg-gray-100'
+                                  }`}
+                                  title={isOverridden ? 'Manually reclassified - drag to move' : 'Drag to reclassify'}
+                                >
+                                  {col}
+                                  {col === state.selectedDateCol && <Calendar className="w-3 h-3 inline ml-1" />}
+                                  {col === state.selectedTargetCol && <Target className="w-3 h-3 inline ml-1" />}
+                                  {isOverridden && !state.selectedDateCol && !state.selectedTargetCol && (
+                                    <span className="ml-1 text-yellow-600">*</span>
+                                  )}
+                                </span>
+                              );
+                            })}
+                            {group.columns.length === 0 && (
+                              <span className="text-xs text-gray-400 italic py-2">Drop columns here</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Drag hint */}
+              {state.draggingColumn && (
+                <div className="mt-3 p-2 bg-blue-50 rounded-lg border border-blue-200 text-center">
+                  <p className="text-xs text-blue-700">
+                    Drop <strong>{state.draggingColumn}</strong> into a category to reclassify it
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Validation Warnings */}
           {state.validation && state.validation.warnings.length > 0 && (
             <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
@@ -1429,102 +2227,114 @@ export const SimpleModePanel: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Detailed Example Explanation */}
+                    {/* Detailed Example Explanation - DYNAMIC based on actual data */}
                     <div className="mt-4 p-4 bg-white rounded-lg border border-gray-200">
                       <h5 className="font-medium text-gray-800 mb-3 flex items-center">
                         <Info className="w-4 h-4 mr-2 text-blue-500" />
                         {state.forecastMode === 'aggregate'
-                          ? AI_GUIDANCE.aggregateMode.example.title
-                          : AI_GUIDANCE.sliceMode.example.title}
+                          ? `Example: Your ${state.selectedTargetCol || 'Data'} Aggregation`
+                          : `Example: Your ${getDynamicExamples?.sliceColumnLabel || 'Segmented'} Forecasts`}
                       </h5>
 
                       {state.forecastMode === 'aggregate' ? (
                         <div className="space-y-4">
-                          {/* Before: Raw Data */}
-                          <div>
-                            <p className="text-xs font-medium text-gray-500 uppercase mb-2">Your Raw Data:</p>
-                            <div className="overflow-x-auto">
-                              <table className="min-w-full text-xs border border-gray-200 rounded">
-                                <thead className="bg-gray-50">
-                                  <tr>
-                                    <th className="px-2 py-1 text-left text-gray-600 border-b">Region</th>
-                                    <th className="px-2 py-1 text-left text-gray-600 border-b">Week</th>
-                                    <th className="px-2 py-1 text-right text-gray-600 border-b">Sales</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {AI_GUIDANCE.aggregateMode.example.before.map((row, i) => (
-                                    <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                                      <td className="px-2 py-1 border-b">{row.region}</td>
-                                      <td className="px-2 py-1 border-b">{row.week}</td>
-                                      <td className="px-2 py-1 text-right border-b">${row.sales}</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          </div>
+                          {/* Before: Raw Data - DYNAMIC */}
+                          {getDynamicExamples && getDynamicExamples.beforeData.length > 0 ? (
+                            <>
+                              <div>
+                                <p className="text-xs font-medium text-gray-500 uppercase mb-2">Your Raw Data (Sample):</p>
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-full text-xs border border-gray-200 rounded">
+                                    <thead className="bg-gray-50">
+                                      <tr>
+                                        <th className="px-2 py-1 text-left text-gray-600 border-b">{getDynamicExamples.sliceColumnLabel}</th>
+                                        <th className="px-2 py-1 text-left text-gray-600 border-b">{getDynamicExamples.dateColumn}</th>
+                                        <th className="px-2 py-1 text-right text-gray-600 border-b">{getDynamicExamples.targetColumn}</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {getDynamicExamples.beforeData.slice(0, 4).map((row, i) => (
+                                        <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                          <td className="px-2 py-1 border-b">{row.slice}</td>
+                                          <td className="px-2 py-1 border-b">{row.date}</td>
+                                          <td className="px-2 py-1 text-right border-b">{getDynamicExamples.formatValue(row.value)}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
 
-                          {/* Arrow */}
-                          <div className="flex items-center justify-center">
-                            <div className="flex items-center space-x-2 px-4 py-2 bg-blue-50 rounded-lg">
-                              <span className="text-xs text-blue-600 font-medium">Aggregation</span>
-                              <ArrowRight className="w-4 h-4 text-blue-500" />
-                              <span className="text-xs text-blue-600">Sum by Week</span>
-                            </div>
-                          </div>
+                              {/* Arrow */}
+                              <div className="flex items-center justify-center">
+                                <div className="flex items-center space-x-2 px-4 py-2 bg-blue-50 rounded-lg">
+                                  <span className="text-xs text-blue-600 font-medium">Aggregation</span>
+                                  <ArrowRight className="w-4 h-4 text-blue-500" />
+                                  <span className="text-xs text-blue-600">Sum by {getDynamicExamples.dateColumn}</span>
+                                </div>
+                              </div>
 
-                          {/* After: Aggregated Data */}
-                          <div>
-                            <p className="text-xs font-medium text-gray-500 uppercase mb-2">What the Model Sees:</p>
-                            <div className="overflow-x-auto">
-                              <table className="min-w-full text-xs border border-blue-200 rounded bg-blue-50">
-                                <thead className="bg-blue-100">
-                                  <tr>
-                                    <th className="px-2 py-1 text-left text-blue-700 border-b border-blue-200">Week</th>
-                                    <th className="px-2 py-1 text-right text-blue-700 border-b border-blue-200">Total Sales</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {AI_GUIDANCE.aggregateMode.example.after.map((row, i) => (
-                                    <tr key={i}>
-                                      <td className="px-2 py-1 border-b border-blue-200 text-blue-800">{row.week}</td>
-                                      <td className="px-2 py-1 text-right border-b border-blue-200 font-medium text-blue-800">${row.sales}</td>
-                                    </tr>
-                                  ))}
-                                  <tr className="bg-blue-100">
-                                    <td className="px-2 py-1 text-blue-700">Week 3</td>
-                                    <td className="px-2 py-1 text-right font-medium text-blue-700">$??? (Forecast)</td>
-                                  </tr>
-                                </tbody>
-                              </table>
-                            </div>
-                          </div>
+                              {/* After: Aggregated Data */}
+                              <div>
+                                <p className="text-xs font-medium text-gray-500 uppercase mb-2">What the Model Sees:</p>
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-full text-xs border border-blue-200 rounded bg-blue-50">
+                                    <thead className="bg-blue-100">
+                                      <tr>
+                                        <th className="px-2 py-1 text-left text-blue-700 border-b border-blue-200">{getDynamicExamples.dateColumn}</th>
+                                        <th className="px-2 py-1 text-right text-blue-700 border-b border-blue-200">Total {getDynamicExamples.targetColumn}</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {getDynamicExamples.afterData.map((row, i) => (
+                                        <tr key={i}>
+                                          <td className="px-2 py-1 border-b border-blue-200 text-blue-800">{row.date}</td>
+                                          <td className="px-2 py-1 text-right border-b border-blue-200 font-medium text-blue-800">{getDynamicExamples.formatValue(row.total)}</td>
+                                        </tr>
+                                      ))}
+                                      <tr className="bg-blue-100">
+                                        <td className="px-2 py-1 text-blue-700">Next Period</td>
+                                        <td className="px-2 py-1 text-right font-medium text-blue-700">$??? (Forecast)</td>
+                                      </tr>
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </>
+                          ) : (
+                            <p className="text-sm text-gray-500 italic">Select slice columns to see how aggregation works with your data.</p>
+                          )}
 
                           {/* Explanation */}
                           <div className="p-3 bg-gray-50 rounded-lg">
-                            <p className="text-sm text-gray-700">{AI_GUIDANCE.aggregateMode.example.explanation}</p>
-                            <p className="text-xs text-green-600 mt-2 font-medium">{AI_GUIDANCE.aggregateMode.example.useCase}</p>
+                            <p className="text-sm text-gray-700">
+                              Data is summed across all {getDynamicExamples?.sliceColumnLabel || 'segments'}. The model sees total {state.selectedTargetCol || 'values'} and predicts future totals. You get ONE forecast number per period.
+                            </p>
+                            <p className="text-xs text-green-600 mt-2 font-medium">
+                              {getDynamicExamples?.aggregateUseCase || AI_GUIDANCE.aggregateMode.example.useCase}
+                            </p>
                           </div>
                         </div>
                       ) : (
                         <div className="space-y-4">
-                          {/* Slice Mode Explanation */}
+                          {/* Slice Mode Explanation - DYNAMIC */}
                           <div className="p-3 bg-purple-50 rounded-lg">
-                            <p className="text-sm text-gray-700">{AI_GUIDANCE.sliceMode.example.explanation}</p>
+                            <p className="text-sm text-gray-700">
+                              Each {getDynamicExamples?.sliceColumnLabel || 'segment'} gets its own model trained on its own data. Each learns its unique patterns (seasonality, trends, holiday effects).
+                            </p>
                           </div>
 
-                          {/* Visual: Separate Models */}
+                          {/* Visual: Separate Models - DYNAMIC */}
                           <div className="grid grid-cols-2 gap-3">
-                            {AI_GUIDANCE.sliceMode.example.result.map((item, i) => (
+                            {(getDynamicExamples?.sliceExamples || []).slice(0, 4).map((item, i) => (
                               <div key={i} className="p-3 bg-white border-2 border-purple-200 rounded-lg">
                                 <div className="flex items-center space-x-2 mb-2">
                                   <div className="w-6 h-6 bg-purple-100 rounded-full flex items-center justify-center">
-                                    <MapPin className="w-3 h-3 text-purple-600" />
+                                    <Layers className="w-3 h-3 text-purple-600" />
                                   </div>
-                                  <span className="font-medium text-purple-800">{item.region}</span>
+                                  <span className="font-medium text-purple-800 text-xs truncate">{item.slice}</span>
                                 </div>
-                                <p className="text-xs text-gray-600">{item.forecast}</p>
+                                <p className="text-xs text-gray-600">{item.description}</p>
                                 <div className="mt-2 h-8 bg-gradient-to-r from-purple-100 to-purple-200 rounded flex items-center justify-center">
                                   <span className="text-xs text-purple-700">Separate Forecast</span>
                                 </div>
@@ -1533,42 +2343,151 @@ export const SimpleModePanel: React.FC = () => {
                           </div>
 
                           <div className="p-3 bg-gray-50 rounded-lg">
-                            <p className="text-xs text-green-600 font-medium">{AI_GUIDANCE.sliceMode.example.useCase}</p>
+                            <p className="text-xs text-green-600 font-medium">
+                              {getDynamicExamples?.sliceUseCase || AI_GUIDANCE.sliceMode.example.useCase}
+                            </p>
                           </div>
                         </div>
                       )}
                     </div>
                   </div>
 
-                  {/* Slice Values Selection (when by_slice mode) */}
+                  {/* Enhanced Slice Values Selection (when by_slice mode) */}
                   {state.forecastMode === 'by_slice' && state.selectedSliceCols.length > 0 && getCombinedSliceInfo && (
                     <div className="p-4 bg-purple-50 rounded-lg border border-purple-200">
-                      <h5 className="font-medium text-purple-800 mb-2">
-                        Select which {state.selectedSliceCols.length === 1
-                          ? state.selectedSliceCols[0]
-                          : getCombinedSliceInfo.combinedKey} {state.selectedSliceCols.length === 1 ? 'values' : 'combinations'} to forecast:
-                      </h5>
-                      <p className="text-xs text-purple-600 mb-3">
-                        Each selected {state.selectedSliceCols.length === 1 ? 'value' : 'combination'} will have its own forecast model trained
-                      </p>
-                      <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto">
-                        {getCombinedSliceInfo.uniqueCombinations.map(val => (
+                      <div className="flex items-center justify-between mb-3">
+                        <div>
+                          <h5 className="font-medium text-purple-800">
+                            Select {state.selectedSliceCols.length === 1
+                              ? state.selectedSliceCols[0]
+                              : 'Segment Combinations'} to Forecast
+                          </h5>
+                          <p className="text-xs text-purple-600">
+                            Each selection trains a separate forecast model
+                          </p>
+                        </div>
+                        <div className="flex items-center space-x-2">
                           <button
-                            key={val}
-                            onClick={() => handleSliceValueToggle(val)}
-                            className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
-                              state.selectedSliceValues.includes(val)
-                                ? 'bg-purple-100 border-purple-300 text-purple-700'
-                                : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                            }`}
+                            onClick={() => selectAllSliceCombinations(true)}
+                            className="px-2 py-1 text-xs bg-purple-100 text-purple-700 rounded hover:bg-purple-200 transition-colors"
                           >
-                            {state.selectedSliceValues.includes(val) && <Check className="w-3 h-3 inline mr-1" />}
-                            {val}
+                            Select All
                           </button>
-                        ))}
+                          <button
+                            onClick={() => selectAllSliceCombinations(false)}
+                            className="px-2 py-1 text-xs bg-white text-gray-600 border border-gray-200 rounded hover:bg-gray-100 transition-colors"
+                          >
+                            Clear All
+                          </button>
+                        </div>
                       </div>
-                      <div className="mt-2 text-xs text-purple-600">
-                        {state.selectedSliceValues.length} of {getCombinedSliceInfo.count} selected
+
+                      {/* Search Filter for many slices */}
+                      {getCombinedSliceInfo.count > 10 && (
+                        <div className="mb-3 relative">
+                          <Search className="w-4 h-4 absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" />
+                          <input
+                            type="text"
+                            placeholder="Search segments..."
+                            value={state.sliceSearchQuery}
+                            onChange={(e) => setState(s => ({ ...s, sliceSearchQuery: e.target.value }))}
+                            className="w-full pl-9 pr-4 py-2 text-sm border border-purple-200 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 bg-white"
+                          />
+                        </div>
+                      )}
+
+                      {/* Slice Combinations with Stats */}
+                      {getSliceCombinations.length > 0 ? (
+                        <div className="space-y-2 max-h-64 overflow-y-auto">
+                          {filteredSliceCombinations.map(combo => {
+                            // If user hasn't explicitly modified selection, treat empty as "all selected"
+                            // If user has explicitly cleared, empty means nothing selected
+                            const isSelected = state.selectedSliceValues.includes(combo.id) ||
+                              (!state.sliceSelectionExplicit && state.selectedSliceValues.length === 0);
+
+                            return (
+                              <div
+                                key={combo.id}
+                                onClick={() => handleSliceValueToggle(combo.id)}
+                                className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                                  isSelected
+                                    ? 'bg-purple-100 border-purple-300'
+                                    : 'bg-white border-gray-200 hover:border-purple-200 hover:bg-purple-50'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center space-x-2">
+                                    <div className={`w-5 h-5 rounded border-2 flex items-center justify-center ${
+                                      isSelected ? 'bg-purple-500 border-purple-500' : 'border-gray-300'
+                                    }`}>
+                                      {isSelected && <Check className="w-3 h-3 text-white" />}
+                                    </div>
+                                    <span className={`font-medium text-sm ${isSelected ? 'text-purple-800' : 'text-gray-700'}`}>
+                                      {combo.displayName}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center space-x-3 text-xs text-gray-500">
+                                    <span title="Data Points">
+                                      <Table className="w-3 h-3 inline mr-1" />
+                                      {combo.rowCount.toLocaleString()}
+                                    </span>
+                                    {state.selectedTargetCol && (
+                                      <>
+                                        <span title={`Total ${state.selectedTargetCol}`}>
+                                          <TrendingUp className="w-3 h-3 inline mr-1" />
+                                          {combo.targetSum >= 1000000
+                                            ? `${(combo.targetSum / 1000000).toFixed(1)}M`
+                                            : combo.targetSum >= 1000
+                                            ? `${(combo.targetSum / 1000).toFixed(1)}K`
+                                            : combo.targetSum.toFixed(0)}
+                                        </span>
+                                        <span title={`Avg ${state.selectedTargetCol}`} className="text-gray-400">
+                                          avg: {combo.targetAvg >= 1000
+                                            ? `${(combo.targetAvg / 1000).toFixed(1)}K`
+                                            : combo.targetAvg.toFixed(0)}
+                                        </span>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto">
+                          {getCombinedSliceInfo.uniqueCombinations.map(val => (
+                            <button
+                              key={val}
+                              onClick={() => handleSliceValueToggle(val)}
+                              className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
+                                state.selectedSliceValues.includes(val)
+                                  ? 'bg-purple-100 border-purple-300 text-purple-700'
+                                  : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                              }`}
+                            >
+                              {state.selectedSliceValues.includes(val) && <Check className="w-3 h-3 inline mr-1" />}
+                              {val}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Summary */}
+                      <div className="mt-3 flex items-center justify-between text-xs">
+                        <span className={state.sliceSelectionExplicit && state.selectedSliceValues.length === 0 ? 'text-amber-600' : 'text-purple-600'}>
+                          {state.selectedSliceValues.length > 0
+                            ? `${state.selectedSliceValues.length} of ${getCombinedSliceInfo.count} selected`
+                            : state.sliceSelectionExplicit
+                            ? `0 of ${getCombinedSliceInfo.count} selected - click Select All or choose segments`
+                            : `All ${getCombinedSliceInfo.count} segments selected (default)`}
+                        </span>
+                        {state.selectedSliceValues.length > 5 && (
+                          <span className="text-amber-600 flex items-center">
+                            <AlertTriangle className="w-3 h-3 mr-1" />
+                            Many segments may take longer to process
+                          </span>
+                        )}
                       </div>
                     </div>
                   )}
@@ -1649,7 +2568,7 @@ export const SimpleModePanel: React.FC = () => {
                 )}
               </div>
 
-              {/* Covariates with Enhanced Guidance */}
+              {/* Covariates with Enhanced Categorized Selection */}
               <div className="p-4 bg-gray-50 rounded-lg">
                 <div className="flex items-center justify-between mb-2">
                   <label className="block text-sm font-medium text-gray-700">
@@ -1661,35 +2580,110 @@ export const SimpleModePanel: React.FC = () => {
                   </span>
                 </div>
 
-                {/* Guidance Box */}
-                <div className="mb-3 p-3 bg-purple-50 rounded-lg border border-purple-100">
-                  <div className="flex items-start space-x-2">
-                    <Sparkles className="w-4 h-4 text-purple-600 flex-shrink-0 mt-0.5" />
-                    <div className="text-xs text-purple-700">
-                      <p className="font-medium mb-1">What are features/covariates?</p>
-                      <p>These are external factors that influence your target value. Including relevant features improves forecast accuracy.</p>
-                      <ul className="mt-2 space-y-1">
-                        <li>• <strong>Promotions/Campaigns:</strong> Include if you run marketing activities</li>
-                        <li>• <strong>Holidays/Events:</strong> Include if sales spike during holidays</li>
-                        <li>• <strong>Price:</strong> Include if pricing affects demand</li>
-                        <li>• <strong>Weather/External:</strong> Include if relevant to your business</li>
-                      </ul>
-                    </div>
+                {/* Compact Guidance Box */}
+                <div className="mb-3 p-2 bg-purple-50 rounded-lg border border-purple-100">
+                  <div className="flex items-center space-x-2">
+                    <Sparkles className="w-4 h-4 text-purple-600 flex-shrink-0" />
+                    <p className="text-xs text-purple-700">
+                      Select features that influence your target. Use category headers to bulk select/deselect.
+                    </p>
                   </div>
                 </div>
 
-                <div className="flex flex-wrap gap-2">
-                  {getAvailableCovariates().map(col => {
-                    const isPromo = /promo|campaign|market|ad/i.test(col);
-                    const isHoliday = /holiday|event|season/i.test(col);
-                    const isPrice = /price|cost|discount/i.test(col);
-                    const hint = isPromo ? 'Marketing' : isHoliday ? 'Event' : isPrice ? 'Pricing' : null;
+                {/* Search Filter */}
+                {getAvailableCovariates().length > 10 && (
+                  <div className="mb-3 relative">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      placeholder="Search features..."
+                      value={state.covariateSearchQuery}
+                      onChange={(e) => setState(s => ({ ...s, covariateSearchQuery: e.target.value }))}
+                      className="w-full pl-9 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500"
+                    />
+                  </div>
+                )}
 
-                    return (
+                {/* Categorized Covariate Selection */}
+                {getCovariateCategories.length > 0 ? (
+                  <div className="space-y-3 max-h-80 overflow-y-auto">
+                    {getCovariateCategories.map(category => {
+                      const filteredColumns = state.covariateSearchQuery.trim()
+                        ? category.columns.filter(c => c.toLowerCase().includes(state.covariateSearchQuery.toLowerCase()))
+                        : category.columns;
+
+                      if (filteredColumns.length === 0) return null;
+
+                      const selectedInCategory = filteredColumns.filter(c => state.selectedCovariates.includes(c)).length;
+                      const allSelected = selectedInCategory === filteredColumns.length;
+                      const isExpanded = state.expandedCovariateGroups.includes(category.type);
+
+                      return (
+                        <div key={category.type} className="border border-gray-200 rounded-lg bg-white overflow-hidden">
+                          {/* Category Header - Clickable to expand/collapse */}
+                          <div
+                            className={`flex items-center justify-between p-3 cursor-pointer hover:bg-gray-50 ${category.color}`}
+                            onClick={() => setState(s => ({
+                              ...s,
+                              expandedCovariateGroups: isExpanded
+                                ? s.expandedCovariateGroups.filter(g => g !== category.type)
+                                : [...s.expandedCovariateGroups, category.type]
+                            }))}
+                          >
+                            <div className="flex items-center space-x-2">
+                              {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                              {getCategoryIcon(category.type, `w-4 h-4 ${category.color}`)}
+                              <span className="font-medium text-sm text-gray-800">{category.label}</span>
+                              <span className="text-xs text-gray-500">({selectedInCategory}/{filteredColumns.length})</span>
+                            </div>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleCovariateCategory(category);
+                              }}
+                              className={`px-2 py-1 text-xs rounded transition-colors ${
+                                allSelected
+                                  ? 'bg-purple-100 text-purple-700 hover:bg-purple-200'
+                                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                              }`}
+                            >
+                              {allSelected ? 'Deselect All' : 'Select All'}
+                            </button>
+                          </div>
+
+                          {/* Category Items */}
+                          {isExpanded && (
+                            <div className="px-3 pb-3 pt-1">
+                              <p className="text-xs text-gray-500 mb-2">{category.description}</p>
+                              <div className="flex flex-wrap gap-2">
+                                {filteredColumns.map(col => (
+                                  <button
+                                    key={col}
+                                    onClick={() => handleCovariateToggle(col)}
+                                    className={`px-2 py-1 text-xs rounded-lg border transition-colors ${
+                                      state.selectedCovariates.includes(col)
+                                        ? 'bg-purple-100 border-purple-300 text-purple-700'
+                                        : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
+                                    }`}
+                                  >
+                                    {state.selectedCovariates.includes(col) && <Check className="w-3 h-3 inline mr-1" />}
+                                    {col}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {getAvailableCovariates().map(col => (
                       <button
                         key={col}
                         onClick={() => handleCovariateToggle(col)}
-                        className={`px-3 py-1.5 text-sm rounded-lg border transition-colors relative ${
+                        className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                           state.selectedCovariates.includes(col)
                             ? 'bg-purple-100 border-purple-300 text-purple-700'
                             : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
@@ -1697,22 +2691,15 @@ export const SimpleModePanel: React.FC = () => {
                       >
                         {state.selectedCovariates.includes(col) && <Check className="w-3 h-3 inline mr-1" />}
                         {col}
-                        {hint && (
-                          <span className={`ml-1 text-xs px-1 py-0.5 rounded ${
-                            state.selectedCovariates.includes(col) ? 'bg-purple-200' : 'bg-gray-100'
-                          }`}>
-                            {hint}
-                          </span>
-                        )}
                       </button>
-                    );
-                  })}
-                  {getAvailableCovariates().length === 0 && (
-                    <span className="text-sm text-gray-400 italic">No additional numeric columns available</span>
-                  )}
-                </div>
+                    ))}
+                    {getAvailableCovariates().length === 0 && (
+                      <span className="text-sm text-gray-400 italic">No additional numeric columns available</span>
+                    )}
+                  </div>
+                )}
 
-                {/* Impact warning */}
+                {/* Impact Summary */}
                 {state.selectedCovariates.length > 0 && (
                   <div className="mt-3 p-2 bg-amber-50 rounded border border-amber-100">
                     <p className="text-xs text-amber-700">
@@ -2129,6 +3116,196 @@ export const SimpleModePanel: React.FC = () => {
             </div>
           </div>
 
+          {/* NEW: How We Built Your Forecast - Plain English Explanation */}
+          <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-xl shadow-sm border border-blue-200 p-6">
+            <h3 className="font-semibold text-gray-800 mb-4 flex items-center">
+              <Lightbulb className="w-5 h-5 mr-2 text-blue-600" />
+              How We Built Your Forecast
+              <span className="ml-2 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">Plain English</span>
+            </h3>
+
+            {/* Model Selection Explanation */}
+            <div className="space-y-4">
+              {/* What Models Were Tested */}
+              <div className="bg-white/70 rounded-lg p-4">
+                <h4 className="font-medium text-gray-700 mb-2 flex items-center">
+                  <Target className="w-4 h-4 mr-2 text-purple-600" />
+                  Models We Tested
+                </h4>
+                <p className="text-sm text-gray-600 mb-2">
+                  We automatically tested {state.forecast.all_models_trained?.length || 3} different forecasting approaches to find the best fit for your data:
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {(state.forecast.all_models_trained || ['Prophet', 'ARIMA', 'XGBoost']).map((model, idx) => {
+                    const isBest = state.forecast.best_model?.includes(model.split('(')[0]);
+                    return (
+                      <span key={idx} className={`px-3 py-1 rounded-full text-xs font-medium ${
+                        isBest ? 'bg-green-100 text-green-700 ring-2 ring-green-300' : 'bg-gray-100 text-gray-600'
+                      }`}>
+                        {model} {isBest && '✓ Winner'}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Why Winner Was Chosen */}
+              <div className="bg-white/70 rounded-lg p-4">
+                <h4 className="font-medium text-gray-700 mb-2 flex items-center">
+                  <Shield className="w-4 h-4 mr-2 text-green-600" />
+                  Why {state.forecast.best_model || 'This Model'} Won
+                </h4>
+                <div className="text-sm text-gray-600 space-y-2">
+                  {(() => {
+                    const bestModel = state.forecast.best_model || '';
+                    const mape = state.forecast.holdout_mape || state.forecast.confidence?.mape || 5;
+
+                    // Generate explanation based on model type
+                    if (bestModel.toLowerCase().includes('arima')) {
+                      return (
+                        <>
+                          <p><strong>ARIMA</strong> (Auto-Regressive Integrated Moving Average) was chosen because:</p>
+                          <ul className="list-disc list-inside space-y-1 ml-2">
+                            <li>Your data shows consistent patterns that ARIMA captures well</li>
+                            <li>It achieved the lowest error rate ({mape.toFixed(1)}% MAPE) on unseen test data</li>
+                            <li>ARIMA is excellent for data with clear trends and stable seasonality</li>
+                            <li>It's particularly good when you have regular weekly/monthly patterns</li>
+                          </ul>
+                        </>
+                      );
+                    } else if (bestModel.toLowerCase().includes('xgboost')) {
+                      return (
+                        <>
+                          <p><strong>XGBoost</strong> (Extreme Gradient Boosting) was chosen because:</p>
+                          <ul className="list-disc list-inside space-y-1 ml-2">
+                            <li>Your data has complex patterns that machine learning captures best</li>
+                            <li>It achieved the lowest error rate ({mape.toFixed(1)}% MAPE) on unseen test data</li>
+                            <li>XGBoost excels at learning from multiple features (covariates)</li>
+                            <li>It's especially powerful when holidays and external factors affect your numbers</li>
+                          </ul>
+                        </>
+                      );
+                    } else if (bestModel.toLowerCase().includes('prophet')) {
+                      return (
+                        <>
+                          <p><strong>Prophet</strong> (Facebook's forecasting model) was chosen because:</p>
+                          <ul className="list-disc list-inside space-y-1 ml-2">
+                            <li>Your data has strong yearly/weekly seasonality that Prophet handles well</li>
+                            <li>It achieved the lowest error rate ({mape.toFixed(1)}% MAPE) on unseen test data</li>
+                            <li>Prophet is designed for business data with holiday effects</li>
+                            <li>It automatically detects changepoints where trends shift</li>
+                          </ul>
+                        </>
+                      );
+                    } else {
+                      return (
+                        <>
+                          <p>The winning model achieved the lowest error rate ({mape.toFixed(1)}% MAPE) when tested on data it hadn't seen before.</p>
+                          <ul className="list-disc list-inside space-y-1 ml-2">
+                            <li>We held back 15% of your historical data as a "test set"</li>
+                            <li>Each model was trained on the remaining 85% and then predicted the test set</li>
+                            <li>The model with the smallest prediction errors wins</li>
+                          </ul>
+                        </>
+                      );
+                    }
+                  })()}
+                </div>
+              </div>
+
+              {/* Data Treatments Applied */}
+              <div className="bg-white/70 rounded-lg p-4">
+                <h4 className="font-medium text-gray-700 mb-2 flex items-center">
+                  <RefreshCw className="w-4 h-4 mr-2 text-orange-600" />
+                  What We Did With Your Data
+                </h4>
+                <div className="text-sm text-gray-600">
+                  <p className="mb-2">Before training, we automatically prepared your data:</p>
+                  <div className="grid md:grid-cols-2 gap-3">
+                    <div className="flex items-start space-x-2">
+                      <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                      <span><strong>Sorted by date</strong> - Ensured chronological order</span>
+                    </div>
+                    <div className="flex items-start space-x-2">
+                      <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                      <span><strong>Handled missing values</strong> - Filled gaps appropriately</span>
+                    </div>
+                    {state.forecast?.forecast_mode === 'by_slice' && (
+                      <div className="flex items-start space-x-2">
+                        <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                        <span><strong>Trained per segment</strong> - Each slice got its own model</span>
+                      </div>
+                    )}
+                    {state.selectedCovariates.length > 0 && (
+                      <div className="flex items-start space-x-2">
+                        <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                        <span><strong>Included {state.selectedCovariates.length} features</strong> - Used to improve predictions</span>
+                      </div>
+                    )}
+                    <div className="flex items-start space-x-2">
+                      <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                      <span><strong>Detected frequency</strong> - {state.profile?.profile?.frequency || 'weekly'} patterns</span>
+                    </div>
+                    {state.profile?.profile?.has_seasonality && (
+                      <div className="flex items-start space-x-2">
+                        <Check className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                        <span><strong>Found seasonality</strong> - Recurring patterns in your data</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Holiday & Seasonality Handling */}
+              {(state.selectedCovariates.some(c => /holiday|easter|christmas|thanksgiving/i.test(c)) || state.profile?.profile?.holiday_coverage_score > 0) && (
+                <div className="bg-white/70 rounded-lg p-4">
+                  <h4 className="font-medium text-gray-700 mb-2 flex items-center">
+                    <Calendar className="w-4 h-4 mr-2 text-red-600" />
+                    How Holidays & Special Days Are Handled
+                  </h4>
+                  <div className="text-sm text-gray-600 space-y-2">
+                    <p>
+                      <strong>Holiday indicators</strong> in your data (like Christmas, Thanksgiving, etc.) tell the model
+                      when to expect unusual spikes or dips in your numbers.
+                    </p>
+                    <div className="bg-yellow-50 p-3 rounded border border-yellow-200">
+                      <p className="text-yellow-800">
+                        <strong>What this means for your forecast:</strong> When a future date falls on a holiday,
+                        the model will automatically adjust the prediction based on how your data typically behaves
+                        during that holiday in previous years.
+                      </p>
+                    </div>
+                    {state.selectedCovariates.filter(c => /holiday|easter|christmas|thanksgiving|halloween|super.?bowl/i.test(c)).length > 0 && (
+                      <p className="text-gray-500 text-xs mt-2">
+                        Holidays included: {state.selectedCovariates.filter(c => /holiday|easter|christmas|thanksgiving|halloween|super.?bowl/i.test(c)).join(', ')}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Confidence Explanation */}
+              <div className="bg-white/70 rounded-lg p-4">
+                <h4 className="font-medium text-gray-700 mb-2 flex items-center">
+                  <Info className="w-4 h-4 mr-2 text-blue-600" />
+                  Understanding the Confidence Interval
+                </h4>
+                <div className="text-sm text-gray-600">
+                  <p>
+                    The shaded area around the forecast line shows the <strong>95% confidence interval</strong> -
+                    there's a 95% chance the actual value will fall within this range.
+                  </p>
+                  <div className="mt-2 p-2 bg-blue-50 rounded">
+                    <p className="text-blue-800 text-xs">
+                      <strong>Tip:</strong> Wider intervals mean more uncertainty. If the interval is very wide,
+                      consider adding more historical data or relevant features to improve accuracy.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Forecast Chart */}
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-4">
@@ -2289,11 +3466,13 @@ export const SimpleModePanel: React.FC = () => {
                   state.rawData.forEach(row => {
                     // If viewing individual slice, filter by that slice only
                     if (selectedSlice && hasSliceColumns) {
-                      const sliceParts = selectedSlice.slice_id.split('|');
+                      // Split by ' | ' (space-pipe-space) to match how slice_id is constructed
+                      const sliceParts = selectedSlice.slice_id.split(' | ').map(s => s.trim());
                       let matches = true;
                       sliceColumns.forEach((col, idx) => {
                         const expectedValue = sliceParts[idx] || sliceParts[0];
-                        if (String(row[col]) !== expectedValue) {
+                        const rowValue = String(row[col] ?? '').trim();
+                        if (rowValue !== expectedValue) {
                           matches = false;
                         }
                       });

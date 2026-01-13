@@ -357,7 +357,8 @@ def train_xgboost_model(
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
     country: str = 'US',
-    hyperparameter_filters: Dict[str, Any] = None
+    hyperparameter_filters: Dict[str, Any] = None,
+    forecast_start_date: pd.Timestamp = None  # User's specified end_date for forecast start
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
     Train XGBoost model for time series forecasting with full covariate support
@@ -750,9 +751,14 @@ def train_xgboost_model(
         date_strs = full_df['ds'].dt.strftime('%Y-%m-%d')
         yoy_lag_values = dict(zip(date_strs, full_df['y'].values))
 
-        # Generate forecast
-        last_date = full_df['ds'].max()
+        # Generate forecast - use forecast_start_date if provided (user's to_date)
+        if forecast_start_date is not None:
+            last_date = pd.to_datetime(forecast_start_date).normalize()
+            logger.info(f"📅 Using user-specified forecast start: {last_date}")
+        else:
+            last_date = full_df['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
+        logger.info(f"📅 XGBoost forecast dates: {future_dates.min()} to {future_dates.max()}")
         future_df = pd.DataFrame({'ds': future_dates})
         # Create features without lag columns (we'll fill them recursively during prediction)
         future_df = create_xgboost_features(future_df, 'y', valid_covariates, include_lags=False)
