@@ -929,11 +929,13 @@ export const SimpleModePanel: React.FC = () => {
     if (!state.columns.length || !state.rawData) return [];
 
     const categories: CovariateCategory[] = [];
-    const { dateColumns, numericColumns } = detectColumnTypes(state.columns, state.rawData);
+    const { dateColumns, numericColumns, holidayColumns } = detectColumnTypes(state.columns, state.rawData);
     const sliceColumns = state.detectedSlices.map(s => s.column);
 
-    // Get available covariates (exclude date, target, slice columns)
-    const availableCovariates = numericColumns.filter(c =>
+    // Get available covariates - include both numeric AND holiday columns
+    // (exclude date, target, slice columns)
+    const allPotentialCovariates = [...new Set([...numericColumns, ...holidayColumns])];
+    const availableCovariates = allPotentialCovariates.filter(c =>
       c !== state.selectedDateCol &&
       c !== state.selectedTargetCol &&
       !sliceColumns.includes(c)
