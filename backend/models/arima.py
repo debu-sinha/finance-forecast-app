@@ -555,18 +555,26 @@ def train_arima_model(
         if arima_filters:
             logger.info(f"📊 Using data-driven ARIMA filters: p={p_values}, d={d_values}, q={q_values}")
 
-        all_orders = list(set(itertools.product(p_values, d_values, q_values)))
+        # Ensure all values are integers (filters may come as strings from JSON)
+        p_values = [int(p) for p in p_values]
+        d_values = [int(d) for d in d_values]
+        q_values = [int(q) for q in q_values]
+
+        # Generate all combinations as integer tuples
+        all_orders = [(int(p), int(d), int(q)) for p, d, q in itertools.product(p_values, d_values, q_values)]
+        all_orders = list(set(all_orders))  # Remove duplicates
 
         # CRITICAL: Filter out degenerate models that produce flat/uninformative forecasts
         # (0,0,0) = constant mean
         # (0,1,0) = random walk (flat forecast at last value)
         # (0,d,0) = pure differencing (no learning)
-        degenerate_orders = [(0, 0, 0), (0, 1, 0), (0, 2, 0)]
+        degenerate_orders = {(0, 0, 0), (0, 1, 0), (0, 2, 0)}  # Use set for O(1) lookup
         original_count = len(all_orders)
         all_orders = [o for o in all_orders if o not in degenerate_orders]
 
         if len(all_orders) < original_count:
-            logger.info(f"🚫 Excluded {original_count - len(all_orders)} degenerate ARIMA orders (random walk, pure differencing)")
+            excluded_count = original_count - len(all_orders)
+            logger.info(f"🚫 Excluded {excluded_count} degenerate ARIMA orders: {[o for o in [(0,0,0), (0,1,0), (0,2,0)] if o in degenerate_orders]}")
 
         # Ensure we have at least some valid orders
         if len(all_orders) == 0:

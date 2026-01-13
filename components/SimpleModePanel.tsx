@@ -3614,19 +3614,29 @@ export const SimpleModePanel: React.FC = () => {
                   const sliceColumns = state.forecast?.slice_columns || state.selectedSliceCols;
                   const hasSliceColumns = sliceColumns && sliceColumns.length > 0;
 
-                  // Build a set of forecasted slice IDs for quick lookup
+                  // Build a set of forecasted slice IDs for quick lookup (normalized)
                   const forecastedSliceIds = new Set<string>();
                   if (hasSliceForecasts && state.forecast?.slice_forecasts) {
                     state.forecast.slice_forecasts.forEach(slice => {
-                      forecastedSliceIds.add(slice.slice_id);
+                      // Normalize: trim whitespace and use consistent separator
+                      const normalizedId = slice.slice_id.split(/\s*\|\s*/).map(s => s.trim()).join(' | ');
+                      forecastedSliceIds.add(normalizedId);
                     });
                   }
+
+                  // Helper to normalize slice ID
+                  const normalizeSliceId = (parts: string[]) =>
+                    parts.map(p => String(p ?? '').trim()).join(' | ');
+
+                  // Debug: track why rows might be filtered
+                  let matchedRows = 0;
+                  let filteredRows = 0;
 
                   state.rawData.forEach(row => {
                     // If viewing individual slice, filter by that slice only
                     if (selectedSlice && hasSliceColumns) {
                       // Split by ' | ' (space-pipe-space) to match how slice_id is constructed
-                      const sliceParts = selectedSlice.slice_id.split(' | ').map(s => s.trim());
+                      const sliceParts = selectedSlice.slice_id.split(/\s*\|\s*/).map(s => s.trim());
                       let matches = true;
                       sliceColumns.forEach((col, idx) => {
                         const expectedValue = sliceParts[idx] || sliceParts[0];
@@ -3635,13 +3645,24 @@ export const SimpleModePanel: React.FC = () => {
                           matches = false;
                         }
                       });
-                      if (!matches) return;
+                      if (!matches) {
+                        filteredRows++;
+                        return;
+                      }
+                      matchedRows++;
                     }
                     // If viewing all slices in by_slice mode, only include rows from forecasted slices
                     else if (hasSliceForecasts && hasSliceColumns && forecastedSliceIds.size > 0) {
-                      // Build the slice_id for this row
-                      const rowSliceId = sliceColumns.map(col => String(row[col] ?? '')).join(' | ');
-                      if (!forecastedSliceIds.has(rowSliceId)) return;
+                      // Build the slice_id for this row (normalized)
+                      const rowSliceParts = sliceColumns.map(col => row[col]);
+                      const rowSliceId = normalizeSliceId(rowSliceParts);
+                      if (!forecastedSliceIds.has(rowSliceId)) {
+                        filteredRows++;
+                        return;
+                      }
+                      matchedRows++;
+                    } else {
+                      matchedRows++;
                     }
 
                     const dateVal = row[state.selectedDateCol];
@@ -3665,6 +3686,17 @@ export const SimpleModePanel: React.FC = () => {
                     }
                     dateAggregates[dateStr] += numVal;
                   });
+
+                  // Debug: Log filtering results if many rows were filtered
+                  if (filteredRows > 0 && matchedRows === 0) {
+                    console.warn(`Chart data: ALL ${filteredRows} rows filtered! No matches found.`);
+                    console.warn(`Forecasted slice IDs: ${Array.from(forecastedSliceIds).join(', ')}`);
+                    if (sliceColumns && state.rawData && state.rawData.length > 0) {
+                      const sampleRow = state.rawData[0];
+                      const sampleSliceId = normalizeSliceId(sliceColumns.map(col => sampleRow[col]));
+                      console.warn(`Sample raw data slice ID: "${sampleSliceId}"`);
+                    }
+                  }
 
                   const sortedDates = Object.keys(dateAggregates)
                     .sort((a, b) => a.localeCompare(b))
