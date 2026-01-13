@@ -1081,19 +1081,25 @@ export const SimpleModePanel: React.FC = () => {
 
   // NEW: Toggle covariate category (select all in category)
   const toggleCovariateCategory = (category: CovariateCategory) => {
+    console.log(`🏷️ Category toggle clicked: "${category.label}"`);
     setState(s => {
       const categoryColumns = category.columns;
       const allSelected = categoryColumns.every(c => s.selectedCovariates.includes(c));
+      console.log(`📊 Category "${category.label}": ${allSelected ? 'DESELECTING ALL' : 'SELECTING ALL'}`);
+      console.log(`📊 Columns in category: ${categoryColumns.join(', ')}`);
 
       if (allSelected) {
         // Deselect all in category
+        const newCovariates = s.selectedCovariates.filter(c => !categoryColumns.includes(c));
+        console.log(`📊 New covariate count: ${newCovariates.length}`);
         return {
           ...s,
-          selectedCovariates: s.selectedCovariates.filter(c => !categoryColumns.includes(c))
+          selectedCovariates: newCovariates
         };
       } else {
         // Select all in category
         const newSelection = new Set([...s.selectedCovariates, ...categoryColumns]);
+        console.log(`📊 New covariate count: ${newSelection.size}`);
         return { ...s, selectedCovariates: Array.from(newSelection) };
       }
     });
