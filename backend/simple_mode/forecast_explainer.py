@@ -259,6 +259,20 @@ All parameters were optimized for your specific data patterns."""
             base_values, trend_values, seasonal_values, holiday_values = \
                 self._estimate_components(forecast_values, forecast_dates)
 
+        # =========================================================================
+        # ENHANCED: Calculate holiday effect from covariate_impacts
+        # Prophet provides per-covariate impact analysis we can use
+        # =========================================================================
+        covariate_impacts = result.get('covariate_impacts', [])
+        if covariate_impacts and sum(holiday_values) == 0:
+            # Calculate total holiday effect from covariate impacts
+            total_holiday_effect = self._calculate_holiday_effect_from_impacts(
+                covariate_impacts, forecast_values
+            )
+            # Distribute across periods proportionally
+            if total_holiday_effect != 0 and len(forecast_values) > 0:
+                holiday_values = [total_holiday_effect / len(forecast_values)] * len(forecast_values)
+
         # Build period-by-period breakdown
         period_breakdown = []
         for i, val in enumerate(forecast_values):
@@ -325,6 +339,52 @@ All parameters were optimized for your specific data patterns."""
         holiday_values = [0] * n
 
         return base_values, trend_values, seasonal_values, holiday_values
+
+    def _calculate_holiday_effect_from_impacts(
+        self,
+        covariate_impacts: List[Dict[str, Any]],
+        forecast_values: List[float]
+    ) -> float:
+        """
+        Calculate total holiday effect from covariate impacts.
+
+        Looks for holiday-related covariates and sums their impacts.
+        Holiday-related patterns:
+        - is_*_week, is_*_day, is_holiday, is_*_window
+        - weeks_to_*, days_to_*, days_since_*
+        - thanksgiving, christmas, easter, black_friday, super_bowl
+        """
+        if not covariate_impacts or not forecast_values:
+            return 0.0
+
+        holiday_keywords = [
+            'holiday', 'thanksgiving', 'christmas', 'easter', 'black_friday',
+            'super_bowl', 'new_years', 'july4', 'labor', 'memorial', 'halloween',
+            'valentines', 'mothers_day', 'fathers_day', '_week', '_day', '_window',
+            'weeks_to_', 'days_to_', 'days_since_'
+        ]
+
+        total_holiday_impact = 0.0
+        holiday_covariates_found = []
+
+        for impact in covariate_impacts:
+            covariate_name = impact.get('covariate', '').lower()
+            impact_value = impact.get('mean_impact', 0)
+
+            # Check if this is a holiday-related covariate
+            is_holiday_related = any(kw in covariate_name for kw in holiday_keywords)
+
+            if is_holiday_related and impact_value != 0:
+                total_holiday_impact += abs(impact_value)
+                holiday_covariates_found.append((covariate_name, impact_value))
+
+        if holiday_covariates_found:
+            logger.info(f"📅 Holiday effect calculated from {len(holiday_covariates_found)} covariates: "
+                       f"${total_holiday_impact:,.0f}")
+            for name, val in holiday_covariates_found[:5]:  # Log top 5
+                logger.info(f"   - {name}: ${val:,.0f}")
+
+        return total_holiday_impact
 
     def _generate_period_explanation(
         self, forecast: float, base: float, trend: float,

@@ -556,6 +556,24 @@ def train_arima_model(
             logger.info(f"📊 Using data-driven ARIMA filters: p={p_values}, d={d_values}, q={q_values}")
 
         all_orders = list(set(itertools.product(p_values, d_values, q_values)))
+
+        # CRITICAL: Filter out degenerate models that produce flat/uninformative forecasts
+        # (0,0,0) = constant mean
+        # (0,1,0) = random walk (flat forecast at last value)
+        # (0,d,0) = pure differencing (no learning)
+        degenerate_orders = [(0, 0, 0), (0, 1, 0), (0, 2, 0)]
+        original_count = len(all_orders)
+        all_orders = [o for o in all_orders if o not in degenerate_orders]
+
+        if len(all_orders) < original_count:
+            logger.info(f"🚫 Excluded {original_count - len(all_orders)} degenerate ARIMA orders (random walk, pure differencing)")
+
+        # Ensure we have at least some valid orders
+        if len(all_orders) == 0:
+            # Fall back to simple but informative models
+            all_orders = [(1, 1, 0), (0, 1, 1), (1, 1, 1)]
+            logger.warning("All ARIMA orders were degenerate. Using fallback: (1,1,0), (0,1,1), (1,1,1)")
+
         if len(all_orders) > max_arima_combinations:
             all_orders.sort(key=lambda x: sum(x))
             orders = all_orders[:max_arima_combinations]
@@ -563,6 +581,9 @@ def train_arima_model(
         else:
             orders = all_orders
     else:
+        # User-specified order - warn if degenerate
+        if order in [(0, 0, 0), (0, 1, 0), (0, 2, 0)]:
+            logger.warning(f"⚠️ Specified ARIMA order {order} is a degenerate model (random walk). Consider using (1,1,0) or (1,1,1) instead.")
         orders = [order]
     
     with mlflow.start_run(run_name="ARIMA_Tuning", nested=True) as parent_run:

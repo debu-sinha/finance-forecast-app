@@ -13,7 +13,7 @@ import itertools
 import concurrent.futures
 from mlflow.tracking import MlflowClient
 from mlflow.models.signature import infer_signature
-from backend.preprocessing import enhance_features_for_forecasting, get_derived_feature_columns, prepare_future_features
+from backend.preprocessing import enhance_features_for_forecasting, get_derived_feature_columns, prepare_future_features, build_prophet_holidays_dataframe
 from backend.models.utils import compute_metrics, register_model_to_unity_catalog, analyze_covariate_impact
 
 warnings.filterwarnings('ignore')
@@ -217,12 +217,13 @@ random.seed({random_seed})
 SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
 
 
-def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False):
+def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False, custom_holidays_df=None):
     """
     Evaluate a single hyperparameter combination.
 
     Args:
         skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
+        custom_holidays_df: Optional DataFrame with holiday definitions including lower_window/upper_window
     """
     client = MlflowClient() if not skip_mlflow_logging else None
     run_id = None
@@ -235,12 +236,26 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         if not skip_mlflow_logging:
             for k, v in params.items(): client.log_param(run_id, k, str(v))
 
-        model = Prophet(seasonality_mode=params['seasonality_mode'], yearly_seasonality=params['yearly_seasonality'],
-                        weekly_seasonality=params['weekly_seasonality'], daily_seasonality=False,
-                        changepoint_prior_scale=params['changepoint_prior_scale'], seasonality_prior_scale=params['seasonality_prior_scale'],
-                        growth=params.get('growth', 'linear'), interval_width=0.95, uncertainty_samples=1000)
-        try: model.add_country_holidays(country_name=country)
-        except: pass
+        # Use custom holidays DataFrame with multi-day effect windows if provided
+        model = Prophet(
+            seasonality_mode=params['seasonality_mode'],
+            yearly_seasonality=params['yearly_seasonality'],
+            weekly_seasonality=params['weekly_seasonality'],
+            daily_seasonality=False,
+            changepoint_prior_scale=params['changepoint_prior_scale'],
+            seasonality_prior_scale=params['seasonality_prior_scale'],
+            growth=params.get('growth', 'linear'),
+            interval_width=0.95,
+            uncertainty_samples=1000,
+            holidays=custom_holidays_df  # Multi-day holiday effects with windows
+        )
+
+        # Only add country holidays if no custom holidays provided
+        if custom_holidays_df is None:
+            try:
+                model.add_country_holidays(country_name=country)
+            except:
+                pass
 
         # Make copies to avoid modifying originals (since they're shared across threads)
         train_df_local = train_df.copy()
@@ -396,6 +411,22 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     if lag_cols:
         logger.info(f"Filled NaN values with 0 in lag features: {lag_cols}")
 
+    # =========================================================================
+    # BUILD CUSTOM HOLIDAYS DATAFRAME WITH MULTI-DAY EFFECT WINDOWS
+    # This gives Prophet better handling of holidays like Thanksgiving/Christmas
+    # where effects span multiple days (pre-holiday shopping, holiday itself, post-holiday)
+    # =========================================================================
+    custom_holidays_df = None
+    try:
+        # Get date range from the data
+        start_year = int(history_df['ds'].min().year) - 1
+        end_year = int(history_df['ds'].max().year) + 2  # +2 for forecast horizon
+        custom_holidays_df = build_prophet_holidays_dataframe(start_year, end_year, country)
+        logger.info(f"📅 Built custom holidays DataFrame with multi-day windows: {len(custom_holidays_df)} entries")
+    except Exception as e:
+        logger.warning(f"Could not build custom holidays DataFrame, using default: {e}")
+        custom_holidays_df = None
+
     # Note: Don't call mlflow.set_experiment() here - main.py already sets the correct experiment
     # (including batch-specific experiments). Calling it here would override the batch experiment.
 
@@ -482,7 +513,8 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 executor.submit(
                     evaluate_param_set,
                     params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id,
-                    skip_mlflow_logging=SKIP_CHILD_RUNS
+                    skip_mlflow_logging=SKIP_CHILD_RUNS,
+                    custom_holidays_df=custom_holidays_df  # Pass multi-day holiday windows
                 )
                 for params in param_combinations
             ]
@@ -502,7 +534,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Cross-validation
         from mlflow.models import infer_signature
         
-        # Final model training on FULL history
+        # Final model training on FULL history with multi-day holiday effects
         final_model = Prophet(
             seasonality_mode=best_params['seasonality_mode'],
             yearly_seasonality=best_params['yearly_seasonality'],
@@ -512,10 +544,15 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             seasonality_prior_scale=best_params['seasonality_prior_scale'],
             growth=best_params.get('growth', 'linear'),
             interval_width=0.95,
-            uncertainty_samples=1000
+            uncertainty_samples=1000,
+            holidays=custom_holidays_df  # Use multi-day holiday windows
         )
-        try: final_model.add_country_holidays(country_name=country)
-        except: pass
+        # Only add country holidays if no custom holidays provided
+        if custom_holidays_df is None:
+            try:
+                final_model.add_country_holidays(country_name=country)
+            except:
+                pass
         
         for cov in covariates:
             if cov in history_df.columns:
