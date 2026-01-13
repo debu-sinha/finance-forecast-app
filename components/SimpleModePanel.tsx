@@ -866,6 +866,52 @@ export const SimpleModePanel: React.FC = () => {
       .sort((a, b) => b.targetSum - a.targetSum);
   }, [state.rawData, state.selectedSliceCols, state.selectedTargetCol, state.selectedSliceCombinations]);
 
+  // NEW: Compute effective segments that respect user's column reclassifications
+  const getEffectiveSegments = useMemo((): SliceInfo[] => {
+    if (!state.rawData) return state.detectedSlices;
+
+    const { numericColumns, holidayColumns } = detectColumnTypes(state.columns, state.rawData);
+
+    // Start with original detected slices, but filter based on overrides
+    let effectiveSlices = state.detectedSlices.filter(slice => {
+      const override = state.columnOverrides[slice.column];
+      // If user reclassified to something other than 'slice', remove it
+      if (override && override !== 'slice') {
+        return false;
+      }
+      return true;
+    });
+
+    // Add any columns that user explicitly reclassified as 'slice'
+    Object.entries(state.columnOverrides).forEach(([col, type]) => {
+      if (type === 'slice' && !effectiveSlices.some(s => s.column === col)) {
+        // Calculate unique values for this column
+        const uniqueValues = [...new Set(state.rawData!.map(row => String(row[col] ?? '')))].filter(v => v !== '');
+
+        // Determine suggested type based on column characteristics
+        let suggestedType: 'category' | 'region' | 'product' | 'customer' | 'other' = 'category';
+        const lowerCol = col.toLowerCase();
+        if (lowerCol.includes('region') || lowerCol.includes('area') || lowerCol.includes('zone')) {
+          suggestedType = 'region';
+        } else if (lowerCol.includes('product') || lowerCol.includes('item') || lowerCol.includes('sku')) {
+          suggestedType = 'product';
+        } else if (lowerCol.includes('customer') || lowerCol.includes('client') || lowerCol.includes('segment')) {
+          suggestedType = 'customer';
+        }
+
+        effectiveSlices.push({
+          column: col,
+          count: uniqueValues.length,
+          uniqueValues: uniqueValues.slice(0, 20),
+          suggestedType,
+          hasNulls: state.rawData!.some(row => row[col] === null || row[col] === undefined || row[col] === ''),
+        });
+      }
+    });
+
+    return effectiveSlices;
+  }, [state.detectedSlices, state.columnOverrides, state.rawData, state.columns]);
+
   // NEW: Categorize covariates for organized selection
   const getCovariateCategories = useMemo((): CovariateCategory[] => {
     if (!state.columns.length || !state.rawData) return [];
@@ -1952,6 +1998,24 @@ export const SimpleModePanel: React.FC = () => {
                             {group.columns.map(col => {
                               const isOverridden = state.columnOverrides[col] !== undefined;
                               const isDragging = state.draggingColumn === col;
+                              const isNumericGroup = group.type === 'numeric';
+                              const isTarget = col === state.selectedTargetCol;
+                              const isDate = col === state.selectedDateCol;
+                              const isDateGroup = group.type === 'date';
+
+                              // Handle click for numeric columns (to select as target) or date columns
+                              const handleChipClick = () => {
+                                if (isNumericGroup && !isTarget) {
+                                  // Remove from covariates if it was selected
+                                  setState(s => ({
+                                    ...s,
+                                    selectedTargetCol: col,
+                                    selectedCovariates: s.selectedCovariates.filter(c => c !== col),
+                                  }));
+                                } else if (isDateGroup && !isDate) {
+                                  setState(s => ({ ...s, selectedDateCol: col }));
+                                }
+                              };
 
                               return (
                                 <span
@@ -1959,25 +2023,35 @@ export const SimpleModePanel: React.FC = () => {
                                   draggable
                                   onDragStart={(e) => handleDragStart(e, col)}
                                   onDragEnd={handleDragEnd}
-                                  className={`px-2 py-1 text-xs rounded-full cursor-grab active:cursor-grabbing select-none transition-all ${
+                                  onClick={handleChipClick}
+                                  className={`px-2 py-1 text-xs rounded-full select-none transition-all ${
                                     isDragging
-                                      ? 'opacity-50 scale-95 bg-gray-200'
-                                      : col === state.selectedDateCol
-                                      ? 'ring-2 ring-blue-400 text-blue-700 bg-white'
-                                      : col === state.selectedTargetCol
-                                      ? 'ring-2 ring-green-400 text-green-700 bg-white'
+                                      ? 'opacity-50 scale-95 bg-gray-200 cursor-grabbing'
+                                      : isDate
+                                      ? 'ring-2 ring-blue-400 text-blue-700 bg-white cursor-pointer'
+                                      : isTarget
+                                      ? 'ring-2 ring-green-400 text-green-700 bg-white cursor-default'
                                       : state.selectedCovariates.includes(col)
-                                      ? 'ring-2 ring-purple-400 text-purple-700 bg-white'
+                                      ? 'ring-2 ring-purple-400 text-purple-700 bg-white cursor-grab'
                                       : isOverridden
-                                      ? 'bg-yellow-100 text-yellow-800 border border-yellow-300'
-                                      : 'bg-white text-gray-600 hover:bg-gray-100'
+                                      ? 'bg-yellow-100 text-yellow-800 border border-yellow-300 cursor-grab hover:bg-yellow-200'
+                                      : isNumericGroup || isDateGroup
+                                      ? 'bg-white text-gray-600 hover:bg-green-50 hover:ring-1 hover:ring-green-300 cursor-pointer'
+                                      : 'bg-white text-gray-600 hover:bg-gray-100 cursor-grab'
                                   }`}
-                                  title={isOverridden ? 'Manually reclassified - drag to move' : 'Drag to reclassify'}
+                                  title={
+                                    isTarget ? 'Current target column'
+                                    : isDate ? 'Current date column'
+                                    : isNumericGroup ? 'Click to set as target column, or drag to reclassify'
+                                    : isDateGroup ? 'Click to set as date column'
+                                    : isOverridden ? 'Manually reclassified - drag to move'
+                                    : 'Drag to reclassify'
+                                  }
                                 >
                                   {col}
-                                  {col === state.selectedDateCol && <Calendar className="w-3 h-3 inline ml-1" />}
-                                  {col === state.selectedTargetCol && <Target className="w-3 h-3 inline ml-1" />}
-                                  {isOverridden && !state.selectedDateCol && !state.selectedTargetCol && (
+                                  {isDate && <Calendar className="w-3 h-3 inline ml-1" />}
+                                  {isTarget && <Target className="w-3 h-3 inline ml-1" />}
+                                  {isOverridden && !isDate && !isTarget && (
                                     <span className="ml-1 text-yellow-600">*</span>
                                   )}
                                 </span>
@@ -2023,7 +2097,7 @@ export const SimpleModePanel: React.FC = () => {
           )}
 
           {/* AI Guidance: Slice Detection */}
-          {state.detectedSlices.length > 0 && (
+          {getEffectiveSegments.length > 0 && (
             <div className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-xl border border-purple-200 overflow-hidden">
               <button
                 onClick={() => setShowSliceGuide(!showSliceGuide)}
@@ -2035,7 +2109,7 @@ export const SimpleModePanel: React.FC = () => {
                   </div>
                   <div className="text-left">
                     <span className="font-semibold text-purple-800 flex items-center">
-                      AI Detected {state.detectedSlices.length} Data Segment{state.detectedSlices.length > 1 ? 's' : ''}
+                      AI Detected {getEffectiveSegments.length} Data Segment{getEffectiveSegments.length > 1 ? 's' : ''}
                       <span className="ml-2 px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full">
                         Important
                       </span>
@@ -2079,10 +2153,11 @@ export const SimpleModePanel: React.FC = () => {
                       Select one or more columns to create slice combinations. For example, selecting both "Region" and "Product" will create slices like "North | Electronics".
                     </p>
                     <div className="grid gap-3">
-                      {state.detectedSlices.map((slice) => {
-                        const config = SLICE_TYPE_CONFIG[slice.suggestedType];
+                      {getEffectiveSegments.map((slice) => {
+                        const config = SLICE_TYPE_CONFIG[slice.suggestedType] || SLICE_TYPE_CONFIG.other;
                         const IconComponent = config.icon;
                         const isSelected = state.selectedSliceCols.includes(slice.column);
+                        const isOverridden = state.columnOverrides[slice.column] === 'slice';
                         return (
                           <div
                             key={slice.column}
