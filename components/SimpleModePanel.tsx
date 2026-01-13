@@ -1960,12 +1960,33 @@ export const SimpleModePanel: React.FC = () => {
                 </div>
               </div>
 
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-gray-500 mb-2">
                 <span className="font-medium text-gray-700">Drag and drop</span> column chips between categories to reclassify them.
                 {Object.keys(state.columnOverrides).length > 0 && (
                   <span className="ml-2 text-blue-600">({Object.keys(state.columnOverrides).length} manually reclassified)</span>
                 )}
               </p>
+
+              {/* Color Legend */}
+              <div className="flex flex-wrap items-center gap-3 mb-4 text-xs text-gray-500">
+                <span className="font-medium text-gray-600">Legend:</span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-full ring-2 ring-blue-400 bg-white"></span>
+                  <span>Date</span>
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-full ring-2 ring-green-400 bg-white"></span>
+                  <span>Target</span>
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-full ring-2 ring-purple-400 bg-white"></span>
+                  <span>Covariate</span>
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-3 h-3 rounded-full bg-yellow-100 border border-yellow-300"></span>
+                  <span>Reclassified</span>
+                </span>
+              </div>
 
               <div className="grid md:grid-cols-2 gap-3">
                 {getColumnGroups.map(group => {
@@ -2015,17 +2036,31 @@ export const SimpleModePanel: React.FC = () => {
                               const isDate = col === state.selectedDateCol;
                               const isDateGroup = group.type === 'date';
 
-                              // Handle click for numeric columns (to select as target) or date columns
+                              const isCovariate = state.selectedCovariates.includes(col);
+
+                              // Handle click for numeric columns (toggle covariate) or date columns
                               const handleChipClick = () => {
                                 if (isNumericGroup && !isTarget) {
-                                  // Remove from covariates if it was selected
+                                  // Toggle covariate selection
+                                  setState(s => ({
+                                    ...s,
+                                    selectedCovariates: isCovariate
+                                      ? s.selectedCovariates.filter(c => c !== col)
+                                      : [...s.selectedCovariates, col],
+                                  }));
+                                } else if (isDateGroup && !isDate) {
+                                  setState(s => ({ ...s, selectedDateCol: col }));
+                                }
+                              };
+
+                              // Handle double-click for numeric columns (set as target)
+                              const handleChipDoubleClick = () => {
+                                if (isNumericGroup && !isTarget) {
                                   setState(s => ({
                                     ...s,
                                     selectedTargetCol: col,
                                     selectedCovariates: s.selectedCovariates.filter(c => c !== col),
                                   }));
-                                } else if (isDateGroup && !isDate) {
-                                  setState(s => ({ ...s, selectedDateCol: col }));
                                 }
                               };
 
@@ -2036,6 +2071,7 @@ export const SimpleModePanel: React.FC = () => {
                                   onDragStart={(e) => handleDragStart(e, col)}
                                   onDragEnd={handleDragEnd}
                                   onClick={handleChipClick}
+                                  onDoubleClick={handleChipDoubleClick}
                                   className={`px-2 py-1 text-xs rounded-full select-none transition-all ${
                                     isDragging
                                       ? 'opacity-50 scale-95 bg-gray-200 cursor-grabbing'
@@ -2043,18 +2079,21 @@ export const SimpleModePanel: React.FC = () => {
                                       ? 'ring-2 ring-blue-400 text-blue-700 bg-white cursor-pointer'
                                       : isTarget
                                       ? 'ring-2 ring-green-400 text-green-700 bg-white cursor-default'
-                                      : state.selectedCovariates.includes(col)
-                                      ? 'ring-2 ring-purple-400 text-purple-700 bg-white cursor-grab'
+                                      : isCovariate
+                                      ? 'ring-2 ring-purple-400 text-purple-700 bg-white cursor-pointer hover:bg-purple-50'
                                       : isOverridden
                                       ? 'bg-yellow-100 text-yellow-800 border border-yellow-300 cursor-grab hover:bg-yellow-200'
-                                      : isNumericGroup || isDateGroup
-                                      ? 'bg-white text-gray-600 hover:bg-green-50 hover:ring-1 hover:ring-green-300 cursor-pointer'
+                                      : isNumericGroup
+                                      ? 'bg-white text-gray-600 hover:bg-purple-50 hover:ring-1 hover:ring-purple-300 cursor-pointer'
+                                      : isDateGroup
+                                      ? 'bg-white text-gray-600 hover:bg-blue-50 hover:ring-1 hover:ring-blue-300 cursor-pointer'
                                       : 'bg-white text-gray-600 hover:bg-gray-100 cursor-grab'
                                   }`}
                                   title={
-                                    isTarget ? 'Current target column'
+                                    isTarget ? 'Current target column (double-click another to change)'
                                     : isDate ? 'Current date column'
-                                    : isNumericGroup ? 'Click to set as target column, or drag to reclassify'
+                                    : isCovariate ? 'Covariate - click to remove, double-click to set as target'
+                                    : isNumericGroup ? 'Click to add as covariate, double-click to set as target'
                                     : isDateGroup ? 'Click to set as date column'
                                     : isOverridden ? 'Manually reclassified - drag to move'
                                     : 'Drag to reclassify'
