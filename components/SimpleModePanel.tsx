@@ -1328,14 +1328,22 @@ export const SimpleModePanel: React.FC = () => {
   };
 
   const handleCovariateToggle = (col: string) => {
+    console.log(`🔄 Covariate toggle clicked: "${col}"`);
     setState(s => {
       // Don't allow selecting target as covariate
-      if (col === s.selectedTargetCol) return s;
+      if (col === s.selectedTargetCol) {
+        console.log(`⚠️ Blocked: "${col}" is the target column`);
+        return s;
+      }
+      const wasSelected = s.selectedCovariates.includes(col);
+      const newCovariates = wasSelected
+        ? s.selectedCovariates.filter(c => c !== col)
+        : [...s.selectedCovariates, col];
+      console.log(`📊 Covariate "${col}": ${wasSelected ? 'REMOVING' : 'ADDING'}`);
+      console.log(`📊 New covariate count: ${newCovariates.length}`);
       return {
         ...s,
-        selectedCovariates: s.selectedCovariates.includes(col)
-          ? s.selectedCovariates.filter(c => c !== col)
-          : [...s.selectedCovariates, col],
+        selectedCovariates: newCovariates,
       };
     });
   };
