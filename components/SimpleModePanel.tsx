@@ -1504,16 +1504,44 @@ export const SimpleModePanel: React.FC = () => {
 
   // Handle slice value toggle
   const handleSliceValueToggle = (value: string) => {
-    setState(s => ({
-      ...s,
-      selectedSliceValues: s.selectedSliceValues.includes(value)
-        ? s.selectedSliceValues.filter(v => v !== value)
-        : [...s.selectedSliceValues, value],
-      sliceSelectionExplicit: true,  // User has explicitly modified selection
-      // Clear old forecast results when slice selection changes
-      forecast: null,
-      step: 'configure',
-    }));
+    setState(s => {
+      // Special case: In default state (empty array = all selected visually),
+      // clicking to "deselect" should keep all EXCEPT the clicked item
+      const isDefaultAllSelected = !s.sliceSelectionExplicit && s.selectedSliceValues.length === 0;
+
+      if (isDefaultAllSelected) {
+        // Get all possible combinations from the slice columns
+        const allCombinations = new Set<string>();
+        if (s.rawData && s.selectedSliceCols.length > 0) {
+          s.rawData.forEach(row => {
+            const id = s.selectedSliceCols.map(col => String(row[col] || 'Unknown')).join(' | ');
+            allCombinations.add(id);
+          });
+        }
+        // Keep all EXCEPT the clicked one (user wants to deselect it)
+        const newSelection = Array.from(allCombinations).filter(v => v !== value);
+        return {
+          ...s,
+          selectedSliceValues: newSelection,
+          selectedSliceCombinations: newSelection,
+          sliceSelectionExplicit: true,
+          forecast: null,
+          step: 'configure',
+        };
+      }
+
+      // Normal toggle behavior
+      const isCurrentlySelected = s.selectedSliceValues.includes(value);
+      return {
+        ...s,
+        selectedSliceValues: isCurrentlySelected
+          ? s.selectedSliceValues.filter(v => v !== value)
+          : [...s.selectedSliceValues, value],
+        sliceSelectionExplicit: true,
+        forecast: null,
+        step: 'configure',
+      };
+    });
   };
 
   // Handle slice column toggle (supports multiple selection)
