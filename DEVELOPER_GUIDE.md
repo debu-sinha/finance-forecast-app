@@ -336,7 +336,7 @@ flowchart LR
 | `is_new_years_week` | New Year's week flag |
 | ... | Other major US holidays |
 
-#### Holiday Proximity Features (v1.2.0+)
+#### Holiday Proximity Features - Weekly Data (v1.2.0+)
 
 | Feature | Type | Description |
 |---------|------|-------------|
@@ -348,6 +348,39 @@ flowchart LR
 | `is_post_thanksgiving` | int | Within 2 weeks after Thanksgiving |
 | `is_pre_christmas` | int | Within 2 weeks before Christmas |
 | `is_post_christmas` | int | Within 2 weeks after Christmas |
+
+#### Holiday Proximity Features - Daily Data (v1.3.0+)
+
+| Feature | Type | Description |
+|---------|------|-------------|
+| `days_to_thanksgiving` | int | Days until next Thanksgiving (0-365) |
+| `days_since_thanksgiving` | int | Days since last Thanksgiving (0-365) |
+| `days_to_christmas` | int | Days until next Christmas (0-365) |
+| `days_since_christmas` | int | Days since last Christmas (0-365) |
+| `days_to_black_friday` | int | Days until next Black Friday (0-365) |
+| `days_since_black_friday` | int | Days since last Black Friday (0-365) |
+| `days_to_easter` | int | Days until next Easter (0-365) |
+| `days_since_easter` | int | Days since last Easter (0-365) |
+| `days_to_super_bowl` | int | Days until next Super Bowl (0-365) |
+| `days_since_super_bowl` | int | Days since last Super Bowl (0-365) |
+| `is_thanksgiving_window` | int | Within ±3 days of Thanksgiving |
+| `is_christmas_window` | int | Within ±3 days of Christmas |
+| `is_black_friday_window` | int | Within ±3 days of Black Friday |
+| `is_easter_window` | int | Within ±3 days of Easter |
+| `is_super_bowl_window` | int | Within ±3 days of Super Bowl |
+
+#### Prophet Multi-Day Holiday Windows (v1.3.0+)
+
+Prophet now uses custom holidays DataFrame with `lower_window` and `upper_window` to capture multi-day effects:
+
+| Holiday | Window | Effect Period |
+|---------|--------|---------------|
+| Thanksgiving | -1 to +3 | Wed prep through Black Friday weekend |
+| Christmas | -7 to +1 | Full week before + day after |
+| Black Friday | 0 to +2 | Fri-Sun shopping weekend |
+| Super Bowl | -1 to 0 | Day before + event day |
+| Mother's/Father's Day | -1 to 0 | Weekend effect |
+| Memorial/Labor Day | -2 to 0 | Weekend celebration |
 
 #### YoY Lag Features (Conditional)
 
@@ -595,6 +628,25 @@ python backend/tests/test_simple_mode_e2e.py
 
 ## Changelog
 
+### v1.3.0 (January 2026)
+
+**New Features - World-Class Holiday Handling:**
+- Daily holiday proximity features (`days_to_*`, `days_since_*`) for 5 key holidays
+- Multi-day holiday effect windows (`is_*_window`) for Thanksgiving, Christmas, Black Friday, Easter, Super Bowl
+- Prophet custom holidays DataFrame with `lower_window`/`upper_window` for multi-day effects
+- Easter, Super Bowl, Mother's Day, Father's Day date calculations added
+- Weekend indicator (`is_weekend`) ensured for all daily data
+
+**New Features - Forecast Quality:**
+- ARIMA degenerate order filtering (excludes random walk models 0,1,0)
+- Holiday effect calculation from covariate impacts (fixes $0 display)
+- Improved holiday effect reporting in forecast breakdown
+
+**Bug Fixes:**
+- Fixed flat forecasts when ARIMA(0,1,0) random walk was selected
+- Fixed holiday effect showing $0 in forecast breakdown
+- Fixed Expert Mode forecast dates starting from eval end instead of user's end_date
+
 ### v1.2.0 (December 29, 2024)
 
 **New Features:**
@@ -636,5 +688,5 @@ python backend/tests/test_simple_mode_e2e.py
 
 ---
 
-**Version:** 1.2.0
-**Last Updated:** December 2024
+**Version:** 1.3.0
+**Last Updated:** January 2026

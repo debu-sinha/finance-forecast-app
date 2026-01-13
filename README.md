@@ -32,6 +32,11 @@ A comprehensive **prototype and reference implementation** for an AI-powered tim
 
 *   **Simple Mode (NEW!)**: Autopilot forecasting for finance users - upload data, get forecast. No ML knowledge required.
 *   **AutoML Forecasting Paradigm**: Automatically trains and compares multiple model types (Prophet, ARIMA, Exponential Smoothing, SARIMAX, XGBoost) to find the best fit for your data.
+*   **World-Class Holiday Handling (v1.3.0)**:
+    - Multi-day holiday effect windows for Prophet (Thanksgiving -1 to +3 days, Christmas -7 to +1 days, etc.)
+    - Daily proximity features (`days_to_christmas`, `days_since_thanksgiving`, `is_black_friday_window`)
+    - Automatic Easter, Super Bowl, Mother's Day, Father's Day date calculations
+*   **Smart ARIMA Model Selection**: Excludes degenerate random walk models (0,1,0) that produce flat forecasts
 *   **Time Series Cross-Validation**: Expanding window CV for robust metric estimation (not just single holdout).
 *   **Statistical Prediction Intervals**: Residual-based confidence bounds using t-distribution (not arbitrary ±10%).
 *   **Parallel Hyperparameter Tuning**: Leverages multi-threading to optimize model parameters efficiently.
