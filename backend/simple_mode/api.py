@@ -1007,7 +1007,8 @@ async def _run_forecast(
                         'US',
                         config.random_seed,
                         future_features_list,  # Pass future covariate rows if available
-                        hyperparameter_filters  # Pass intelligent hyperparameter filters
+                        hyperparameter_filters,  # Pass intelligent hyperparameter filters
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
 
                     result = {
@@ -1025,7 +1026,8 @@ async def _run_forecast(
                         train_df, eval_df, config.horizon, config.frequency,
                         None, config.random_seed,
                         original_data=data_list, covariates=covariates,
-                        hyperparameter_filters=hyperparameter_filters
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
 
                     result = {
@@ -1043,7 +1045,8 @@ async def _run_forecast(
                         train_df, eval_df, config.horizon, config.frequency,
                         covariates=covariates, random_seed=config.random_seed,
                         original_data=data_list, country='US',
-                        hyperparameter_filters=hyperparameter_filters
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
 
                     result = {
@@ -1118,7 +1121,8 @@ async def _run_forecast(
                         'US',
                         config.random_seed,
                         None,
-                        hyperparameter_filters  # Pass intelligent hyperparameter filters
+                        hyperparameter_filters,  # Pass intelligent hyperparameter filters
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
                     final_result = {
                         'model_type': 'Prophet',
@@ -1135,7 +1139,8 @@ async def _run_forecast(
                         processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
                         None, config.random_seed,
                         original_data=data_list, covariates=covariates,
-                        hyperparameter_filters=hyperparameter_filters
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
                     final_result = {
                         'model_type': f'ARIMA{params}' if params else 'ARIMA',
@@ -1151,7 +1156,8 @@ async def _run_forecast(
                         processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
                         covariates=covariates, random_seed=config.random_seed,
                         original_data=data_list, country='US',
-                        hyperparameter_filters=hyperparameter_filters
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
                     final_result = {
                         'model_type': f'XGBoost(depth={params.get("max_depth", "?")})' if params else 'XGBoost',
