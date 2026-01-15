@@ -286,7 +286,9 @@ def train_exponential_smoothing_model(
     seasonal_periods: int = 12,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    covariates: List[str] = None  # Kept for API compatibility but NOT used - ETS is univariate
+    covariates: List[str] = None,  # Kept for API compatibility but NOT used - ETS is univariate
+    hyperparameter_filters: Dict[str, Any] = None,
+    forecast_start_date: pd.Timestamp = None  # User's specified end_date for forecast start
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
     Train Exponential Smoothing model with hyperparameter tuning and MLflow logging
@@ -309,9 +311,16 @@ def train_exponential_smoothing_model(
     best_run_id = None
     best_artifact_uri = None
 
-    trend_options = ['add', None]
-    seasonal_options = ['add', None]
-    
+    # Apply hyperparameter filters from data analysis if provided
+    ets_filters = (hyperparameter_filters or {}).get('ETS', {})
+
+    # Use filtered values if provided, otherwise use defaults
+    trend_options = ets_filters.get('trend', ['add', None])
+    seasonal_options = ets_filters.get('seasonal', ['add', None])
+
+    if ets_filters:
+        logger.info(f"📊 Using data-driven ETS filters: trend={trend_options}, seasonal={seasonal_options}")
+
     # Limit ETS combinations for Databricks Apps
     param_combinations = list(set([(trend, seasonal) for trend in trend_options for seasonal in seasonal_options]))
     max_ets_combinations = int(os.environ.get('ETS_MAX_COMBINATIONS', '4'))
@@ -430,8 +439,14 @@ def train_exponential_smoothing_model(
             forecast_lower = forecast_values * 0.9
             forecast_upper = forecast_values * 1.1
 
-        last_date = full_data['ds'].max()
+        # Use forecast_start_date if provided (user's to_date), otherwise use end of data
+        if forecast_start_date is not None:
+            last_date = pd.to_datetime(forecast_start_date).normalize()
+            logger.info(f"📅 Using user-specified forecast start: {last_date}")
+        else:
+            last_date = full_data['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
+        logger.info(f"📅 ETS forecast dates: {future_dates.min()} to {future_dates.max()}")
 
         forecast_data = pd.DataFrame({
             'ds': future_dates,

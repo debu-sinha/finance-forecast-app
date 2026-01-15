@@ -13,7 +13,7 @@ import itertools
 import concurrent.futures
 from mlflow.tracking import MlflowClient
 from mlflow.models.signature import infer_signature
-from backend.preprocessing import enhance_features_for_forecasting, get_derived_feature_columns, prepare_future_features
+from backend.preprocessing import enhance_features_for_forecasting, get_derived_feature_columns, prepare_future_features, build_prophet_holidays_dataframe
 from backend.models.utils import compute_metrics, register_model_to_unity_catalog, analyze_covariate_impact
 
 warnings.filterwarnings('ignore')
@@ -212,20 +212,50 @@ random.seed({random_seed})
     
     return "Code generation logic placeholder - will be filled by subsequent tool call"
 
-def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id):
-    client = MlflowClient()
-    run = client.create_run(experiment_id=experiment_id, tags={"mlflow.parentRunId": parent_run_id, "mlflow.runName": f"Prophet_{params}"})
-    run_id = run.info.run_id
+# Environment variable to control child run logging
+# Set MLFLOW_SKIP_CHILD_RUNS=true to only log the best model (reduces MLflow overhead)
+SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
+
+
+def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False, custom_holidays_df=None):
+    """
+    Evaluate a single hyperparameter combination.
+
+    Args:
+        skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
+        custom_holidays_df: Optional DataFrame with holiday definitions including lower_window/upper_window
+    """
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
+
+    if not skip_mlflow_logging:
+        run = client.create_run(experiment_id=experiment_id, tags={"mlflow.parentRunId": parent_run_id, "mlflow.runName": f"Prophet_{params}"})
+        run_id = run.info.run_id
 
     try:
-        for k, v in params.items(): client.log_param(run_id, k, str(v))
+        if not skip_mlflow_logging:
+            for k, v in params.items(): client.log_param(run_id, k, str(v))
 
-        model = Prophet(seasonality_mode=params['seasonality_mode'], yearly_seasonality=params['yearly_seasonality'],
-                        weekly_seasonality=params['weekly_seasonality'], daily_seasonality=False,
-                        changepoint_prior_scale=params['changepoint_prior_scale'], seasonality_prior_scale=params['seasonality_prior_scale'],
-                        growth=params.get('growth', 'linear'), interval_width=0.95, uncertainty_samples=1000)
-        try: model.add_country_holidays(country_name=country)
-        except: pass
+        # Use custom holidays DataFrame with multi-day effect windows if provided
+        model = Prophet(
+            seasonality_mode=params['seasonality_mode'],
+            yearly_seasonality=params['yearly_seasonality'],
+            weekly_seasonality=params['weekly_seasonality'],
+            daily_seasonality=False,
+            changepoint_prior_scale=params['changepoint_prior_scale'],
+            seasonality_prior_scale=params['seasonality_prior_scale'],
+            growth=params.get('growth', 'linear'),
+            interval_width=0.95,
+            uncertainty_samples=1000,
+            holidays=custom_holidays_df  # Multi-day holiday effects with windows
+        )
+
+        # Only add country holidays if no custom holidays provided
+        if custom_holidays_df is None:
+            try:
+                model.add_country_holidays(country_name=country)
+            except:
+                pass
 
         # Make copies to avoid modifying originals (since they're shared across threads)
         train_df_local = train_df.copy()
@@ -256,17 +286,19 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         # Use test_df_local which has NaN-filled lag columns
         test_future = test_df_local[['ds'] + added_regressors].copy()
         metrics = compute_metrics(test_df_local['y'].values, model.predict(test_future)['yhat'].values)
-        
-        for k, v in metrics.items(): client.log_metric(run_id, k, v)
-        client.set_terminated(run_id)
-        
+
+        if not skip_mlflow_logging:
+            for k, v in metrics.items(): client.log_metric(run_id, k, v)
+            client.set_terminated(run_id)
+
         return {"params": params, "metrics": metrics, "run_id": run_id, "model": model, "status": "SUCCESS"}
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
-        client.set_terminated(run_id, status="FAILED")
+        if not skip_mlflow_logging and run_id:
+            client.set_terminated(run_id, status="FAILED")
         return {"params": params, "metrics": None, "run_id": run_id, "status": "FAILED", "error": str(e)}
 
-def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None):
+def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None, forecast_start_date=None):
     # Set global random seeds for reproducibility
     np.random.seed(random_seed)
     import random
@@ -339,9 +371,25 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     logger.info(f"Preprocessing added {len(covariates) - len(original_covariates)} derived features: {[c for c in covariates if c not in original_covariates]}")
 
     history_df = df.dropna(subset=['y']).copy()
-    
-    if test_size is None: test_size = min(horizon, len(history_df) // 5)
-    train_df, test_df = history_df.iloc[:-test_size].copy(), history_df.iloc[-test_size:].copy()
+
+    # Use pre-split data from main.py if provided, otherwise do our own split
+    if train_df_override is not None and test_df_override is not None:
+        # Align with the split dates from main.py
+        # The override DataFrames have 'ds' and 'y' columns already
+        train_end_date = train_df_override['ds'].max()
+        test_start_date = test_df_override['ds'].min()
+
+        train_df = history_df[history_df['ds'] <= train_end_date].copy()
+        test_df = history_df[(history_df['ds'] >= test_start_date) & (history_df['ds'] <= test_df_override['ds'].max())].copy()
+        test_size = len(test_df)
+
+        logger.info(f"📊 Using pre-split data from main.py: train={len(train_df)}, eval={len(test_df)}")
+        logger.info(f"   Train ends: {train_end_date}, Eval starts: {test_start_date}")
+    else:
+        # Legacy behavior: do our own split
+        if test_size is None: test_size = min(horizon, len(history_df) // 5)
+        train_df, test_df = history_df.iloc[:-test_size].copy(), history_df.iloc[-test_size:].copy()
+        logger.info(f"📊 Prophet doing internal split: train={len(train_df)}, eval={len(test_df)}")
 
     valid_covariates = []
     for cov in covariates:
@@ -362,6 +410,22 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
 
     if lag_cols:
         logger.info(f"Filled NaN values with 0 in lag features: {lag_cols}")
+
+    # =========================================================================
+    # BUILD CUSTOM HOLIDAYS DATAFRAME WITH MULTI-DAY EFFECT WINDOWS
+    # This gives Prophet better handling of holidays like Thanksgiving/Christmas
+    # where effects span multiple days (pre-holiday shopping, holiday itself, post-holiday)
+    # =========================================================================
+    custom_holidays_df = None
+    try:
+        # Get date range from the data
+        start_year = int(history_df['ds'].min().year) - 1
+        end_year = int(history_df['ds'].max().year) + 2  # +2 for forecast horizon
+        custom_holidays_df = build_prophet_holidays_dataframe(start_year, end_year, country)
+        logger.info(f"📅 Built custom holidays DataFrame with multi-day windows: {len(custom_holidays_df)} entries")
+    except Exception as e:
+        logger.warning(f"Could not build custom holidays DataFrame, using default: {e}")
+        custom_holidays_df = None
 
     # Note: Don't call mlflow.set_experiment() here - main.py already sets the correct experiment
     # (including batch-specific experiments). Calling it here would override the batch experiment.
@@ -397,14 +461,33 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         except Exception as e:
             logger.warning(f"Could not log datasets: {e}")
 
-        # Hyperparameter tuning
-        param_grid = {
+        # Hyperparameter tuning - use filtered values if provided from data analysis
+        prophet_filters = (hyperparameter_filters or {}).get('Prophet', {})
+
+        # Default param_grid values
+        default_param_grid = {
             'changepoint_prior_scale': [0.001, 0.01, 0.05, 0.1, 0.5],
             'seasonality_prior_scale': [0.01, 0.1, 1.0, 10.0],
             'seasonality_mode': ['additive', 'multiplicative'] if seasonality_mode == 'multiplicative' else ['additive'],
             'yearly_seasonality': [True, False],
             'weekly_seasonality': [True, False]
         }
+
+        # Apply filters from data analysis if provided
+        param_grid = {}
+        for param_name, default_values in default_param_grid.items():
+            if param_name in prophet_filters:
+                filtered_values = prophet_filters[param_name]
+                # Ensure filtered values is a list
+                if not isinstance(filtered_values, list):
+                    filtered_values = [filtered_values]
+                param_grid[param_name] = filtered_values
+                logger.info(f"📊 Using data-driven filter for {param_name}: {filtered_values}")
+            else:
+                param_grid[param_name] = default_values
+
+        if prophet_filters:
+            logger.info(f"📊 Applied {len(prophet_filters)} hyperparameter filters from data analysis")
         
         keys, values = zip(*param_grid.items())
         param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
@@ -421,13 +504,18 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         best_model = None
         
         # Parallel execution
+        # If MLFLOW_SKIP_CHILD_RUNS=true, we only log the best model (reduces MLflow overhead significantly)
         max_workers = int(os.environ.get("MLFLOW_MAX_WORKERS", "4"))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
-                    evaluate_param_set, 
-                    params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id
-                ) 
+                    evaluate_param_set,
+                    params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id,
+                    skip_mlflow_logging=SKIP_CHILD_RUNS,
+                    custom_holidays_df=custom_holidays_df  # Pass multi-day holiday windows
+                )
                 for params in param_combinations
             ]
             
@@ -446,7 +534,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Cross-validation
         from mlflow.models import infer_signature
         
-        # Final model training on FULL history
+        # Final model training on FULL history with multi-day holiday effects
         final_model = Prophet(
             seasonality_mode=best_params['seasonality_mode'],
             yearly_seasonality=best_params['yearly_seasonality'],
@@ -456,19 +544,33 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             seasonality_prior_scale=best_params['seasonality_prior_scale'],
             growth=best_params.get('growth', 'linear'),
             interval_width=0.95,
-            uncertainty_samples=1000
+            uncertainty_samples=1000,
+            holidays=custom_holidays_df  # Use multi-day holiday windows
         )
-        try: final_model.add_country_holidays(country_name=country)
-        except: pass
+        # Only add country holidays if no custom holidays provided
+        if custom_holidays_df is None:
+            try:
+                final_model.add_country_holidays(country_name=country)
+            except:
+                pass
         
         for cov in covariates:
             if cov in history_df.columns:
                 final_model.add_regressor(cov)
         
         final_model.fit(history_df)
-        
-        # Forecast
-        future = final_model.make_future_dataframe(periods=horizon, freq=freq_code)
+
+        # Forecast - generate dates starting from forecast_start_date if provided
+        # This ensures forecasts start from user's specified end_date, not from training data end
+        if forecast_start_date is not None:
+            # Use user-specified forecast start date
+            start_date = pd.to_datetime(forecast_start_date).normalize()
+            future_dates = pd.date_range(start=start_date, periods=horizon + 1, freq=freq_code)[1:]
+            future = pd.DataFrame({'ds': future_dates})
+            logger.info(f"📅 Forecast dates: {start_date} + {horizon} periods -> {future['ds'].min()} to {future['ds'].max()}")
+        else:
+            # Fallback to Prophet's default behavior (from end of training data)
+            future = final_model.make_future_dataframe(periods=horizon, freq=freq_code)
         
         # Add future covariates
         # Use simple mean for now, or use provided future_df if available
@@ -479,18 +581,62 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Let's assume we use the simple logic for now to save space, 
         # or I can copy `create_future_dataframe` if I have it.
         # I'll use a simplified version here.
+        # =========================================================================
+        # CRITICAL FIX: Generate proper future features instead of using means
+        # Using means for covariates causes FLAT FORECASTS because:
+        # - Holiday indicators should be 1/0, not 0.02 (mean)
+        # - Calendar features should vary, not be constant
+        # =========================================================================
+        logger.info(f"📅 Generating future features for {len(future)} forecast periods...")
+
+        # First, generate calendar and holiday features for future dates
+        future_with_features = future.copy()
+        future_with_features['y'] = 0  # Placeholder for feature generation
+
+        try:
+            # Use the same preprocessing as training to generate derived features
+            future_with_features = enhance_features_for_forecasting(
+                df=future_with_features,
+                date_col='ds',
+                target_col='y',
+                promo_cols=[],  # Don't process user covariates here
+                frequency=frequency
+            )
+            logger.info(f"✅ Generated {len(future_with_features.columns)} features for future dates")
+
+            # Copy generated features to future dataframe
+            for col in future_with_features.columns:
+                if col not in ['ds', 'y'] and col in history_df.columns:
+                    future[col] = future_with_features[col].values
+                    logger.info(f"   Added derived feature '{col}' to future")
+
+        except Exception as e:
+            logger.warning(f"Could not generate future derived features: {e}. Using historical means.")
+
+        # For user-provided covariates that weren't auto-generated, use mapping or means
         for cov in covariates:
-            if cov in history_df.columns:
+            if cov in history_df.columns and cov not in future.columns:
                 # If we have future values in df (from future_features), use them
-                # Map from df to future based on ds
                 future = future.set_index('ds')
                 # Create a map from df
                 cov_map = df.set_index('ds')[cov]
                 # Update future with values from df where available
                 future[cov] = future.index.map(cov_map)
-                # Fill remaining NaNs with mean
-                future[cov] = future[cov].fillna(history_df[cov].mean())
+                # Fill remaining NaNs with mean (only for truly unknown covariates)
+                if future[cov].isna().any():
+                    mean_val = history_df[cov].mean()
+                    future[cov] = future[cov].fillna(mean_val)
+                    logger.info(f"   User covariate '{cov}': filled NaN with mean={mean_val:.4f}")
                 future = future.reset_index()
+
+        # Log a sample of future features to verify they vary
+        if len(future) > 0:
+            sample_cols = [c for c in ['is_thanksgiving_week', 'is_christmas_week', 'is_weekend', 'day_of_week', 'month'] if c in future.columns]
+            if sample_cols:
+                logger.info(f"📊 Future feature sample (first 3 rows):")
+                for col in sample_cols[:3]:
+                    vals = future[col].head(3).tolist()
+                    logger.info(f"   {col}: {vals}")
 
         forecast = final_model.predict(future)
         

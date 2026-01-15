@@ -1,5 +1,23 @@
 # Simple Mode Design: Autopilot Forecasting
 
+> **Status: IMPLEMENTED** - All core features are live in v1.2.0
+
+---
+
+## Implementation Status
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Data Profiler | ✅ Implemented | `backend/simple_mode/data_profiler.py` |
+| Autopilot Config | ✅ Implemented | `backend/simple_mode/autopilot_config.py` |
+| Forecast Explainer | ✅ Implemented | `backend/simple_mode/forecast_explainer.py` |
+| Excel Exporter | ✅ Implemented | `backend/simple_mode/excel_exporter.py` |
+| API Endpoints | ✅ Implemented | `backend/simple_mode/api.py` |
+| Mode Toggle UI | ✅ Implemented | `App.tsx` |
+| By-Slice Forecasting | ✅ Implemented | Multi-segment support |
+
+---
+
 ## Executive Summary
 
 Finance users currently use Excel/Google Sheets for forecasting because:
@@ -17,56 +35,44 @@ Our ML system must match or exceed these properties while delivering better accu
 ### 1. Deterministic Reproducibility
 Every forecast must be 100% reproducible. Given the same inputs, produce identical outputs.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     REPRODUCIBILITY CONTRACT                     │
-├─────────────────────────────────────────────────────────────────┤
-│  Input Hash + Config Hash + Model Version = Deterministic Output │
-│                                                                  │
-│  • Fixed random seeds (no stochastic variance between runs)      │
-│  • Versioned model artifacts (immutable once created)            │
-│  • Configuration snapshot stored with every run                  │
-│  • Data fingerprint (hash) logged for audit                      │
-└─────────────────────────────────────────────────────────────────┘
-```
+**Reproducibility Contract:**
+- Input Hash + Config Hash + Model Version = Deterministic Output
+- Fixed random seeds (no stochastic variance between runs)
+- Versioned model artifacts (immutable once created)
+- Configuration snapshot stored with every run
+- Data fingerprint (hash) logged for audit
 
 ### 2. Excel-Level Transparency
 Users must be able to understand and explain every forecast number.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     TRANSPARENCY LAYERS                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Level 1: Summary     "Forecast: $1.2M for Q1 2025"             │
-│  Level 2: Components  "Base: $1.0M + Trend: +$150K + Holiday: +$50K" │
-│  Level 3: Audit Trail  Full config, data hash, model params     │
-│  Level 4: Export       Download as Excel with formulas          │
-└─────────────────────────────────────────────────────────────────┘
-```
+**Transparency Layers:**
+| Level | Description | Example |
+|-------|-------------|---------|
+| 1. Summary | High-level forecast | "Forecast: $1.2M for Q1 2025" |
+| 2. Components | Breakdown | "Base: $1.0M + Trend: +$150K + Holiday: +$50K" |
+| 3. Audit Trail | Technical details | Full config, data hash, model params |
+| 4. Export | Downloadable | Excel with formulas |
 
 ### 3. Progressive Disclosure
 Simple by default, complexity available on demand.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                  │
-│   ┌─────────────┐                    ┌─────────────┐            │
-│   │   SIMPLE    │ ←── Toggle ───→    │   EXPERT    │            │
-│   │    MODE     │                    │    MODE     │            │
-│   └─────────────┘                    └─────────────┘            │
-│         │                                   │                    │
-│         ▼                                   ▼                    │
-│   • Upload data                       • Full parameter control   │
-│   • Click "Forecast"                  • Model selection          │
-│   • Get results                       • Hyperparameter tuning    │
-│         │                                   │                    │
-│         └───────────┬───────────────────────┘                    │
-│                     ▼                                            │
-│            SAME OUTPUT FORMAT                                    │
-│            SAME REPRODUCIBILITY                                  │
-│            SAME AUDIT TRAIL                                      │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph modes["Mode Selection"]
+        simple["Simple Mode"]
+        expert["Expert Mode"]
+    end
+
+    simple --> s1["Upload data"]
+    simple --> s2["Click Forecast"]
+    simple --> s3["Get results"]
+
+    expert --> e1["Full parameter control"]
+    expert --> e2["Model selection"]
+    expert --> e3["Hyperparameter tuning"]
+
+    s3 --> output["Same Output Format<br/>Same Reproducibility<br/>Same Audit Trail"]
+    e3 --> output
 ```
 
 ---
@@ -75,27 +81,40 @@ Simple by default, complexity available on demand.
 
 ### High-Level Flow
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                            SIMPLE MODE FLOW                               │
-└──────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph input["Step 1: Input"]
+        upload["Upload Data"]
+        profiler["Data Profiler"]
+    end
 
-     ┌──────────┐      ┌──────────────┐      ┌──────────────┐
-     │  Upload  │ ───▶ │   Autopilot  │ ───▶ │   Results    │
-     │   Data   │      │    Engine    │      │   + Audit    │
-     └──────────┘      └──────────────┘      └──────────────┘
-           │                  │                     │
-           ▼                  ▼                     ▼
-     ┌──────────┐      ┌──────────────┐      ┌──────────────┐
-     │  Data    │      │  Auto-Config │      │  Forecast    │
-     │  Profiler│      │  Generator   │      │  Explainer   │
-     └──────────┘      └──────────────┘      └──────────────┘
-           │                  │                     │
-           ▼                  ▼                     ▼
-     • Detect freq      • Select models      • Plain English
-     • Find holidays    • Set parameters     • Decomposition
-     • Check quality    • Validate config    • Excel export
-     • Flag issues      • Log everything     • Audit trail
+    subgraph process["Step 2: Processing"]
+        autopilot["Autopilot Engine"]
+        config["Auto-Config Generator"]
+    end
+
+    subgraph output["Step 3: Output"]
+        results["Results + Audit"]
+        explainer["Forecast Explainer"]
+    end
+
+    upload --> profiler
+    profiler --> autopilot
+    autopilot --> config
+    config --> results
+    results --> explainer
+
+    profiler -.-> p1["Detect frequency"]
+    profiler -.-> p2["Find holidays"]
+    profiler -.-> p3["Check quality"]
+
+    config -.-> c1["Select models"]
+    config -.-> c2["Set parameters"]
+    config -.-> c3["Log everything"]
+
+    explainer -.-> e1["Plain English"]
+    explainer -.-> e2["Decomposition"]
+    explainer -.-> e3["Excel export"]
 ```
 
 ### Component Design
@@ -418,154 +437,74 @@ class ExcelExporter:
 
 ### Mode Toggle
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        FORECAST CONFIGURATION                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │                                                                  │   │
-│   │     ○ Simple Mode                    ● Expert Mode              │   │
-│   │       (Recommended)                    (Full Control)           │   │
-│   │                                                                  │   │
-│   │     "Upload data and get            "Configure models,          │   │
-│   │      accurate forecasts              parameters, and            │   │
-│   │      automatically"                  training options"          │   │
-│   │                                                                  │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+Users select between Simple and Expert modes via a toggle at the top of the interface:
+
+| Mode | Target User | Description |
+|------|-------------|-------------|
+| Simple Mode (Recommended) | Finance users | Upload data and get accurate forecasts automatically |
+| Expert Mode | Data scientists | Full control over models, parameters, and training options |
+
+### Simple Mode Workflow
+
+```mermaid
+flowchart TD
+    A["Step 1: Upload Data"] --> B["Step 2: Review Auto-Detected Settings"]
+    B --> C["Step 3: Select Forecast Horizon"]
+    C --> D["Generate Forecast"]
+
+    B -.-> B1["Frequency: Weekly"]
+    B -.-> B2["Date Column: week_start"]
+    B -.-> B3["Target Column: revenue"]
+    B -.-> B4["Warnings if applicable"]
 ```
 
-### Simple Mode UI
+**Auto-detected settings include:**
+- Frequency (daily/weekly/monthly)
+- Date and target columns
+- History length and quality score
+- Data quality warnings
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         SIMPLE MODE                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  STEP 1: Upload Your Data                                               │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                                                                  │   │
-│  │     📁 Drag & drop your CSV/Excel file here                     │   │
-│  │                                                                  │   │
-│  │     Supported: .csv, .xlsx                                      │   │
-│  │     Required: Date column + Value column                        │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                          │
-│  STEP 2: Auto-Detected Settings                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  ✅ Frequency: Weekly (detected from data)                      │   │
-│  │  ✅ Date Column: "week_start"                                   │   │
-│  │  ✅ Target Column: "revenue"                                    │   │
-│  │  ✅ History: 18 months (Jan 2024 - Jul 2025)                    │   │
-│  │                                                                  │   │
-│  │  ⚠️  Warning: Only 1 Thanksgiving in data.                      │   │
-│  │     Holiday forecasts may be less accurate.                     │   │
-│  │     [Learn more]                                                │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                          │
-│  STEP 3: Forecast Horizon                                               │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                                                                  │   │
-│  │     How far ahead to forecast?                                  │   │
-│  │                                                                  │   │
-│  │     [  4 weeks  ] [  12 weeks  ] [  26 weeks  ] [ Custom ]      │   │
-│  │                      (recommended)                               │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│                                                                          │
-│               [ 🚀 Generate Forecast ]                                  │
-│                                                                          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+### Results View
+
+Both modes display the same results format:
+
+```mermaid
+flowchart TB
+    subgraph summary["Summary Section"]
+        s1["Total Forecast Value"]
+        s2["Trend Direction"]
+        s3["Confidence Level (MAPE)"]
+        s4["Best Model"]
+    end
+
+    subgraph chart["Visualization"]
+        c1["Historical vs Forecast Chart"]
+        c2["Confidence Intervals"]
+    end
+
+    subgraph explain["Explanation"]
+        e1["Forecast = Base + Trend + Seasonality + Holiday"]
+        e2["Per-period breakdown"]
+    end
+
+    subgraph export["Export Options"]
+        x1["Download Excel"]
+        x2["Download CSV"]
+        x3["Copy to Clipboard"]
+    end
+
+    subgraph audit["Audit Trail"]
+        a1["Run ID & Timestamp"]
+        a2["Data & Config Hashes"]
+        a3["Model Version & MLflow Link"]
+    end
 ```
 
-### Results View (Same for Both Modes)
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         FORECAST RESULTS                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  📊 SUMMARY                                                              │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                                                                  │   │
-│  │  Total Forecast (12 weeks): $1,245,000                          │   │
-│  │  Trend: ↗️ +5.2% growth                                          │   │
-│  │  Confidence: High (MAPE 4.1%)                                   │   │
-│  │  Best Model: Prophet                                            │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  📈 FORECAST CHART                                                       │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                                                                  │   │
-│  │     $120K ─┤                                    ╱──────         │   │
-│  │            │                               ╱───╱                │   │
-│  │     $100K ─┤              ╱───╲       ╱───╱                     │   │
-│  │            │         ╱───╱    ╲──╱───╱                          │   │
-│  │      $80K ─┤    ╱───╱                                           │   │
-│  │            │───╱                                                │   │
-│  │            ├────────────────────┬────────────────────           │   │
-│  │            Jan    Apr    Jul    Oct    Jan    Apr               │   │
-│  │                   2024                 2025                     │   │
-│  │                                                                  │   │
-│  │            ─── Historical    ─── Forecast    ░░░ Confidence     │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  📋 HOW THIS FORECAST WAS CALCULATED                                    │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                                                                  │   │
-│  │  Forecast = Base + Trend + Seasonality + Holiday Effect         │   │
-│  │                                                                  │   │
-│  │  Example: Week of Nov 25, 2025 (Thanksgiving)                   │   │
-│  │  • Base:        $95,000  (average weekly revenue)               │   │
-│  │  • Trend:       +$4,800  (5.2% growth factor)                   │   │
-│  │  • Seasonality: +$2,200  (Q4 typical uplift)                    │   │
-│  │  • Holiday:    +$18,000  (Thanksgiving effect)                  │   │
-│  │  • TOTAL:      $120,000                                         │   │
-│  │                                                                  │   │
-│  │  [View All Periods ▼]                                           │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                          │
-│  📥 EXPORT OPTIONS                                                       │
-│                                                                          │
-│  [ 📊 Download Excel ]  [ 📄 Download CSV ]  [ 📋 Copy to Clipboard ]   │
-│                                                                          │
-│  Excel includes:                                                        │
-│  • Summary sheet                                                        │
-│  • Detailed forecast with formulas                                      │
-│  • Component breakdown                                                  │
-│  • Audit trail for compliance                                           │
-│                                                                          │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                          │
-│  🔍 AUDIT TRAIL                                              [Expand ▼] │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Run ID: abc123-def456                                          │   │
-│  │  Timestamp: 2025-12-14 10:30:00 UTC                             │   │
-│  │  Data Hash: sha256:7f83b1657...                                 │   │
-│  │  Config Hash: sha256:2c26b46b...                                │   │
-│  │  Model: Prophet v1.1.0                                          │   │
-│  │  MLflow Run: https://mlflow.../runs/abc123                      │   │
-│  │                                                                  │   │
-│  │  ✅ Reproducible: Re-run with same inputs = identical output    │   │
-│  │                                                                  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+**Excel export includes:**
+- Summary sheet
+- Detailed forecast with formulas
+- Component breakdown
+- Audit trail for compliance
 
 ---
 
@@ -796,43 +735,48 @@ def compute_data_hash(df: pd.DataFrame) -> str:
 
 ## Migration Path
 
-### Phase 1: Add Simple Mode Toggle (Week 1)
+### Phase 1: Add Simple Mode Toggle ✅ COMPLETE
 - Add mode toggle to UI
 - Simple mode uses same backend with auto-config
 - Expert mode unchanged
 
-### Phase 2: Add Data Profiler (Week 2)
+### Phase 2: Add Data Profiler ✅ COMPLETE
 - Implement auto-detection of frequency, columns
 - Add data quality warnings
 - Show detected settings to user
 
-### Phase 3: Add Forecast Explainer (Week 3)
+### Phase 3: Add Forecast Explainer ✅ COMPLETE
 - Component decomposition
 - Plain English summaries
 - Formula breakdown
 
-### Phase 4: Add Excel Export (Week 4)
+### Phase 4: Add Excel Export ✅ COMPLETE
 - Multi-sheet Excel export
 - Formulas in cells
 - Audit trail sheet
 
-### Phase 5: Add Reproducibility (Week 5)
+### Phase 5: Add Reproducibility ✅ COMPLETE
 - Run ID tracking
 - Config snapshots
 - Reproduce endpoint
+
+### Phase 6: By-Slice Forecasting ✅ COMPLETE (Added Dec 2024)
+- Multi-segment support
+- Per-slice model selection
+- Aggregated results view
 
 ---
 
 ## Success Metrics
 
-| Metric | Current | Target |
-|--------|---------|--------|
-| Time to first forecast | 10+ mins (configure) | < 2 mins (upload + click) |
-| User errors | Frequent | Rare (guardrails) |
-| Support tickets | High | Low (self-explanatory) |
-| Adoption by finance users | Low | High |
-| Reproducibility | Manual | 100% automatic |
-| Audit compliance | Manual tracking | Built-in |
+| Metric | Before | Target | Achieved |
+|--------|--------|--------|----------|
+| Time to first forecast | 10+ mins (configure) | < 2 mins (upload + click) | ✅ ~1-2 mins |
+| User errors | Frequent | Rare (guardrails) | ✅ Auto-validation |
+| Support tickets | High | Low (self-explanatory) | ✅ Self-service |
+| Adoption by finance users | Low | High | 🔄 In progress |
+| Reproducibility | Manual | 100% automatic | ✅ Built-in |
+| Audit compliance | Manual tracking | Built-in | ✅ Full audit trail |
 
 ---
 

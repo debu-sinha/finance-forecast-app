@@ -1,77 +1,86 @@
 # Scalable Architecture for Finance Forecasting App
 
-## Current Architecture (Limited)
+> **Status: PLANNED** - Design document for future scaling improvements
 
+---
+
+## Implementation Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| In-App Batch Training | ✅ Implemented | Sequential with progress tracking |
+| Router Model Deployment | ✅ Implemented | Single endpoint for all segments |
+| Pre-deployment Testing | ✅ Implemented | Validates models before registration |
+| Serverless Job Offload | 🔄 Planned | Future enhancement |
+| Event-Driven Retraining | 🔄 Planned | Future enhancement |
+
+---
+
+## Current Architecture (Optimized)
+
+```mermaid
+flowchart TB
+    subgraph app["Databricks App (Large: 4 vCPU / 12GB RAM)"]
+        fastapi["FastAPI Backend"]
+        react["React Frontend"]
+        training["Model Training (in-process)"]
+    end
+
+    fastapi --> mlflow["MLflow"]
+    training --> mlflow
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Databricks App (Large)                   │
-│                   4 vCPU / 12GB RAM max                     │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │   FastAPI   │  │   React     │  │   Model Training    │  │
-│  │   Backend   │  │   Frontend  │  │   (in-process)      │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│                           │                                 │
-│                           ▼                                 │
-│                    ┌─────────────┐                          │
-│                    │   MLflow    │                          │
-│                    └─────────────┘                          │
-└─────────────────────────────────────────────────────────────┘
 
-Limitations:
+**Current Limitations:**
 - Training blocks the App
 - Max 4 parallel workers
 - Memory constrained to 12GB
-- Can't scale beyond single instance
-```
+- Cannot scale beyond single instance
 
 ---
 
 ## Proposed Scalable Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         SCALABLE FORECASTING PLATFORM                        │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph app["Databricks App (Medium: 2 vCPU / 6GB)"]
+        ui["React UI"]
+        api["FastAPI Orchestrator"]
+    end
 
-┌─────────────────────┐     ┌─────────────────────────────────────────────────┐
-│   Databricks App    │     │          Serverless Compute Pool                │
-│   (UI + API Layer)  │     │         (Auto-scaling Training)                 │
-│   2 vCPU / 6GB      │     │                                                 │
-├─────────────────────┤     │  ┌─────────┐ ┌─────────┐ ┌─────────┐           │
-│                     │     │  │ Job 1   │ │ Job 2   │ │ Job 3   │  ...      │
-│  ┌───────────────┐  │     │  │ Prophet │ │ ARIMA   │ │ XGBoost │           │
-│  │ React UI      │  │     │  │ Seg A   │ │ Seg A   │ │ Seg A   │           │
-│  └───────────────┘  │     │  └────┬────┘ └────┬────┘ └────┬────┘           │
-│         │          │     │       │           │           │                 │
-│  ┌───────────────┐  │────▶│  ┌─────────┐ ┌─────────┐ ┌─────────┐           │
-│  │ FastAPI       │  │     │  │ Job 4   │ │ Job 5   │ │ Job 6   │           │
-│  │ (Orchestrator)│  │     │  │ Prophet │ │ ARIMA   │ │ XGBoost │           │
-│  └───────────────┘  │     │  │ Seg B   │ │ Seg B   │ │ Seg B   │           │
-│         │          │     │  └────┬────┘ └────┬────┘ └────┬────┘           │
-└─────────┼──────────┘     │       │           │           │                 │
-          │                 │       ▼           ▼           ▼                 │
-          │                 │  ┌─────────────────────────────────────────┐   │
-          │                 │  │         Results Collection              │   │
-          │                 │  └─────────────────────────────────────────┘   │
-          │                 └─────────────────────────────────────────────────┘
-          │
-          ▼
-┌─────────────────────┐
-│      MLflow         │
-│  (Tracking Store)   │
-│  - Experiments      │
-│  - Model Registry   │
-│  - Artifacts        │
-└─────────────────────┘
+    subgraph serverless["Serverless Compute Pool (Auto-scaling)"]
+        subgraph segA["Segment A Jobs"]
+            j1["Prophet"]
+            j2["ARIMA"]
+            j3["XGBoost"]
+        end
+        subgraph segB["Segment B Jobs"]
+            j4["Prophet"]
+            j5["ARIMA"]
+            j6["XGBoost"]
+        end
+        results["Results Collection"]
+    end
 
-Benefits:
-✅ App stays responsive (UI never blocked)
-✅ Unlimited parallel training jobs
-✅ Auto-scaling compute (pay per use)
-✅ Each job gets dedicated resources
-✅ No memory constraints per model
+    subgraph mlflow["MLflow"]
+        experiments["Experiments"]
+        registry["Model Registry"]
+        artifacts["Artifacts"]
+    end
+
+    ui --> api
+    api --> serverless
+    j1 & j2 & j3 --> results
+    j4 & j5 & j6 --> results
+    api --> mlflow
+    results --> mlflow
 ```
+
+**Benefits:**
+- App stays responsive (UI never blocked)
+- Unlimited parallel training jobs
+- Auto-scaling compute (pay per use)
+- Each job gets dedicated resources
+- No memory constraints per model
 
 ---
 
@@ -439,6 +448,14 @@ Total: ~600 DBU/month (potentially less if usage is lower)
 
 ## Implementation Checklist
 
+### Already Implemented (v1.1.0)
+- [x] Batch training UI with progress tracking
+- [x] Router model for multi-segment deployment
+- [x] Pre-deployment inference testing
+- [x] Sequential segment processing
+- [x] MAPE statistics across segments
+
+### Future Serverless Migration
 - [ ] Create training notebook in workspace
 - [ ] Package model training code as wheel
 - [ ] Add serverless training service

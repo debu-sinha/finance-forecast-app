@@ -377,6 +377,170 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
     return comparisonResult.rows.filter(r => r.status === filterStatus);
   }, [comparisonResult, filterStatus]);
 
+  // Diagnostic analysis of comparison results - Root Cause Analysis
+  const diagnosticAnalysis = useMemo(() => {
+    if (!comparisonResult || comparisonResult.rows.length === 0) return null;
+
+    const rows = comparisonResult.rows;
+    const issues: Array<{type: 'error' | 'warning' | 'info'; title: string; description: string; recommendation: string}> = [];
+
+    // Calculate aggregate statistics
+    const totalBias = rows.reduce((sum, r) => sum + r.actualBias, 0);
+    const avgBias = rows.length > 0 ? totalBias / rows.length : 0;
+    const biasStdDev = rows.length > 0 ? Math.sqrt(rows.reduce((sum, r) => sum + Math.pow(r.actualBias - avgBias, 2), 0) / rows.length) : 0;
+
+    const positivesBias = rows.filter(r => r.actualBias > 0).length;
+    const negativesBias = rows.filter(r => r.actualBias < 0).length;
+    const totalBiasCount = positivesBias + negativesBias;
+    const biasRatio = totalBiasCount > 0 ? positivesBias / totalBiasCount : 0.5;
+
+    const highMapeSegments = rows.filter(r => r.actualMAPE > 20);
+    const veryHighMapeSegments = rows.filter(r => r.actualMAPE > 30);
+    const moderateMapeSegments = rows.filter(r => r.actualMAPE > 15 && r.actualMAPE <= 30);
+
+    // Calculate MAPE std dev
+    const mapeStdDev = rows.length > 0 ? Math.sqrt(rows.reduce((sum, r) => sum + Math.pow(r.actualMAPE - comparisonResult.overallMAPE, 2), 0) / rows.length) : 0;
+
+    // Calculate training vs actual drift
+    const trainActualDrifts = rows.map(r => r.actualMAPE - parseFloat(r.forecastMAPE || '0'));
+    const avgDrift = trainActualDrifts.length > 0 ? trainActualDrifts.reduce((a, b) => a + b, 0) / trainActualDrifts.length : 0;
+
+    // Check for no matched periods first - this is critical
+    const noMatchSegments = rows.filter(r => r.periodsCompared === 0);
+    const matchedSegments = rows.filter(r => r.periodsCompared > 0);
+
+    // 0. Always show overall summary first
+    const excellentGoodCount = comparisonResult.segmentsByStatus.excellent + comparisonResult.segmentsByStatus.good;
+    const problemCount = comparisonResult.segmentsByStatus.review + comparisonResult.segmentsByStatus.significant_deviation;
+
+    if (problemCount > 0 || noMatchSegments.length > 0) {
+      issues.push({
+        type: problemCount > rows.length * 0.3 ? 'error' : 'warning',
+        title: 'Root Cause Analysis Summary',
+        description: `Analyzed ${rows.length} segments: ${excellentGoodCount} performing well, ${comparisonResult.segmentsByStatus.acceptable} acceptable, ${problemCount} need attention${noMatchSegments.length > 0 ? `, ${noMatchSegments.length} have no data to compare` : ''}.`,
+        recommendation: 'Review the specific issues below to understand what may be causing forecast deviations from actuals.'
+      });
+    }
+
+    // 1. Check for no matched periods - often the biggest issue
+    if (noMatchSegments.length > 0) {
+      const percentage = ((noMatchSegments.length / rows.length) * 100).toFixed(0);
+      issues.push({
+        type: 'error',
+        title: `${noMatchSegments.length} Segments (${percentage}%) Have No Overlapping Dates`,
+        description: `Forecast dates don't align with actuals dates for: ${noMatchSegments.slice(0, 3).map(s => s.segmentId).join(', ')}${noMatchSegments.length > 3 ? ` and ${noMatchSegments.length - 3} more` : ''}.`,
+        recommendation: 'Root causes: (1) Forecast horizon is different from actuals period - check date ranges, (2) Date format mismatch between forecast (ds column) and actuals file, (3) Weekly aggregation alignment - forecasts may be on different weekday than actuals, (4) Model training failed for these segments.'
+      });
+    }
+
+    // Only continue detailed analysis if we have matched data
+    if (matchedSegments.length > 0) {
+      // 2. Check for systematic bias - most common root cause
+      if (biasRatio > 0.65 && totalBiasCount >= 3) {
+        issues.push({
+          type: 'warning',
+          title: 'Systematic Under-Forecasting Pattern',
+          description: `${(biasRatio * 100).toFixed(0)}% of segments show actual > forecast. Average under-prediction: ${Math.abs(avgBias).toFixed(1)} units.`,
+          recommendation: 'Root causes: (1) Recent demand growth not in training data - consider more recent training data, (2) Missing promotional/event features - actuals may include promotions not modeled, (3) Seasonality shift - holiday patterns may have changed, (4) New product launch or market expansion effects.'
+        });
+      } else if (biasRatio < 0.35 && totalBiasCount >= 3) {
+        issues.push({
+          type: 'warning',
+          title: 'Systematic Over-Forecasting Pattern',
+          description: `${((1 - biasRatio) * 100).toFixed(0)}% of segments show actual < forecast. Average over-prediction: ${Math.abs(avgBias).toFixed(1)} units.`,
+          recommendation: 'Root causes: (1) Recent demand decline not captured - market may have shifted, (2) Supply constraints in actuals - stockouts reduce actual sales, (3) Competition or substitution effects, (4) Promotional period in training not repeated in forecast period.'
+        });
+      }
+
+      // 3. Check for high variance
+      if (mapeStdDev > 12 && rows.length >= 3) {
+        issues.push({
+          type: 'warning',
+          title: 'Inconsistent Accuracy Across Segments',
+          description: `MAPE ranges widely (std dev: ${mapeStdDev.toFixed(1)}%). Best: ${Math.min(...rows.map(r => r.actualMAPE)).toFixed(1)}%, Worst: ${Math.max(...rows.map(r => r.actualMAPE)).toFixed(1)}%.`,
+          recommendation: 'Root causes: (1) Some segments have sparse or irregular data - check data volume per segment, (2) Different segments need different models - consider segment-specific training, (3) Data quality varies by segment - audit outliers in problem segments, (4) Some segments may have structural changes (new stores, products).'
+        });
+      }
+
+      // 4. Check for segments with very high error
+      if (veryHighMapeSegments.length > 0) {
+        const worstSegments = veryHighMapeSegments
+          .sort((a, b) => b.actualMAPE - a.actualMAPE)
+          .slice(0, 3)
+          .map(s => `${s.segmentId} (${s.actualMAPE.toFixed(1)}%)`);
+
+        issues.push({
+          type: 'error',
+          title: `${veryHighMapeSegments.length} Segments with Major Deviations (>30% MAPE)`,
+          description: `Problem segments: ${worstSegments.join(', ')}`,
+          recommendation: 'Investigate these segments: (1) Check for data anomalies or outliers in training data, (2) Look for one-time events affecting actuals (promotions, stockouts), (3) Verify actuals data is correct for these segments, (4) Consider excluding from batch or modeling separately with different features.'
+        });
+      } else if (moderateMapeSegments.length > rows.length * 0.3) {
+        issues.push({
+          type: 'warning',
+          title: `${moderateMapeSegments.length} Segments with Moderate Deviations (15-30% MAPE)`,
+          description: `${((moderateMapeSegments.length / rows.length) * 100).toFixed(0)}% of segments have acceptable but improvable accuracy.`,
+          recommendation: 'Consider: (1) Adding more features or regressors, (2) Tuning hyperparameters for these segments, (3) Using longer training history if available.'
+        });
+      }
+
+      // 5. Check training vs actual MAPE drift
+      const significantDriftSegments = rows.filter(r => Math.abs(r.actualMAPE - parseFloat(r.forecastMAPE || '0')) > 10);
+      if (avgDrift > 8 && significantDriftSegments.length > 0) {
+        issues.push({
+          type: 'warning',
+          title: 'Models Performing Worse on Actuals Than Training',
+          description: `Actual MAPE is ${avgDrift.toFixed(1)}% higher than training MAPE on average. ${significantDriftSegments.length} segments show >10% degradation.`,
+          recommendation: 'Root causes: (1) Overfitting - models learned training patterns too specifically, (2) Data drift - recent actuals have different patterns than training period, (3) Concept drift - relationships between features and target have changed, (4) Try simpler models or regularization.'
+        });
+      } else if (avgDrift < -8) {
+        issues.push({
+          type: 'info',
+          title: 'Models Outperforming Training Expectations',
+          description: `Actual MAPE is ${Math.abs(avgDrift).toFixed(1)}% better than training MAPE.`,
+          recommendation: 'This is positive - actuals period may have more stable/predictable patterns. Training metrics may be conservative estimates.'
+        });
+      }
+
+      // 6. Check for bias-dominated errors
+      const highBiasSegments = matchedSegments.filter(r => r.actualRMSE > 0 && Math.abs(r.actualBias) > r.actualRMSE * 0.7);
+      if (highBiasSegments.length > matchedSegments.length * 0.3 && highBiasSegments.length >= 2) {
+        issues.push({
+          type: 'info',
+          title: 'Errors Are Primarily Systematic (Not Random)',
+          description: `${highBiasSegments.length} segments (${((highBiasSegments.length / matchedSegments.length) * 100).toFixed(0)}%) have bias as the main error source.`,
+          recommendation: 'Systematic errors are easier to fix than random errors: (1) Add trend components if missing, (2) Include level adjustment features, (3) Consider multiplicative seasonality mode, (4) Bias correction post-processing could help.'
+        });
+      }
+    }
+
+    // 7. Success message if no issues
+    if (issues.length === 0) {
+      issues.push({
+        type: 'info',
+        title: 'Forecast Performance is Strong',
+        description: `Overall MAPE of ${comparisonResult.overallMAPE.toFixed(1)}% with ${excellentGoodCount} of ${rows.length} segments performing well.`,
+        recommendation: 'Continue monitoring accuracy over time. Consider retraining periodically as more data becomes available.'
+      });
+    }
+
+    return {
+      issues,
+      stats: {
+        avgBias,
+        biasStdDev,
+        mapeStdDev,
+        biasRatio,
+        avgDrift,
+        highMapeCount: highMapeSegments.length,
+        noMatchCount: noMatchSegments.length,
+        matchedCount: matchedSegments.length
+      }
+    };
+  }, [comparisonResult]);
+
+  const [showDiagnostics, setShowDiagnostics] = useState(true);
+
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
@@ -570,6 +734,101 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
                   </span>
                 </div>
               </div>
+
+              {/* Root Cause Analysis Section */}
+              {diagnosticAnalysis && (
+                <div className="bg-white rounded-lg border border-gray-200 border-l-4 border-l-amber-400">
+                  <div
+                    className="px-4 py-3 border-b border-gray-100 flex items-center justify-between cursor-pointer hover:bg-gray-50 bg-amber-50"
+                    onClick={() => setShowDiagnostics(!showDiagnostics)}
+                  >
+                    <h3 className="text-sm font-semibold text-gray-700 flex items-center">
+                      <AlertTriangle className="w-4 h-4 mr-2 text-amber-600" />
+                      Root Cause Analysis - Why Are Forecasts Deviating From Actuals?
+                    </h3>
+                    <button className="text-gray-500 hover:text-gray-700">
+                      {showDiagnostics ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </button>
+                  </div>
+
+                  {showDiagnostics && (
+                    <div className="p-4 space-y-3">
+                      {/* Quick Stats */}
+                      <div className="grid grid-cols-4 gap-2 mb-4">
+                        <div className="bg-gray-50 rounded p-2 text-center">
+                          <div className={`text-sm font-bold ${diagnosticAnalysis.stats.avgBias > 0 ? 'text-orange-600' : diagnosticAnalysis.stats.avgBias < 0 ? 'text-blue-600' : 'text-gray-600'}`}>
+                            {diagnosticAnalysis.stats.avgBias > 0 ? '+' : ''}{diagnosticAnalysis.stats.avgBias.toFixed(1)}
+                          </div>
+                          <div className="text-[10px] text-gray-500">Avg Bias</div>
+                        </div>
+                        <div className="bg-gray-50 rounded p-2 text-center">
+                          <div className="text-sm font-bold text-gray-700">
+                            {(diagnosticAnalysis.stats.biasRatio * 100).toFixed(0)}%
+                          </div>
+                          <div className="text-[10px] text-gray-500">Under-forecast</div>
+                        </div>
+                        <div className="bg-gray-50 rounded p-2 text-center">
+                          <div className="text-sm font-bold text-gray-700">
+                            {diagnosticAnalysis.stats.mapeStdDev.toFixed(1)}%
+                          </div>
+                          <div className="text-[10px] text-gray-500">MAPE Std Dev</div>
+                        </div>
+                        <div className="bg-gray-50 rounded p-2 text-center">
+                          <div className={`text-sm font-bold ${diagnosticAnalysis.stats.avgDrift > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                            {diagnosticAnalysis.stats.avgDrift > 0 ? '+' : ''}{diagnosticAnalysis.stats.avgDrift.toFixed(1)}%
+                          </div>
+                          <div className="text-[10px] text-gray-500">Train→Actual Drift</div>
+                        </div>
+                      </div>
+
+                      {/* Issues List */}
+                      {diagnosticAnalysis.issues.map((issue, idx) => (
+                        <div
+                          key={idx}
+                          className={`p-3 rounded-lg border ${
+                            issue.type === 'error' ? 'bg-red-50 border-red-200' :
+                            issue.type === 'warning' ? 'bg-amber-50 border-amber-200' :
+                            'bg-blue-50 border-blue-200'
+                          }`}
+                        >
+                          <div className="flex items-start space-x-2">
+                            {issue.type === 'error' ? (
+                              <XCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                            ) : issue.type === 'warning' ? (
+                              <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                            ) : (
+                              <CheckCircle2 className="w-4 h-4 text-blue-500 flex-shrink-0 mt-0.5" />
+                            )}
+                            <div className="flex-1">
+                              <h4 className={`text-sm font-semibold ${
+                                issue.type === 'error' ? 'text-red-800' :
+                                issue.type === 'warning' ? 'text-amber-800' :
+                                'text-blue-800'
+                              }`}>
+                                {issue.title}
+                              </h4>
+                              <p className={`text-xs mt-1 ${
+                                issue.type === 'error' ? 'text-red-700' :
+                                issue.type === 'warning' ? 'text-amber-700' :
+                                'text-blue-700'
+                              }`}>
+                                {issue.description}
+                              </p>
+                              <div className={`mt-2 text-xs ${
+                                issue.type === 'error' ? 'text-red-600' :
+                                issue.type === 'warning' ? 'text-amber-600' :
+                                'text-blue-600'
+                              }`}>
+                                <strong>Recommendation:</strong> {issue.recommendation}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Results Table */}
               {showDetails && (

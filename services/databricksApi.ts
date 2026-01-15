@@ -1,9 +1,46 @@
 
-import { DataRow, ForecastResult, ModelRunResult, BatchTrainingResult, BatchTrainingSummary } from "../types";
+import { DataRow, ForecastResult, ModelRunResult, BatchTrainingResult, BatchTrainingSummary, DataAnalysisResult } from "../types";
 
-// When running as a Databricks App, the backend is on the same host/port usually, 
+// When running as a Databricks App, the backend is on the same host/port usually,
 // or proxied. For local dev, you might need a proxy setup.
 const API_BASE = "/api";
+
+/**
+ * Analyze training data and get intelligent model/hyperparameter recommendations
+ */
+export const analyzeTrainingData = async (
+    data: DataRow[],
+    timeCol: string,
+    targetCol: string,
+    frequency: string = 'auto'
+): Promise<DataAnalysisResult> => {
+    const payload = {
+        data,
+        time_col: timeCol,
+        target_col: targetCol,
+        frequency
+    };
+
+    const response = await fetch(`${API_BASE}/analyze-data`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        let errDetail = "Data analysis failed";
+        try {
+            const json = JSON.parse(text);
+            errDetail = json.detail || errDetail;
+        } catch (e) {
+            errDetail = text || errDetail;
+        }
+        throw new Error(errDetail);
+    }
+
+    return response.json();
+};
 
 export const trainModelOnBackend = async (
     data: DataRow[],
@@ -23,7 +60,8 @@ export const trainModelOnBackend = async (
     fromDate?: string,
     toDate?: string,
     randomSeed?: number,
-    futureFeatures?: DataRow[]
+    futureFeatures?: DataRow[],
+    hyperparameterFilters?: Record<string, Record<string, any>>
 ): Promise<any> => {
 
     const payload = {
@@ -44,7 +82,8 @@ export const trainModelOnBackend = async (
         from_date: fromDate || null,
         to_date: toDate || null,
         random_seed: randomSeed || 42,
-        future_features: futureFeatures || null
+        future_features: futureFeatures || null,
+        hyperparameter_filters: hyperparameterFilters || null
     };
 
     const response = await fetch(`${API_BASE}/train`, {
@@ -420,6 +459,151 @@ export const deployBatchModels = async (
     }
 
     return await response.json();
+};
+
+// ==========================================
+// SIMPLE MODE API (Autopilot for Finance Users)
+// ==========================================
+
+export interface SimpleProfileResponse {
+    success: boolean;
+    profile: {
+        frequency: string;
+        date_column: string;
+        target_column: string;
+        date_range: [string, string];
+        total_periods: number;
+        history_months: number;
+        data_quality_score: number;
+        holiday_coverage_score: number;
+        has_trend: boolean;
+        has_seasonality: boolean;
+        covariate_columns: string[];
+        recommended_models: string[];
+        recommended_horizon: number;
+        data_hash: string;
+        row_count: number;
+    };
+    warnings: Array<{ level: string; message: string; recommendation: string }>;
+    config_preview: any;
+}
+
+export interface SimpleForecastResponse {
+    success: boolean;
+    mode: string;
+    run_id: string;
+    summary: string;
+    forecast: number[];
+    dates: string[];
+    lower_bounds: number[];
+    upper_bounds: number[];
+    components: {
+        formula: string;
+        totals: { base: number; trend: number; seasonal: number; holiday: number };
+        periods: Array<{
+            date: string;
+            forecast: number;
+            lower: number;
+            upper: number;
+            base: number;
+            trend: number;
+            seasonal: number;
+            holiday: number;
+            explanation: string;
+        }>;
+    };
+    confidence: {
+        level: string;
+        score: number;
+        mape: number;
+        factors: Array<{ factor: string; score: number; note: string }>;
+        explanation: string;
+    };
+    warnings: Array<{ level: string; message: string; recommendation: string }>;
+    caveats: string[];
+    audit: {
+        run_id: string;
+        timestamp: string;
+        data_hash: string;
+        config_hash: string;
+        model: string;
+        reproducibility_token: string;
+    };
+    excel_download_url: string;
+}
+
+export const profileDataForSimpleMode = async (file: File): Promise<SimpleProfileResponse> => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${API_BASE}/simple/profile`, {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        let errDetail = 'Failed to profile data';
+        try {
+            const json = JSON.parse(text);
+            errDetail = json.detail || errDetail;
+        } catch (e) {
+            errDetail = text || `Error ${response.status}`;
+        }
+        throw new Error(errDetail);
+    }
+
+    return await response.json();
+};
+
+export const runSimpleForecast = async (
+    file: File,
+    horizon?: number
+): Promise<SimpleForecastResponse> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (horizon) {
+        formData.append('horizon', String(horizon));
+    }
+
+    const response = await fetch(`${API_BASE}/simple/forecast`, {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        let errDetail = 'Forecast failed';
+        try {
+            const json = JSON.parse(text);
+            errDetail = json.detail || errDetail;
+        } catch (e) {
+            errDetail = text || `Error ${response.status}`;
+        }
+        throw new Error(errDetail);
+    }
+
+    return await response.json();
+};
+
+export const downloadSimpleForecastExcel = async (runId: string): Promise<Blob> => {
+    const response = await fetch(`${API_BASE}/simple/export/${runId}/excel`);
+
+    if (!response.ok) {
+        throw new Error('Failed to download Excel file');
+    }
+
+    return await response.blob();
+};
+
+export const downloadSimpleForecastCSV = async (runId: string): Promise<Blob> => {
+    const response = await fetch(`${API_BASE}/simple/export/${runId}/csv`);
+
+    if (!response.ok) {
+        throw new Error('Failed to download CSV file');
+    }
+
+    return await response.blob();
 };
 
 // Export batch results to CSV

@@ -2,8 +2,11 @@
 FastAPI backend for Databricks Finance Forecasting Platform
 """
 import os
+import gc
 import logging
 import numpy as np
+import tempfile
+import glob as glob_module
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -14,7 +17,8 @@ from backend.schemas import (
     HealthResponse, ForecastMetrics, ModelResult, CovariateImpact,
     BatchTrainRequest, BatchTrainResponse, BatchResultItem,
     AggregateRequest, AggregateResponse, TestModelRequest, TestModelResponse,
-    ModelTestResult, BatchDeployRequest, BatchDeployResponse, BatchSegmentInfo
+    ModelTestResult, BatchDeployRequest, BatchDeployResponse, BatchSegmentInfo,
+    DataAnalysisRequest, DataAnalysisResponse
 )
 from backend.models.prophet import train_prophet_model, prepare_prophet_data
 from backend.models.arima import train_arima_model, train_sarimax_model
@@ -26,6 +30,15 @@ from backend.deploy_service import (
     list_endpoints, get_databricks_client, test_model_inference
 )
 from backend.ai_service import analyze_dataset, generate_forecast_insights, generate_executive_summary
+from backend.data_analyzer import analyze_time_series, get_analysis_summary_for_ui
+
+# Simple Mode - Autopilot forecasting for finance users
+try:
+    from backend.simple_mode import simple_mode_router
+    SIMPLE_MODE_AVAILABLE = True
+except ImportError:
+    SIMPLE_MODE_AVAILABLE = False
+    simple_mode_router = None
 
 # Configure logging with both console and file handlers
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
@@ -78,6 +91,31 @@ def truncate_log_file():
         logger.info(f"📝 Log file truncated and ready for new training run: {LOG_FILE}")
     except Exception as e:
         logger.warning(f"Could not truncate log file: {e}")
+
+
+def cleanup_temp_files_and_memory():
+    """Clean up temp files and free memory to prevent 'too many open files' errors."""
+    try:
+        # Clean up temp files that may have been created during MLflow logging
+        temp_patterns = [
+            '/tmp/*.csv',
+            '/tmp/*.pkl',
+            '/tmp/*.json',
+            '/tmp/tmp*',
+        ]
+        for pattern in temp_patterns:
+            for f in glob_module.glob(pattern):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+        # Force garbage collection to release file handles
+        gc.collect()
+
+        logger.debug("Cleaned up temp files and ran garbage collection")
+    except Exception as e:
+        logger.warning(f"Cleanup warning (non-fatal): {e}")
 
 
 def log_dataframe_summary(df, name: str, show_sample: bool = True):
@@ -159,6 +197,11 @@ static_dir = "dist" if os.path.exists("dist") else "../dist"
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=f"{static_dir}/assets"), name="assets")
 
+# Register Simple Mode routes
+if SIMPLE_MODE_AVAILABLE and simple_mode_router:
+    app.include_router(simple_mode_router)
+    logger.info("✅ Simple Mode routes registered at /api/simple/*")
+
 @app.get("/")
 async def root():
     return FileResponse(f"{static_dir}/index.html") if os.path.exists(f"{static_dir}/index.html") else {"message": "API Running"}
@@ -185,14 +228,64 @@ async def health_check():
     try:
         get_databricks_client().serving_endpoints.list()
         status_data["databricks_connected"] = True
-    except Exception: pass
-    
+    except Exception as e:
+        logger.debug(f"Databricks connection check failed (expected in dev): {type(e).__name__}")
+
     try:
         import mlflow
         mlflow.set_tracking_uri("databricks")
         status_data["mlflow_enabled"] = True
-    except Exception: pass
+    except Exception as e:
+        logger.debug(f"MLflow setup failed (expected in dev): {type(e).__name__}")
     return HealthResponse(**status_data)
+
+
+@app.post("/api/analyze-data", response_model=DataAnalysisResponse)
+async def analyze_data(request: DataAnalysisRequest):
+    """
+    Analyze time series data and provide intelligent recommendations for:
+    - Which models to use based on data characteristics
+    - Hyperparameter ranges to explore
+    - Data quality assessment and warnings
+
+    Call this endpoint before training to get data-driven model/hyperparameter recommendations.
+    """
+    try:
+        import pandas as pd
+
+        logger.info(f"📊 Analyzing data: {len(request.data)} rows, time_col={request.time_col}, target_col={request.target_col}")
+
+        # Convert to DataFrame
+        df = pd.DataFrame(request.data)
+
+        if len(df) == 0:
+            raise HTTPException(status_code=400, detail="No data provided")
+
+        if request.time_col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Time column '{request.time_col}' not found in data")
+
+        if request.target_col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Target column '{request.target_col}' not found in data")
+
+        # Run analysis
+        result = analyze_time_series(
+            df=df,
+            time_col=request.time_col,
+            target_col=request.target_col,
+            frequency=request.frequency
+        )
+
+        # Convert to UI-friendly format
+        summary = get_analysis_summary_for_ui(result)
+
+        return DataAnalysisResponse(**summary)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Data analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Data analysis failed: {str(e)}")
+
 
 @app.post("/api/train", response_model=TrainResponse)
 async def train_model(request: TrainRequest):
@@ -214,6 +307,12 @@ async def train_model(request: TrainRequest):
             logger.info(f"📋 Segment filters: {request.filters}")
         if request.batch_segment_id:
             logger.info(f"📋 Batch segment: {request.batch_segment_id}")
+
+        # Log hyperparameter filter info (from data analysis)
+        if request.hyperparameter_filters:
+            logger.info(f"📊 Using data-driven hyperparameter filters for {len(request.hyperparameter_filters)} models")
+            for model_name, filters in request.hyperparameter_filters.items():
+                logger.info(f"   - {model_name}: {list(filters.keys())}")
 
         # ========================================
         # LOG RAW INPUT DATA
@@ -285,31 +384,37 @@ async def train_model(request: TrainRequest):
         # ========================================
         log_dataframe_summary(df, "COMBINED/PROCESSED DATASET (after prepare_prophet_data)")
 
-        # Store pre-filter data for logging
-        pre_filter_df = df.copy()
+        # Store pre-filter data for logging (shallow copy for logging only)
+        pre_filter_df = df
 
-        # Apply date range filtering
+        # Apply date range filtering using a single mask (more efficient than multiple .copy())
         original_len = len(df)
         import pandas as pd
-        
+
         # Default to_date to the end of the time series if not provided
         max_date = df['ds'].max()
         effective_to_date = request.to_date if request.to_date else str(max_date.date())
-        
-        # Apply from_date filter if provided
+
+        # Build combined date mask (avoids multiple DataFrame copies)
+        date_mask = pd.Series(True, index=df.index)
+
         if request.from_date:
             from_date = pd.to_datetime(request.from_date).normalize()
-            df = df[df['ds'] >= from_date].copy()
-            logger.info(f"📅 Filtered data: {original_len} -> {len(df)} rows (from_date >= {request.from_date})")
-        
-        # Always apply to_date filter (either provided or default to max date)
-        before_to_filter = len(df)
+            date_mask &= (df['ds'] >= from_date)
+
         to_date = pd.to_datetime(effective_to_date).normalize()
-        df = df[df['ds'] <= to_date].copy()
+        date_mask &= (df['ds'] <= to_date)
+
+        # Apply mask once with single copy
+        df = df[date_mask].copy()
+
+        # Log filtering results
+        if request.from_date:
+            logger.info(f"📅 Filtered data: {original_len} -> {len(df)} rows (from_date >= {request.from_date})")
         if request.to_date:
-            logger.info(f"📅 Filtered data: {before_to_filter} -> {len(df)} rows (to_date <= {request.to_date})")
+            logger.info(f"📅 Filtered data: to_date <= {request.to_date}")
         else:
-            logger.info(f"📅 Applied default to_date filter: {before_to_filter} -> {len(df)} rows (to_date <= {effective_to_date}, max date in dataset)")
+            logger.info(f"📅 Applied default to_date filter: to_date <= {effective_to_date} (max date in dataset)")
         
         if len(df) == 0:
             raise ValueError(f"No data remaining after date filtering (from_date: {request.from_date}, to_date: {effective_to_date})")
@@ -322,42 +427,85 @@ async def train_model(request: TrainRequest):
         # ========================================
         log_dataframe_summary(df, f"DATE-FILTERED DATASET (from_date={request.from_date or 'N/A'}, to_date={effective_to_date})")
 
-        test_size = request.test_size or min(request.horizon, len(df) // 5)
-        train_df, test_df = df.iloc[:-test_size].copy(), df.iloc[-test_size:].copy()
+        # ========================================
+        # TRAIN / EVAL / HOLDOUT SPLIT
+        # ========================================
+        # Strategy:
+        #   - Holdout: final validation set (never seen during hyperparameter tuning)
+        #   - Eval: hyperparameter tuning validation
+        #   - Train: model training
+        # Split ratios: ~70% train, ~15% eval, ~15% holdout (adjusted based on data size)
+
+        total_rows = len(df)
+
+        # Calculate split sizes - minimum 1 period for eval and holdout
+        eval_size = request.test_size or min(request.horizon, max(1, total_rows // 7))
+        holdout_size = min(request.horizon, max(1, total_rows // 7))
+
+        # Ensure we have enough data for training
+        min_train_size = max(request.horizon * 2, 30)  # At least 2x horizon or 30 points
+        if total_rows - eval_size - holdout_size < min_train_size:
+            # Not enough data for 3-way split, fall back to 2-way split
+            logger.warning(f"⚠️ Not enough data for 3-way split (need {min_train_size + eval_size + holdout_size}, have {total_rows}). Using 2-way train/eval split.")
+            holdout_size = 0
+            eval_size = request.test_size or min(request.horizon, len(df) // 5)
+
+        # Create the splits
+        if holdout_size > 0:
+            holdout_df = df.iloc[-holdout_size:].copy()
+            eval_df = df.iloc[-(holdout_size + eval_size):-holdout_size].copy()
+            train_df = df.iloc[:-(holdout_size + eval_size)].copy()
+        else:
+            holdout_df = pd.DataFrame()  # Empty holdout
+            eval_df = df.iloc[-eval_size:].copy()
+            train_df = df.iloc[:-eval_size].copy()
+
+        # For backward compatibility, test_df refers to eval_df (used by model training functions)
+        test_df = eval_df
+        test_size = eval_size
 
         # ========================================
-        # LOG TRAIN/TEST SPLIT
+        # LOG TRAIN/EVAL/HOLDOUT SPLIT
         # ========================================
         logger.info(f"")
         logger.info(f"{'='*60}")
-        logger.info(f"📊 TRAIN/TEST SPLIT")
+        logger.info(f"📊 TRAIN/EVAL/HOLDOUT SPLIT")
         logger.info(f"{'='*60}")
-        logger.info(f"   Test size requested: {request.test_size or 'auto'}")
-        logger.info(f"   Effective test size: {test_size}")
-        logger.info(f"   Total rows: {len(df)}")
-        logger.info(f"   Train rows: {len(train_df)} ({len(train_df)/len(df)*100:.1f}%)")
-        logger.info(f"   Test rows: {len(test_df)} ({len(test_df)/len(df)*100:.1f}%)")
+        logger.info(f"   Total rows: {total_rows}")
+        logger.info(f"   Train rows: {len(train_df)} ({len(train_df)/total_rows*100:.1f}%)")
+        logger.info(f"   Eval rows: {len(eval_df)} ({len(eval_df)/total_rows*100:.1f}%) - for hyperparameter tuning")
+        if holdout_size > 0:
+            logger.info(f"   Holdout rows: {len(holdout_df)} ({len(holdout_df)/total_rows*100:.1f}%) - for final model selection")
+        else:
+            logger.info(f"   Holdout rows: 0 (insufficient data for 3-way split)")
         logger.info(f"{'='*60}")
 
         # Log TRAIN set details
         log_dataframe_summary(train_df, "TRAINING SET")
 
-        # Log TEST set details
-        log_dataframe_summary(test_df, "TEST/VALIDATION SET")
+        # Log EVAL set details
+        log_dataframe_summary(eval_df, "EVAL SET (hyperparameter tuning)")
 
-        # Log the split point
+        # Log HOLDOUT set details if exists
+        if holdout_size > 0:
+            log_dataframe_summary(holdout_df, "HOLDOUT SET (final model selection)")
+
+        # Log the split points
         logger.info(f"")
         logger.info(f"{'='*60}")
         logger.info(f"📅 SPLIT POINT VERIFICATION")
         logger.info(f"{'='*60}")
         logger.info(f"   Train ends at: {train_df['ds'].max()}")
-        logger.info(f"   Test starts at: {test_df['ds'].min()}")
-        logger.info(f"   Gap check: Test should start right after train")
-        if len(train_df) > 0 and len(test_df) > 0:
+        logger.info(f"   Eval starts at: {eval_df['ds'].min()}")
+        if holdout_size > 0:
+            logger.info(f"   Eval ends at: {eval_df['ds'].max()}")
+            logger.info(f"   Holdout starts at: {holdout_df['ds'].min()}")
+            logger.info(f"   Holdout ends at: {holdout_df['ds'].max()}")
+        if len(train_df) > 0 and len(eval_df) > 0:
             train_end = train_df['ds'].max()
-            test_start = test_df['ds'].min()
-            gap_days = (test_start - train_end).days
-            logger.info(f"   Gap between train end and test start: {gap_days} days")
+            eval_start = eval_df['ds'].min()
+            gap_days = (eval_start - train_end).days
+            logger.info(f"   Gap between train end and eval start: {gap_days} days")
             if gap_days > 7:
                 logger.warning(f"   ⚠️ Large gap detected! This may indicate data issues.")
         logger.info(f"{'='*60}")
@@ -415,26 +563,34 @@ async def train_model(request: TrainRequest):
                 mlflow.log_artifact("/tmp/post_filter_data.csv", "datasets/processed")
                 logger.info(f"Logged post-filter data to datasets/processed/: {len(df)} rows")
                 
-                # Add train/test split metadata
+                # Add train/eval/holdout split metadata
                 split_metadata = {
                     "train_size": len(train_df),
-                    "test_size": len(test_df),
+                    "eval_size": len(eval_df),
+                    "holdout_size": len(holdout_df) if holdout_size > 0 else 0,
                     "total_size": len(df),
-                    "split_date": str(train_df['ds'].max()),
-                    "test_percentage": round(len(test_df) / len(df) * 100, 2),
+                    "train_eval_split_date": str(train_df['ds'].max()),
+                    "eval_holdout_split_date": str(eval_df['ds'].max()) if holdout_size > 0 else None,
+                    "train_percentage": round(len(train_df) / len(df) * 100, 2),
+                    "eval_percentage": round(len(eval_df) / len(df) * 100, 2),
+                    "holdout_percentage": round(len(holdout_df) / len(df) * 100, 2) if holdout_size > 0 else 0,
                     "train_date_range": {
                         "start": str(train_df['ds'].min()),
                         "end": str(train_df['ds'].max())
                     },
-                    "test_date_range": {
-                        "start": str(test_df['ds'].min()),
-                        "end": str(test_df['ds'].max())
-                    }
+                    "eval_date_range": {
+                        "start": str(eval_df['ds'].min()),
+                        "end": str(eval_df['ds'].max())
+                    },
+                    "holdout_date_range": {
+                        "start": str(holdout_df['ds'].min()),
+                        "end": str(holdout_df['ds'].max())
+                    } if holdout_size > 0 else None
                 }
-                with open("/tmp/train_test_split.json", "w") as f:
+                with open("/tmp/train_eval_holdout_split.json", "w") as f:
                     json.dump(split_metadata, f, indent=2)
-                mlflow.log_artifact("/tmp/train_test_split.json", "metadata")
-                logger.info(f"Logged train/test split metadata to metadata/: train={len(train_df)}, test={len(test_df)}")
+                mlflow.log_artifact("/tmp/train_eval_holdout_split.json", "metadata")
+                logger.info(f"Logged train/eval/holdout split metadata: train={len(train_df)}, eval={len(eval_df)}, holdout={len(holdout_df) if holdout_size > 0 else 0}")
             except Exception as e:
                 logger.warning(f"Could not log original uploaded data or metadata: {e}")
             
@@ -448,10 +604,12 @@ async def train_model(request: TrainRequest):
             mlflow.log_param("regressor_method", request.regressor_method)
             mlflow.log_param("country", request.country)
             mlflow.log_param("models_trained", str(request.models))
-            mlflow.log_param("test_size", test_size)
+            mlflow.log_param("eval_size", eval_size)
+            mlflow.log_param("holdout_size", holdout_size)
             mlflow.log_param("total_data_points", len(df))
             mlflow.log_param("training_data_points", len(train_df))
-            mlflow.log_param("validation_data_points", len(test_df))
+            mlflow.log_param("eval_data_points", len(eval_df))
+            mlflow.log_param("holdout_data_points", len(holdout_df) if holdout_size > 0 else 0)
             mlflow.log_param("random_seed", seed)
             logger.info(f"🌱 Logged random seed: {seed} to MLflow")
 
@@ -511,7 +669,11 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, impacts = train_prophet_model(
                             request.data, request.time_col, request.target_col, safe_covariates,
                             request.horizon, request.frequency, request.seasonality_mode, test_size,
-                            request.regressor_method, request.country, seed, request.future_features
+                            request.regressor_method, request.country, seed, request.future_features,
+                            request.hyperparameter_filters,
+                            train_df_override=train_df,  # Pass pre-split data
+                            test_df_override=test_df,    # Pass pre-split data
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         result = ModelResult(
                             model_type='prophet', model_name='Prophet (MLflow)', run_id=run_id,
@@ -526,7 +688,9 @@ async def train_model(request: TrainRequest):
                     elif model_type == 'arima':
                         run_id, _, metrics, val, fcst, uri, params = train_arima_model(
                             train_df, test_df, request.horizon, request.frequency, None, seed,
-                            original_data=request.data, covariates=safe_covariates
+                            original_data=request.data, covariates=safe_covariates,
+                            hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -548,7 +712,9 @@ async def train_model(request: TrainRequest):
                             continue
                         run_id, _, metrics, val, fcst, uri, params = train_exponential_smoothing_model(
                             train_df, test_df, request.horizon, request.frequency, seasonal_periods, seed,
-                            original_data=request.data, covariates=safe_covariates
+                            original_data=request.data, covariates=safe_covariates,
+                            hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -566,7 +732,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_sarimax_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country
+                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -586,7 +753,8 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_xgboost_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country
+                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
                         fcst = fcst.rename(columns={'ds': request.time_col})
@@ -622,6 +790,9 @@ async def train_model(request: TrainRequest):
                         except Exception as val_error:
                             logger.warning(f"   Could not validate artifacts: {val_error}")
 
+                        # Cleanup after each model to prevent 'too many open files' errors
+                        cleanup_temp_files_and_memory()
+
                 except Exception as e:
                     logger.error(f"{model_type} failed: {e}", exc_info=True)
                     # Add failed model to results with error info so frontend can show why it failed
@@ -642,6 +813,92 @@ async def train_model(request: TrainRequest):
 
         if not model_results: raise Exception("All models failed")
 
+        # ========================================
+        # HOLDOUT EVALUATION - Final Model Selection
+        # ========================================
+        # After all models are trained, evaluate them on holdout set
+        # This provides unbiased estimate of model performance
+        if holdout_size > 0 and len(model_results) > 0:
+            logger.info(f"")
+            logger.info(f"{'='*60}")
+            logger.info(f"🔒 HOLDOUT EVALUATION - Final Model Selection")
+            logger.info(f"{'='*60}")
+            logger.info(f"   Evaluating {len(model_results)} models on holdout set ({holdout_size} rows)")
+            logger.info(f"   Holdout period: {holdout_df['ds'].min()} to {holdout_df['ds'].max()}")
+
+            holdout_results = []
+            for res in model_results:
+                if res.run_id and res.metrics.mape != "N/A":
+                    try:
+                        # Load the model and predict on holdout
+                        import mlflow.pyfunc
+                        model_uri = f"runs:/{res.run_id}/model"
+                        loaded_model = mlflow.pyfunc.load_model(model_uri)
+
+                        # Prepare holdout input
+                        holdout_input = pd.DataFrame({
+                            'periods': [holdout_size],
+                            'start_date': [str(eval_df['ds'].max().date())]  # Start from end of eval
+                        })
+
+                        # Get predictions
+                        holdout_predictions = loaded_model.predict(holdout_input)
+
+                        # Calculate holdout MAPE
+                        if isinstance(holdout_predictions, pd.DataFrame) and 'yhat' in holdout_predictions.columns:
+                            # Align predictions with actuals
+                            pred_df = holdout_predictions[['ds', 'yhat']].copy()
+                            pred_df['ds'] = pd.to_datetime(pred_df['ds'])
+                            actual_df = holdout_df[['ds', 'y']].copy()
+
+                            merged = actual_df.merge(pred_df, on='ds', how='inner')
+                            if len(merged) > 0:
+                                holdout_mape = float(np.mean(np.abs((merged['y'] - merged['yhat']) / (merged['y'] + 1e-10))) * 100)
+                                holdout_results.append({
+                                    'model_name': res.model_name,
+                                    'run_id': res.run_id,
+                                    'eval_mape': float(res.metrics.mape),
+                                    'holdout_mape': holdout_mape,
+                                    'result': res
+                                })
+                                logger.info(f"   {res.model_name}: Eval MAPE={res.metrics.mape}%, Holdout MAPE={holdout_mape:.2f}%")
+                            else:
+                                logger.warning(f"   {res.model_name}: No overlapping dates for holdout evaluation")
+                        else:
+                            logger.warning(f"   {res.model_name}: Predictions format not supported for holdout eval")
+                    except Exception as e:
+                        logger.warning(f"   {res.model_name}: Holdout evaluation failed - {str(e)[:100]}")
+
+            # Select best model based on holdout performance
+            if holdout_results:
+                holdout_results.sort(key=lambda x: x['holdout_mape'])
+                best_holdout = holdout_results[0]
+                logger.info(f"")
+                logger.info(f"   🏆 Best model on HOLDOUT: {best_holdout['model_name']}")
+                logger.info(f"      Holdout MAPE: {best_holdout['holdout_mape']:.2f}%")
+                logger.info(f"      Eval MAPE: {best_holdout['eval_mape']:.2f}%")
+
+                # Update best model selection
+                best_model_name = best_holdout['model_name']
+                best_mape = best_holdout['holdout_mape']
+                best_run_id = best_holdout['run_id']
+
+                # Log holdout metrics to MLflow
+                with mlflow.start_run(run_id=parent_run_id):
+                    mlflow.log_metric("best_holdout_mape", best_holdout['holdout_mape'])
+                    mlflow.log_param("best_model_selected_by", "holdout")
+                    for hr in holdout_results:
+                        mlflow.log_metric(f"holdout_mape_{hr['model_name'].replace(' ', '_').replace('(', '').replace(')', '').replace(',', '').replace('=', '_')}", hr['holdout_mape'])
+
+                logger.info(f"{'='*60}")
+            else:
+                logger.warning(f"   ⚠️ No models could be evaluated on holdout. Using eval MAPE for selection.")
+                logger.info(f"{'='*60}")
+        else:
+            if holdout_size == 0:
+                logger.info(f"")
+                logger.info(f"ℹ️ No holdout set available - using eval MAPE for model selection")
+
         # Log final training summary
         logger.info(f"")
         logger.info(f"{'='*60}")
@@ -653,6 +910,10 @@ async def train_model(request: TrainRequest):
             logger.info(f"{status_icon} {res.model_name}: MAPE={mape_str}")
         logger.info(f"")
         logger.info(f"🏆 Best model: {best_model_name} (MAPE: {best_mape:.2f}%)")
+        if holdout_size > 0:
+            logger.info(f"   (Selected based on holdout performance)")
+        else:
+            logger.info(f"   (Selected based on eval performance)")
         logger.info(f"{'='*60}")
 
         # Build MLflow URLs for experiment and runs
@@ -901,7 +1162,7 @@ async def train_batch(request: BatchTrainRequest):
     This endpoint allows you to submit multiple training requests at once,
     processing them in parallel for faster batch forecasting across segments.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
     import traceback
 
     logger.info(f"")
@@ -955,7 +1216,10 @@ async def train_batch(request: BatchTrainRequest):
                 error=str(e)
             )
 
-    # Process requests in parallel
+    # Process requests in parallel with timeout protection
+    # Each segment gets up to 10 minutes to complete
+    SEGMENT_TIMEOUT_SECONDS = int(os.environ.get('BATCH_SEGMENT_TIMEOUT', '600'))  # 10 minutes default
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
             executor.submit(train_single, req, i): i
@@ -965,14 +1229,24 @@ async def train_batch(request: BatchTrainRequest):
         completed_segments = 0
         total_segments = len(request.requests)
 
-        for future in as_completed(future_to_index):
+        for future in as_completed(future_to_index, timeout=SEGMENT_TIMEOUT_SECONDS * total_segments):
             index = future_to_index[future]
             try:
-                result = future.result()
+                # Per-segment timeout
+                result = future.result(timeout=SEGMENT_TIMEOUT_SECONDS)
                 results.append(result)
                 completed_segments += 1
                 status_icon = "✅" if result.status == "success" else "❌"
                 logger.info(f"{status_icon} Completed segment {result.segment_id} [{completed_segments}/{total_segments}]")
+            except FuturesTimeoutError:
+                logger.error(f"⏱️ Timeout for segment {index} after {SEGMENT_TIMEOUT_SECONDS}s")
+                results.append(BatchResultItem(
+                    filters=request.requests[index].filters,
+                    segment_id=f"segment_{index}",
+                    status="error",
+                    result=None,
+                    error=f"Training timeout after {SEGMENT_TIMEOUT_SECONDS} seconds"
+                ))
             except Exception as e:
                 logger.error(f"Unexpected error for segment {index}: {e}")
                 results.append(BatchResultItem(

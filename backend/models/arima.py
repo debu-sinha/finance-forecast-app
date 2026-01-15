@@ -514,7 +514,9 @@ def train_arima_model(
     order: Tuple[int, int, int] = None,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    covariates: List[str] = None  # Kept for API compatibility but NOT used - ARIMA is univariate
+    covariates: List[str] = None,  # Kept for API compatibility but NOT used - ARIMA is univariate
+    hyperparameter_filters: Dict[str, Any] = None,
+    forecast_start_date: pd.Timestamp = None  # User's specified end_date for forecast start
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Tuple[int, int, int]]:
     """
     Train ARIMA model with hyperparameter tuning and MLflow logging
@@ -539,12 +541,47 @@ def train_arima_model(
     best_artifact_uri = None
     
     # Define grid search space if order is not provided
+    # Apply hyperparameter filters from data analysis if provided
+    arima_filters = (hyperparameter_filters or {}).get('ARIMA', {})
+
     if order is None:
         max_arima_combinations = int(os.environ.get('ARIMA_MAX_COMBINATIONS', '6'))
-        p_values = [0, 1, 2]
-        d_values = [0, 1]
-        q_values = [0, 1]
-        all_orders = list(set(itertools.product(p_values, d_values, q_values)))
+
+        # Use filtered values if provided, otherwise use defaults
+        p_values = arima_filters.get('p_values', [0, 1, 2])
+        d_values = arima_filters.get('d_values', [0, 1])
+        q_values = arima_filters.get('q_values', [0, 1])
+
+        if arima_filters:
+            logger.info(f"📊 Using data-driven ARIMA filters: p={p_values}, d={d_values}, q={q_values}")
+
+        # Ensure all values are integers (filters may come as strings from JSON)
+        p_values = [int(p) for p in p_values]
+        d_values = [int(d) for d in d_values]
+        q_values = [int(q) for q in q_values]
+
+        # Generate all combinations as integer tuples
+        all_orders = [(int(p), int(d), int(q)) for p, d, q in itertools.product(p_values, d_values, q_values)]
+        all_orders = list(set(all_orders))  # Remove duplicates
+
+        # CRITICAL: Filter out degenerate models that produce flat/uninformative forecasts
+        # (0,0,0) = constant mean
+        # (0,1,0) = random walk (flat forecast at last value)
+        # (0,d,0) = pure differencing (no learning)
+        degenerate_orders = {(0, 0, 0), (0, 1, 0), (0, 2, 0)}  # Use set for O(1) lookup
+        original_count = len(all_orders)
+        all_orders = [o for o in all_orders if o not in degenerate_orders]
+
+        if len(all_orders) < original_count:
+            excluded_count = original_count - len(all_orders)
+            logger.info(f"🚫 Excluded {excluded_count} degenerate ARIMA orders: {[o for o in [(0,0,0), (0,1,0), (0,2,0)] if o in degenerate_orders]}")
+
+        # Ensure we have at least some valid orders
+        if len(all_orders) == 0:
+            # Fall back to simple but informative models
+            all_orders = [(1, 1, 0), (0, 1, 1), (1, 1, 1)]
+            logger.warning("All ARIMA orders were degenerate. Using fallback: (1,1,0), (0,1,1), (1,1,1)")
+
         if len(all_orders) > max_arima_combinations:
             all_orders.sort(key=lambda x: sum(x))
             orders = all_orders[:max_arima_combinations]
@@ -552,6 +589,9 @@ def train_arima_model(
         else:
             orders = all_orders
     else:
+        # User-specified order - warn if degenerate
+        if order in [(0, 0, 0), (0, 1, 0), (0, 2, 0)]:
+            logger.warning(f"⚠️ Specified ARIMA order {order} is a degenerate model (random walk). Consider using (1,1,0) or (1,1,1) instead.")
         orders = [order]
     
     with mlflow.start_run(run_name="ARIMA_Tuning", nested=True) as parent_run:
@@ -644,8 +684,14 @@ def train_arima_model(
             forecast_lower = forecast_values * 0.9
             forecast_upper = forecast_values * 1.1
 
-        last_date = full_data['ds'].max()
+        # Use forecast_start_date if provided (user's to_date), otherwise use end of data
+        if forecast_start_date is not None:
+            last_date = pd.to_datetime(forecast_start_date).normalize()
+            logger.info(f"📅 Using user-specified forecast start: {last_date}")
+        else:
+            last_date = full_data['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
+        logger.info(f"📅 ARIMA forecast dates: {future_dates.min()} to {future_dates.max()}")
 
         forecast_data = pd.DataFrame({
             'ds': future_dates,
@@ -748,7 +794,9 @@ def train_sarimax_model(
     covariates: List[str] = None,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    country: str = 'US'
+    country: str = 'US',
+    hyperparameter_filters: Dict[str, Any] = None,
+    forecast_start_date: pd.Timestamp = None  # User's specified end_date for forecast start
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
     Train SARIMAX model with hyperparameter tuning and MLflow logging
@@ -805,14 +853,20 @@ def train_sarimax_model(
     best_run_id = None
     best_artifact_uri = None
 
-    # Grid search space
+    # Grid search space - apply hyperparameter filters from data analysis if provided
+    sarimax_filters = (hyperparameter_filters or {}).get('SARIMAX', {})
     max_combinations = int(os.environ.get('SARIMAX_MAX_COMBINATIONS', '8'))
-    p_values = [0, 1, 2]
-    d_values = [0, 1]
-    q_values = [0, 1]
-    P_values = [0, 1]
-    D_values = [0, 1]
-    Q_values = [0, 1]
+
+    # Use filtered values if provided, otherwise use defaults
+    p_values = sarimax_filters.get('p_values', [0, 1, 2])
+    d_values = sarimax_filters.get('d_values', [0, 1])
+    q_values = sarimax_filters.get('q_values', [0, 1])
+    P_values = sarimax_filters.get('P_values', [0, 1])
+    D_values = sarimax_filters.get('D_values', [0, 1])
+    Q_values = sarimax_filters.get('Q_values', [0, 1])
+
+    if sarimax_filters:
+        logger.info(f"📊 Using data-driven SARIMAX filters: p={p_values}, d={d_values}, q={q_values}, P={P_values}, D={D_values}, Q={Q_values}")
 
     all_orders = []
     for p, d, q in itertools.product(p_values, d_values, q_values):
@@ -967,8 +1021,14 @@ def train_sarimax_model(
             forecast_lower = forecast_values * 0.9
             forecast_upper = forecast_values * 1.1
 
-        last_date = full_data['ds'].max()
+        # Use forecast_start_date if provided (user's to_date), otherwise use end of data
+        if forecast_start_date is not None:
+            last_date = pd.to_datetime(forecast_start_date).normalize()
+            logger.info(f"📅 Using user-specified forecast start: {last_date}")
+        else:
+            last_date = full_data['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
+        logger.info(f"📅 SARIMAX forecast dates: {future_dates.min()} to {future_dates.max()}")
 
         forecast_data = pd.DataFrame({
             'ds': future_dates,

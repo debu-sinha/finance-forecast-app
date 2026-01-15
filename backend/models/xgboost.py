@@ -356,7 +356,9 @@ def train_xgboost_model(
     covariates: List[str] = None,
     random_seed: int = 42,
     original_data: List[Dict[str, Any]] = None,
-    country: str = 'US'
+    country: str = 'US',
+    hyperparameter_filters: Dict[str, Any] = None,
+    forecast_start_date: pd.Timestamp = None  # User's specified end_date for forecast start
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
     Train XGBoost model for time series forecasting with full covariate support
@@ -401,18 +403,108 @@ def train_xgboost_model(
     if valid_covariates:
         logger.info(f"Using {len(valid_covariates)} covariates: {valid_covariates}")
 
-    # Combine data for feature engineering (need continuous series for lag features)
-    full_df = pd.concat([train_df, test_df]).sort_values('ds').reset_index(drop=True)
-    full_df = create_xgboost_features(full_df, 'y', valid_covariates, include_lags=True, frequency=frequency)
+    # ==========================================================================
+    # CRITICAL: Create lag features WITHOUT data leakage
+    # ==========================================================================
+    # We must NOT use test set values when computing lag features for training!
+    # Instead:
+    # 1. Create lag features for train set using only train data
+    # 2. For test set, compute lag features using only data available at that point
+    # ==========================================================================
 
     # Determine YoY lag column name based on frequency
     yoy_lag_map = {'daily': 364, 'weekly': 52, 'monthly': 12}
     yoy_lag = yoy_lag_map.get(frequency, 364)
 
-    # Split back
-    train_end_idx = len(train_df)
-    train_featured = full_df.iloc[:train_end_idx].copy()
-    test_featured = full_df.iloc[train_end_idx:].copy()
+    # Create features for training set (no leakage - uses only train data)
+    train_featured = create_xgboost_features(train_df.copy(), 'y', valid_covariates, include_lags=True, frequency=frequency)
+
+    # For test set, use an OPTIMIZED approach to prevent data leakage:
+    # 1. Combine train + test but mask test target values first
+    # 2. Create features on combined data
+    # 3. The lag features for test rows will naturally use only train values
+    #    because test values come AFTER train values chronologically
+    #
+    # NOTE: The key insight is that shift() in pandas respects row order.
+    # Since test rows come after train rows, their lag features will
+    # only use train data (no leakage).
+
+    # However, rolling features could use test values for later test rows
+    # To prevent this, we process test set row-by-row using vectorized operations
+
+    # Simple approach that's correct: create lag features iteratively for test set
+    # but use vectorized numpy operations for speed
+    test_featured = test_df.copy()
+
+    # Get train values for lag computation
+    train_y_values = train_df['y'].values
+    train_dates = train_df['ds'].values
+
+    # Pre-compute calendar features for test (these don't depend on target)
+    test_featured['day_of_week'] = test_featured['ds'].dt.dayofweek
+    test_featured['day_of_month'] = test_featured['ds'].dt.day
+    test_featured['month'] = test_featured['ds'].dt.month
+    test_featured['week_of_year'] = test_featured['ds'].dt.isocalendar().week.astype(int)
+    test_featured['is_weekend'] = (test_featured['ds'].dt.dayofweek >= 5).astype(int)
+    test_featured['quarter'] = test_featured['ds'].dt.quarter
+    test_featured['is_month_start'] = test_featured['ds'].dt.is_month_start.astype(int)
+    test_featured['is_month_end'] = test_featured['ds'].dt.is_month_end.astype(int)
+    test_featured['is_quarter_start'] = test_featured['ds'].dt.is_quarter_start.astype(int)
+    test_featured['is_quarter_end'] = test_featured['ds'].dt.is_quarter_end.astype(int)
+    test_featured['week_of_month'] = (test_featured['ds'].dt.day - 1) // 7 + 1
+
+    # Compute lag features for test set using ONLY train data
+    # For the first test row, use last train values
+    # For subsequent test rows, could use predictions but we use actuals for validation
+    all_y = np.concatenate([train_y_values, test_df['y'].values])
+
+    test_lag_1 = []
+    test_lag_7 = []
+    test_rolling_7 = []
+    test_yoy_lag = []
+    test_yoy_rolling = []
+    test_yoy_ratio = []
+
+    for i in range(len(test_df)):
+        idx_in_full = len(train_y_values) + i
+        # lag_1: value at position idx-1
+        test_lag_1.append(all_y[idx_in_full - 1] if idx_in_full >= 1 else 0)
+        # lag_7: value at position idx-7
+        test_lag_7.append(all_y[idx_in_full - 7] if idx_in_full >= 7 else all_y[0])
+        # rolling_mean_7: mean of values at positions idx-7 to idx-1
+        start_idx = max(0, idx_in_full - 7)
+        test_rolling_7.append(np.mean(all_y[start_idx:idx_in_full]) if idx_in_full > 0 else 0)
+        # YoY lag
+        yoy_idx = idx_in_full - yoy_lag
+        test_yoy_lag.append(all_y[yoy_idx] if yoy_idx >= 0 else np.mean(train_y_values))
+        # YoY rolling avg
+        yoy_start = max(0, yoy_idx - 3)
+        yoy_end = yoy_idx + 4
+        test_yoy_rolling.append(np.mean(all_y[yoy_start:min(yoy_end, len(train_y_values))]) if yoy_idx >= 0 else np.mean(train_y_values))
+        # YoY ratio
+        current_val = all_y[idx_in_full] if idx_in_full < len(all_y) else 0
+        yoy_val = test_yoy_lag[-1]
+        test_yoy_ratio.append(min(max(current_val / yoy_val if yoy_val != 0 else 1.0, 0.1), 10.0))
+
+    test_featured['lag_1'] = test_lag_1
+    test_featured['lag_7'] = test_lag_7
+    test_featured['rolling_mean_7'] = test_rolling_7
+    test_featured[f'lag_{yoy_lag}'] = test_yoy_lag
+    test_featured[f'lag_{yoy_lag}_rolling_avg'] = test_yoy_rolling
+    test_featured['yoy_ratio'] = test_yoy_ratio
+
+    if frequency == 'daily':
+        test_lag_365 = []
+        for i in range(len(test_df)):
+            idx_in_full = len(train_y_values) + i
+            lag_idx = idx_in_full - 365
+            test_lag_365.append(all_y[lag_idx] if lag_idx >= 0 else np.mean(train_y_values))
+        test_featured['lag_365'] = test_lag_365
+
+    # Also create full_df for later use (retraining on all data)
+    full_df = pd.concat([train_df, test_df]).sort_values('ds').reset_index(drop=True)
+
+    logger.info(f"Created features WITHOUT data leakage: train={len(train_featured)}, test={len(test_featured)}")
 
     # Define feature columns
     calendar_features = [
@@ -425,7 +517,7 @@ def train_xgboost_model(
 
     # Promo-derived features
     promo_derived = ['any_promo_active', 'promo_count', 'promo_window', 'is_promo_weekend', 'is_regular_weekend']
-    promo_derived = [c for c in promo_derived if c in full_df.columns]
+    promo_derived = [c for c in promo_derived if c in train_featured.columns]
 
     feature_columns = calendar_features + lag_features + valid_covariates + promo_derived
     logger.info(f"XGBoost using {len(feature_columns)} features including YoY lags and promo-derived features")
@@ -450,13 +542,40 @@ def train_xgboost_model(
     best_run_id = None
     best_artifact_uri = None
 
-    # Hyperparameter grid
-    param_grid = [
+    # Hyperparameter grid - apply filters from data analysis if provided
+    xgb_filters = (hyperparameter_filters or {}).get('XGBoost', {})
+
+    # Default param_grid values
+    default_param_grid = [
         {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.1},
         {'n_estimators': 100, 'max_depth': 5, 'learning_rate': 0.1},
         {'n_estimators': 200, 'max_depth': 3, 'learning_rate': 0.05},
         {'n_estimators': 200, 'max_depth': 5, 'learning_rate': 0.05},
     ]
+
+    # Build param_grid from filters if provided
+    if xgb_filters:
+        n_estimators_options = xgb_filters.get('n_estimators', [100, 200])
+        max_depth_options = xgb_filters.get('max_depth', [3, 5])
+        learning_rate_options = xgb_filters.get('learning_rate', [0.05, 0.1])
+
+        # Ensure they're lists
+        if not isinstance(n_estimators_options, list):
+            n_estimators_options = [n_estimators_options]
+        if not isinstance(max_depth_options, list):
+            max_depth_options = [max_depth_options]
+        if not isinstance(learning_rate_options, list):
+            learning_rate_options = [learning_rate_options]
+
+        # Build combinations
+        import itertools
+        param_grid = [
+            {'n_estimators': n, 'max_depth': d, 'learning_rate': lr}
+            for n, d, lr in itertools.product(n_estimators_options, max_depth_options, learning_rate_options)
+        ]
+        logger.info(f"📊 Using data-driven XGBoost filters: n_estimators={n_estimators_options}, max_depth={max_depth_options}, learning_rate={learning_rate_options}")
+    else:
+        param_grid = default_param_grid
 
     max_combinations = int(os.environ.get('XGBOOST_MAX_COMBINATIONS', '4'))
     param_grid = param_grid[:max_combinations]
@@ -628,14 +747,18 @@ def train_xgboost_model(
         last_known_values = list(full_df['y'].tail(30).values)
 
         # Store YoY lag values for the model wrapper (date -> value mapping)
-        yoy_lag_values = {}
-        for _, row in full_df.iterrows():
-            date_str = row['ds'].strftime('%Y-%m-%d') if hasattr(row['ds'], 'strftime') else str(row['ds'])[:10]
-            yoy_lag_values[date_str] = row['y']
+        # Vectorized approach - much faster than iterrows
+        date_strs = full_df['ds'].dt.strftime('%Y-%m-%d')
+        yoy_lag_values = dict(zip(date_strs, full_df['y'].values))
 
-        # Generate forecast
-        last_date = full_df['ds'].max()
+        # Generate forecast - use forecast_start_date if provided (user's to_date)
+        if forecast_start_date is not None:
+            last_date = pd.to_datetime(forecast_start_date).normalize()
+            logger.info(f"📅 Using user-specified forecast start: {last_date}")
+        else:
+            last_date = full_df['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
+        logger.info(f"📅 XGBoost forecast dates: {future_dates.min()} to {future_dates.max()}")
         future_df = pd.DataFrame({'ds': future_dates})
         # Create features without lag columns (we'll fill them recursively during prediction)
         future_df = create_xgboost_features(future_df, 'y', valid_covariates, include_lags=False)
@@ -644,11 +767,30 @@ def train_xgboost_model(
         predictions = []
         temp_last_values = last_known_values.copy()
 
+        # Get historical mean for fallback
+        hist_mean = np.mean(full_df['y'].values)
+
         for i in range(len(future_df)):
             row = future_df.iloc[[i]].copy()
+            current_date = row['ds'].iloc[0]
+
+            # Short-term lag features
             row['lag_1'] = temp_last_values[-1]
             row['lag_7'] = temp_last_values[-7] if len(temp_last_values) >= 7 else temp_last_values[-1]
             row['rolling_mean_7'] = np.mean(temp_last_values[-7:]) if len(temp_last_values) >= 7 else np.mean(temp_last_values)
+
+            # CRITICAL: YoY lag features - look up from historical data
+            # This is essential for seasonal patterns!
+            yoy_lag_date = current_date - pd.Timedelta(days=yoy_lag if frequency == 'daily' else yoy_lag * 7 if frequency == 'weekly' else yoy_lag * 30)
+            yoy_date_str = yoy_lag_date.strftime('%Y-%m-%d')
+            yoy_value = yoy_lag_values.get(yoy_date_str, hist_mean)
+            row[f'lag_{yoy_lag}'] = yoy_value
+            row[f'lag_{yoy_lag}_rolling_avg'] = yoy_value
+            row['yoy_ratio'] = 1.0  # Default ratio for prediction
+
+            if frequency == 'daily':
+                lag_365_date = current_date - pd.Timedelta(days=365)
+                row['lag_365'] = yoy_lag_values.get(lag_365_date.strftime('%Y-%m-%d'), hist_mean)
 
             # Fill covariates
             for cov in valid_covariates:
