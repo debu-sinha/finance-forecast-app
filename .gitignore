@@ -56,7 +56,7 @@ test_*.csv
 # Development documentation (internal only)
 docs/
 
-# Local config files
+# AI assistant config
 *.local.md
 
 # Temporary files
