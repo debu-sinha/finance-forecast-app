@@ -17,6 +17,7 @@ statsmodels
 xgboost
 pydantic
 requests
+httpx  # Async HTTP client for AI Thinker
 openpyxl
 holidays
 python-multipart
