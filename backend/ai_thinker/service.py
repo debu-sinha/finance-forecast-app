@@ -3,6 +3,8 @@ Forecast Thinker Service - Opus 4.5 powered intelligent analysis.
 
 Uses Databricks Model Serving to host Claude Opus 4.5 for deep reasoning
 about forecasting data, results, and analyst questions.
+
+Uses the same Databricks access pattern as ai_service.py for consistency.
 """
 
 import os
@@ -10,6 +12,7 @@ import json
 import time
 import logging
 import hashlib
+import requests
 from typing import Dict, Any, List, Optional
 from dataclasses import asdict
 from .models import (
@@ -23,132 +26,211 @@ logger = logging.getLogger(__name__)
 _response_cache: Dict[str, ThinkerResponse] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour
 
+# Models to try in order (Opus 4.5 preferred, fallback to other capable models)
+_THINKER_MODELS = [
+    'claude-opus-4-5',           # Primary: Opus 4.5 with extended thinking
+    'databricks-claude-3-opus',  # Fallback: Claude 3 Opus
+    'databricks-meta-llama-3-3-70b-instruct',  # Fallback: Llama 70B
+]
+
+
+def _get_databricks_client():
+    """
+    Get Databricks WorkspaceClient using the same pattern as ai_service.py.
+    Tries auto-auth first, then falls back to environment variables.
+    """
+    from databricks.sdk import WorkspaceClient
+    from mlflow.utils.databricks_utils import get_databricks_host_creds
+
+    client = None
+    try:
+        creds = get_databricks_host_creds("databricks")
+        if creds.host and creds.host != 'inherit':
+            client = WorkspaceClient(host=creds.host, token=creds.token)
+        else:
+            host = os.environ.get('DATABRICKS_HOST', '')
+            if host == 'inherit':
+                del os.environ['DATABRICKS_HOST']
+            client = WorkspaceClient()
+            if client.config.host == 'inherit' and os.environ.get('DATABRICKS_HOST') and os.environ.get('DATABRICKS_HOST') != 'inherit':
+                client = WorkspaceClient(host=os.environ['DATABRICKS_HOST'])
+    except Exception as e:
+        logger.warning(f"Databricks SDK init failed: {e}")
+
+    return client
+
+
+def _call_thinker_model(
+    prompt: str,
+    system_prompt: str = "You are an expert forecasting analyst.",
+    temperature: float = 0.7,
+    max_tokens: int = 4000,
+    enable_thinking: bool = True
+) -> Dict[str, Any]:
+    """
+    Call Databricks-hosted model for thinking tasks.
+    Uses the same access pattern as ai_service.call_databricks_model().
+    """
+    client = _get_databricks_client()
+    last_error = None
+
+    for model_name in _THINKER_MODELS:
+        # Build payload - standard chat completions format
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        # Add extended thinking for Opus 4.5 if supported
+        if enable_thinking and 'opus' in model_name.lower():
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": min(max_tokens // 2, 8000)
+            }
+
+        try:
+            if client:
+                # Use SDK's api_client for direct API calls
+                response = client.api_client.do(
+                    method="POST",
+                    path="/serving-endpoints/chat/completions",
+                    body=payload
+                )
+
+                # Extract content from response
+                if isinstance(response, dict):
+                    content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    thinking = response.get('thinking', '')
+                else:
+                    # Handle SDK response object
+                    choice = getattr(response, 'choices', [None])[0]
+                    if choice:
+                        content = getattr(getattr(choice, 'message', None), 'content', '')
+                        thinking = getattr(response, 'thinking', '')
+                    else:
+                        content = ''
+                        thinking = ''
+            else:
+                # Fallback to direct HTTP request
+                host = os.environ.get('DATABRICKS_HOST', '')
+                token = os.environ.get('DATABRICKS_TOKEN', '')
+                if not host or not token or host == 'inherit':
+                    raise ValueError("Invalid Databricks credentials for manual request")
+
+                resp = requests.post(
+                    f"{host}/serving-endpoints/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=120
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                thinking = result.get('thinking', '')
+
+            return {
+                "success": True,
+                "response": content,
+                "thinking": thinking,
+                "model": model_name
+            }
+
+        except Exception as e:
+            logger.warning(f"Model {model_name} failed: {e}")
+            last_error = e
+            continue
+
+    # All models failed
+    return {
+        "success": False,
+        "response": None,
+        "thinking": None,
+        "error": str(last_error) if last_error else "All models unavailable"
+    }
+
 
 class DatabricksOpusClient:
     """Client for Databricks-hosted Opus 4.5 model serving endpoint."""
 
     def __init__(self):
-        self.workspace_url = os.environ.get("DATABRICKS_HOST", "")
-        self.token = os.environ.get("DATABRICKS_TOKEN", "")
         self.endpoint_name = os.environ.get("OPUS_ENDPOINT_NAME", "opus-4-5-thinker")
-        self.timeout = int(os.environ.get("OPUS_TIMEOUT_SECONDS", "60"))
+        self.timeout = int(os.environ.get("OPUS_TIMEOUT_SECONDS", "120"))
+        self._client = None
         self._initialized = False
 
     def _ensure_initialized(self):
         """Lazy initialization of the client."""
         if self._initialized:
             return
-
-        if not self.workspace_url or not self.token:
-            logger.warning("Databricks credentials not configured for Opus 4.5")
-            self._initialized = True
-            return
-
-        # Try to import databricks SDK
         try:
-            from databricks.sdk import WorkspaceClient
-            self.client = WorkspaceClient(
-                host=self.workspace_url,
-                token=self.token
-            )
+            self._client = _get_databricks_client()
             self._initialized = True
-            logger.info(f"Initialized Databricks Opus client for endpoint: {self.endpoint_name}")
-        except ImportError:
-            logger.warning("databricks-sdk not installed. Using fallback mode.")
-            self.client = None
-            self._initialized = True
+            if self._client:
+                logger.info(f"Initialized Databricks client for thinker")
         except Exception as e:
             logger.warning(f"Could not initialize Databricks client: {e}")
-            self.client = None
+            self._client = None
             self._initialized = True
 
     def is_available(self) -> bool:
-        """Check if the Opus endpoint is available."""
+        """Check if the Databricks endpoint is available."""
         self._ensure_initialized()
-        return self.client is not None and bool(self.workspace_url) and bool(self.token)
+        if self._client:
+            return True
+        # Check if manual credentials are available
+        host = os.environ.get('DATABRICKS_HOST', '')
+        token = os.environ.get('DATABRICKS_TOKEN', '')
+        return bool(host) and bool(token) and host != 'inherit'
 
     async def think(
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 1.0,  # Opus 4.5 extended thinking works best at temp=1
-        max_tokens: int = 16000,
-        budget_tokens: int = 10000  # Thinking budget
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+        budget_tokens: int = 8000  # noqa: ARG002 - used in _call_thinker_model
     ) -> Dict[str, Any]:
         """
-        Send a thinking request to Opus 4.5.
-
-        Uses extended thinking mode for deep reasoning about forecasting problems.
+        Send a thinking request to the Databricks-hosted model.
+        Uses extended thinking mode when Opus 4.5 is available.
         """
         self._ensure_initialized()
 
         if not self.is_available():
             return self._fallback_response(user_prompt)
 
-        try:
-            import httpx
+        # Use the shared model calling function
+        result = _call_thinker_model(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=True
+        )
 
-            # Construct the request for Databricks model serving
-            # Using the Anthropic API format that Databricks supports
-            request_body = {
-                "messages": [
-                    {"role": "user", "content": user_prompt}
-                ],
-                "system": system_prompt,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "anthropic_version": "2023-06-01",
-                # Extended thinking configuration
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens
-                }
+        if result.get("success"):
+            return {
+                "success": True,
+                "thinking": result.get("thinking", ""),
+                "response": result.get("response", ""),
+                "model": result.get("model", "unknown"),
+                "usage": {}
             }
-
-            endpoint_url = f"{self.workspace_url}/serving-endpoints/{self.endpoint_name}/invocations"
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    endpoint_url,
-                    json=request_body,
-                    headers={
-                        "Authorization": f"Bearer {self.token}",
-                        "Content-Type": "application/json"
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-
-                # Extract thinking and response
-                content = result.get("content", [])
-                thinking_text = ""
-                response_text = ""
-
-                for block in content:
-                    if block.get("type") == "thinking":
-                        thinking_text = block.get("thinking", "")
-                    elif block.get("type") == "text":
-                        response_text = block.get("text", "")
-
-                return {
-                    "success": True,
-                    "thinking": thinking_text,
-                    "response": response_text,
-                    "usage": result.get("usage", {}),
-                    "model": result.get("model", self.endpoint_name)
-                }
-
-        except Exception as e:
-            logger.error(f"Opus 4.5 request failed: {e}")
-            return self._fallback_response(user_prompt, str(e))
+        else:
+            return self._fallback_response(user_prompt, result.get("error"))
 
     def _fallback_response(self, prompt: str, error: Optional[str] = None) -> Dict[str, Any]:  # noqa: ARG002
-        """Generate a fallback response when Opus is unavailable."""
+        """Generate a fallback response when models are unavailable."""
         return {
             "success": False,
             "thinking": None,
             "response": None,
-            "error": error or "Opus 4.5 endpoint not available",
+            "error": error or "Databricks models not available",
             "fallback": True
         }
 

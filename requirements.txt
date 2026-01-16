@@ -17,7 +17,7 @@ statsmodels
 xgboost
 pydantic
 requests
-httpx  # Async HTTP client for AI Thinker
+python-dateutil  # Robust date parsing for data normalizer
 openpyxl
 holidays
 python-multipart
