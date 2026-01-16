@@ -476,27 +476,33 @@ export const ResultsChart: React.FC<ResultsChartProps> = ({
           {/* Covariate Overlays - Show in Tooltip Only */}
           {/* Covariates are now part of chartData and will appear in tooltip automatically */}
 
-          {/* Confidence Intervals (Only for Active Model) */}
+          {/* Confidence Interval Band (Shaded area between upper and lower bounds) */}
           {showForecast && (
             <>
+              {/* Upper bound area - creates the shaded band effect */}
               <Area
                 type="monotone"
                 dataKey="yhat_upper"
-                stroke="none"
-                fill="#7c3aed"
-                fillOpacity={0.1}
+                stroke="#8b5cf6"
+                strokeWidth={1}
+                strokeDasharray="3 3"
+                fill="#8b5cf6"
+                fillOpacity={0.15}
                 legendType="none"
-                tooltipType="none"
+                name="95% Confidence Upper"
                 connectNulls
               />
+              {/* Lower bound - draws on top to "cut out" the lower portion */}
               <Area
                 type="monotone"
                 dataKey="yhat_lower"
-                stroke="none"
-                fill="#7c3aed"
-                fillOpacity={0.1}
+                stroke="#8b5cf6"
+                strokeWidth={1}
+                strokeDasharray="3 3"
+                fill="#f9fafb"
+                fillOpacity={1}
                 legendType="none"
-                tooltipType="none"
+                name="95% Confidence Lower"
                 connectNulls
               />
             </>

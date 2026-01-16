@@ -959,6 +959,88 @@ async def _run_forecast(
         from backend.models.arima import train_arima_model
         from backend.models.xgboost import train_xgboost_model
 
+        # ============================================================
+        # MLFLOW SETUP WITH FALLBACK
+        # ============================================================
+        # Try Databricks MLflow first, fall back to local SQLite if unavailable.
+        # This ensures Simple Mode works both in Databricks and local environments.
+        # ============================================================
+        import mlflow
+        import os
+        from datetime import datetime as dt
+
+        mlflow_mode = "databricks"  # Track which mode we're using
+        mlflow_parent_run = None
+        experiment_id = None
+
+        try:
+            # First, try Databricks MLflow
+            databricks_host = os.environ.get("DATABRICKS_HOST", "")
+            databricks_token = os.environ.get("DATABRICKS_TOKEN", "")
+
+            if databricks_host and databricks_token:
+                mlflow.set_tracking_uri("databricks")
+                experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "/Shared/finance-forecasting-simple")
+
+                # Try to get or create the experiment
+                try:
+                    experiment = mlflow.get_experiment_by_name(experiment_name)
+                    if experiment is None:
+                        experiment_id = mlflow.create_experiment(experiment_name)
+                        logger.info(f"📊 Created new MLflow experiment: {experiment_name}")
+                    else:
+                        experiment_id = experiment.experiment_id
+                    mlflow.set_experiment(experiment_name)
+                    logger.info(f"📊 Using Databricks MLflow: {experiment_name}")
+                except Exception as db_exp_error:
+                    logger.warning(f"Could not access Databricks experiment: {db_exp_error}")
+                    raise  # Trigger fallback
+            else:
+                raise ValueError("Databricks credentials not configured")
+
+        except Exception as mlflow_error:
+            # Fall back to local SQLite MLflow
+            mlflow_mode = "local"
+            local_mlflow_dir = os.path.join(os.getcwd(), "mlruns")
+            os.makedirs(local_mlflow_dir, exist_ok=True)
+            mlflow.set_tracking_uri(f"sqlite:///{os.getcwd()}/mlflow.db")
+
+            experiment_name = "simple-mode-forecasting"
+            try:
+                experiment = mlflow.get_experiment_by_name(experiment_name)
+                if experiment is None:
+                    experiment_id = mlflow.create_experiment(experiment_name)
+                else:
+                    experiment_id = experiment.experiment_id
+                mlflow.set_experiment(experiment_name)
+                logger.info(f"📊 Using local MLflow (fallback): {experiment_name}")
+                logger.info(f"   ⚠️ Databricks unavailable: {str(mlflow_error)[:100]}")
+            except Exception as local_exp_error:
+                logger.warning(f"Could not set up local MLflow experiment: {local_exp_error}")
+                # Continue without MLflow - models can still train
+                mlflow_mode = "disabled"
+
+        # Start parent MLflow run for this forecast session
+        mlflow_parent_run_context = None
+        if mlflow_mode != "disabled":
+            try:
+                run_name = f"SimpleMode_{run_id}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
+                mlflow_parent_run_context = mlflow.start_run(run_name=run_name)
+                mlflow_parent_run = mlflow_parent_run_context.__enter__()
+                logger.info(f"📊 Started MLflow parent run: {mlflow_parent_run.info.run_id}")
+
+                # Log run metadata
+                mlflow.log_param("mode", "simple")
+                mlflow.log_param("run_id", run_id)
+                mlflow.log_param("horizon", config.horizon)
+                mlflow.log_param("frequency", config.frequency)
+                mlflow.log_param("data_points", len(data))
+                mlflow.log_param("covariates", str(covariates))
+                mlflow.log_param("mlflow_mode", mlflow_mode)
+            except Exception as run_error:
+                logger.warning(f"Could not start MLflow parent run: {run_error}")
+                mlflow_mode = "disabled"
+
         # Prepare data using the standard preprocessing
         # Note: data_list already has columns renamed to 'ds' and 'y' (lines 752-758)
         # so we pass 'ds' and 'y' to prepare_prophet_data, not the original column names
@@ -1328,7 +1410,7 @@ async def _run_forecast(
             logger.info(f"[OUTPUT] mlflow_run_id: {result_to_use.get('mlflow_run_id')}")
             logger.info("=" * 70)
 
-            return {
+            final_output = {
                 'run_id': run_id,
                 'best_model': result_to_use['model_type'],
                 'model_version': '1.0',
@@ -1357,14 +1439,38 @@ async def _run_forecast(
                 'future_covariates_used': future_covariates_used,
                 'future_covariates_count': future_covariates_count,
                 'future_covariates_date_range': future_covariates_date_range,
+                # Track MLflow mode used
+                'mlflow_mode': mlflow_mode,
             }
+
+            # Cleanup: End MLflow parent run if active
+            if mlflow_parent_run_context is not None:
+                try:
+                    mlflow_parent_run_context.__exit__(None, None, None)
+                    logger.info(f"📊 Closed MLflow parent run")
+                except Exception as cleanup_error:
+                    logger.warning(f"Could not close MLflow run: {cleanup_error}")
+
+            return final_output
 
     except ImportError as e:
         logger.warning(f"[FALLBACK] Could not import full training infrastructure: {e}. Using fallback.")
+        # Cleanup MLflow if it was started
+        if 'mlflow_parent_run_context' in locals() and mlflow_parent_run_context is not None:
+            try:
+                mlflow_parent_run_context.__exit__(None, None, None)
+            except:
+                pass
     except Exception as e:
         logger.error(f"[FALLBACK] AutoML training failed: {e}. Using fallback.")
         import traceback
         logger.error(f"[FALLBACK] Full traceback:\n{traceback.format_exc()}")
+        # Cleanup MLflow if it was started
+        if 'mlflow_parent_run_context' in locals() and mlflow_parent_run_context is not None:
+            try:
+                mlflow_parent_run_context.__exit__(None, None, None)
+            except:
+                pass
 
     # Fallback: simple moving average forecast (when full training unavailable)
     logger.info("[FALLBACK] Using fallback moving average forecast")
