@@ -478,6 +478,6 @@ The system automatically detects and adjusts for:
 
 ---
 
-**Version:** 1.2.0
-**Last Updated:** December 2024
+**Version:** 1.3.1
+**Last Updated:** January 2026
 

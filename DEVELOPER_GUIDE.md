@@ -628,6 +628,11 @@ python backend/tests/test_simple_mode_e2e.py
 
 ## Changelog
 
+### v1.3.1 (January 2026)
+
+**Bug Fixes:**
+- Fixed Super Bowl date calculation for 2022+ (NFL moved to second Sunday of February)
+
 ### v1.3.0 (January 2026)
 
 **New Features - World-Class Holiday Handling:**
@@ -688,5 +693,5 @@ python backend/tests/test_simple_mode_e2e.py
 
 ---
 
-**Version:** 1.3.0
+**Version:** 1.3.1
 **Last Updated:** January 2026

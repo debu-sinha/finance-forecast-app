@@ -109,10 +109,22 @@ def get_easter_date(year: int) -> pd.Timestamp:
 
 
 def get_super_bowl_date(year: int) -> pd.Timestamp:
-    """Get Super Bowl Sunday (first Sunday of February) for a given year."""
+    """
+    Get Super Bowl Sunday for a given year.
+
+    NFL scheduling:
+    - 2020 and earlier: First Sunday of February
+    - 2021: First Sunday of February (Feb 7)
+    - 2022 onwards: Second Sunday of February (NFL added 17th game, pushed back schedule)
+    """
     first_day = pd.Timestamp(year=year, month=2, day=1)
     days_until_sunday = (6 - first_day.dayofweek) % 7
-    return first_day + pd.Timedelta(days=days_until_sunday)
+    first_sunday = first_day + pd.Timedelta(days=days_until_sunday)
+
+    # Starting 2022, Super Bowl moved to second Sunday of February
+    if year >= 2022:
+        return first_sunday + pd.Timedelta(weeks=1)
+    return first_sunday
 
 
 def get_all_key_holiday_dates(year: int) -> Dict[str, pd.Timestamp]:
