@@ -16,46 +16,12 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import holidays
-from backend.models.utils import compute_metrics, time_series_cross_validate, compute_prediction_intervals
+from backend.models.utils import compute_metrics, time_series_cross_validate, compute_prediction_intervals, detect_weekly_freq_code
 
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
-
-def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
-    """Detect the appropriate weekly frequency code based on actual data.
-
-    For weekly data, detects which day of week the data falls on (e.g., Monday)
-    and returns the appropriate pandas freq code (e.g., 'W-MON').
-
-    Returns 'W-MON' as default for weekly, or appropriate code for other frequencies.
-    """
-    if frequency != 'weekly':
-        return {'daily': 'D', 'monthly': 'MS', 'yearly': 'YS'}.get(frequency, 'MS')
-
-    try:
-        if 'ds' in df.columns:
-            dates = pd.to_datetime(df['ds'])
-        else:
-            # Try to find a date column
-            date_cols = df.select_dtypes(include=['datetime64']).columns
-            if len(date_cols) > 0:
-                dates = df[date_cols[0]]
-            else:
-                return 'W-MON'
-
-        if len(dates) > 0:
-            day_counts = dates.dt.dayofweek.value_counts()
-            most_common_day = day_counts.idxmax()
-            day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
-            freq_code = f"W-{day_names[most_common_day]}"
-            logger.info(f"📅 Detected weekly data on {day_names[most_common_day]}s - using freq_code='{freq_code}'")
-            return freq_code
-    except Exception as e:
-        logger.warning(f"Could not detect weekly day-of-week, defaulting to W-MON: {e}")
-
-    return 'W-MON'
 
 class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for ARIMA model

@@ -16,6 +16,7 @@
 | I want to... | Go to... |
 |-------------|----------|
 | **Start forecasting now** | [Quick Start](#quick-start-recommended) |
+| **Understand the architecture** | [Architecture Diagrams](ARCHITECTURE.md) |
 | **Understand the modes (Simple vs Expert)** | [USER_GUIDE.md](USER_GUIDE.md#-understanding-the-modes) |
 | **Learn step-by-step usage** | [USER_GUIDE.md](USER_GUIDE.md) |
 | **Extend or deploy the platform** | [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) |

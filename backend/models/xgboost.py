@@ -10,36 +10,12 @@ from mlflow.models.signature import infer_signature
 import logging
 import warnings
 import holidays
-from backend.models.utils import compute_metrics, compute_prediction_intervals
+from backend.models.utils import compute_metrics, compute_prediction_intervals, detect_weekly_freq_code
 
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
-
-def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
-    """Detect the appropriate weekly frequency code based on actual data."""
-    if frequency != 'weekly':
-        return {'daily': 'D', 'monthly': 'MS', 'yearly': 'YS'}.get(frequency, 'MS')
-
-    try:
-        if 'ds' in df.columns:
-            dates = pd.to_datetime(df['ds'])
-        else:
-            date_cols = df.select_dtypes(include=['datetime64']).columns
-            if len(date_cols) > 0:
-                dates = df[date_cols[0]]
-            else:
-                return 'W-MON'
-
-        if len(dates) > 0:
-            day_counts = dates.dt.dayofweek.value_counts()
-            most_common_day = day_counts.idxmax()
-            day_names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
-            return f"W-{day_names[most_common_day]}"
-    except Exception:
-        pass
-    return 'W-MON'
 
 class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for XGBoost time series model
