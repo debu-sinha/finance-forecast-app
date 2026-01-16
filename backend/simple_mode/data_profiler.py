@@ -110,6 +110,14 @@ class DataProfiler:
         'day_of_week', 'is_weekend', 'is_holiday'
     ]
 
+    # Patterns that indicate a column is likely a COVARIATE, not a target
+    # These should be de-prioritized in target detection
+    COVARIATE_COLUMN_PATTERNS = [
+        'spend', 'cost', 'expense', 'rate', 'margin', 'percent', 'pct', 'ratio',
+        'flag', 'indicator', 'is_', 'has_', 'avg_', 'average', 'mean', 'median',
+        'fee', 'discount', 'price', 'budget', 'marketing'
+    ]
+
     def profile(self, df: pd.DataFrame) -> DataProfile:
         """
         Analyze data and generate complete profile.
@@ -412,7 +420,15 @@ class DataProfiler:
             return "monthly"  # Default for longer gaps
 
     def _detect_target_column(self, df: pd.DataFrame, date_column: str) -> str:
-        """Detect the target (value) column."""
+        """
+        Detect the target (value) column.
+
+        Priority order:
+        1. Exact match with known target patterns (e.g., 'y', 'revenue')
+        2. Partial match with target patterns, excluding covariate-like columns
+        3. Highest variance column that isn't covariate-like
+        4. Highest variance column as fallback
+        """
 
         # Get numeric columns only
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -433,29 +449,58 @@ class DataProfiler:
                 "a numeric column for forecasting (e.g., 'revenue', 'sales', 'value')."
             )
 
+        def is_covariate_like(col_name: str) -> bool:
+            """Check if column name suggests it's a covariate rather than target."""
+            col_lower = col_name.lower()
+            return any(pattern in col_lower for pattern in self.COVARIATE_COLUMN_PATTERNS)
+
+        # Separate columns into likely targets vs likely covariates
+        likely_targets = [c for c in numeric_cols if not is_covariate_like(c)]
+        likely_covariates = [c for c in numeric_cols if is_covariate_like(c)]
+
+        logger.info(f"[TARGET DETECTION] likely_targets: {likely_targets}")
+        logger.info(f"[TARGET DETECTION] likely_covariates: {likely_covariates}")
+
+        # Prioritize likely_targets in pattern matching
+        cols_to_check = likely_targets + likely_covariates  # Check targets first
+
         # Step 1: Try exact matches with short patterns (like 'y')
-        for col in numeric_cols:
+        for col in cols_to_check:
             if col in self.TARGET_COLUMN_EXACT:
+                logger.info(f"[TARGET DETECTION] Exact match found: {col}")
                 return col
 
         # Step 2: Try exact matches with common names (case-insensitive)
-        for col in numeric_cols:
+        # Prioritize columns that aren't covariate-like
+        for col in cols_to_check:
             if col.lower() in self.TARGET_COLUMN_PATTERNS:
+                logger.info(f"[TARGET DETECTION] Pattern exact match found: {col}")
                 return col
 
         # Step 3: Try partial matches with longer patterns
         # Only match if pattern is a substantial part of the column name
-        for col in numeric_cols:
+        # First check likely_targets, then likely_covariates
+        for col in cols_to_check:
             col_lower = col.lower()
             for pattern in self.TARGET_COLUMN_PATTERNS:
                 # Require pattern to be at least 3 chars to avoid false positives
                 if len(pattern) >= 3 and pattern in col_lower:
+                    logger.info(f"[TARGET DETECTION] Pattern partial match found: {col} (pattern: {pattern})")
                     return col
 
-        # Step 4: Pick the column with highest variance (likely the target)
-        # This is a strong heuristic - target columns typically have high variance
+        # Step 4: Pick the column with highest variance
+        # Prefer columns that aren't covariate-like
+        if likely_targets:
+            variances = {col: df[col].var() for col in likely_targets}
+            best_target = max(variances, key=variances.get)
+            logger.info(f"[TARGET DETECTION] Highest variance among likely targets: {best_target}")
+            return best_target
+
+        # Step 5: Fallback - highest variance among all numeric columns
         variances = {col: df[col].var() for col in numeric_cols}
-        return max(variances, key=variances.get)
+        best_fallback = max(variances, key=variances.get)
+        logger.info(f"[TARGET DETECTION] Fallback to highest variance: {best_fallback}")
+        return best_fallback
 
     def _get_date_range(
         self, df: pd.DataFrame, date_column: str

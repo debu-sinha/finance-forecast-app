@@ -17,6 +17,7 @@ statsmodels
 xgboost
 pydantic
 requests
+python-dateutil  # Robust date parsing for data normalizer
 openpyxl
 holidays
 python-multipart
