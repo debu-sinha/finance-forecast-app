@@ -238,11 +238,46 @@ const UserInstructions = () => {
   );
 };
 
+// Parse dates flexibly - handles MM/DD/YY, MM/DD/YYYY, YYYY-MM-DD, etc.
+// IMPORTANT: This handles 2-digit years correctly (e.g., "12/8/25" = 2025, not 1925)
+const parseFlexibleDateUtil = (dateStr: string): Date | null => {
+  if (!dateStr) return null;
+  const str = String(dateStr).trim();
+
+  // Try MM/DD/YY format FIRST (e.g., "11/19/25") - handles 2-digit years
+  const mmddyy = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (mmddyy) {
+    const month = parseInt(mmddyy[1]) - 1;
+    const day = parseInt(mmddyy[2]);
+    let year = parseInt(mmddyy[3]);
+    year = year < 100 ? 2000 + year : year;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // Try standard Date parsing (handles ISO, MM/DD/YYYY, etc.)
+  let d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+
+  // Try YYYY-MM-DD format
+  const yyyymmdd = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (yyyymmdd) {
+    d = new Date(parseInt(yyyymmdd[1]), parseInt(yyyymmdd[2]) - 1, parseInt(yyyymmdd[3]));
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+};
+
 const detectFrequency = (data: DataRow[], dateCol: string): 'daily' | 'weekly' | 'monthly' => {
   if (!data || data.length < 2 || !dateCol) return 'monthly';
 
+  // Use parseFlexibleDateUtil to handle 2-digit years correctly
   const dates = data
-    .map(row => new Date(String(row[dateCol])).getTime())
+    .map(row => {
+      const d = parseFlexibleDateUtil(String(row[dateCol]));
+      return d ? d.getTime() : NaN;
+    })
     .filter(t => !isNaN(t))
     .sort((a, b) => a - b);
 
@@ -857,16 +892,14 @@ const App = () => {
   };
 
   // Helper function to parse various date formats
+  // IMPORTANT: Check MM/DD/YY format FIRST to handle 2-digit years correctly
+  // (e.g., "12/8/25" should be 2025, not 1925)
   const parseFlexibleDate = (dateStr: string): Date | null => {
     if (!dateStr) return null;
 
     const str = String(dateStr).trim();
 
-    // Try standard Date parsing first
-    let d = new Date(str);
-    if (!isNaN(d.getTime())) return d;
-
-    // Try MM/DD/YY format (e.g., "11/19/25")
+    // Try MM/DD/YY format FIRST (e.g., "11/19/25") - handles 2-digit years
     const mmddyy = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
     if (mmddyy) {
       const month = parseInt(mmddyy[1]) - 1;
@@ -874,19 +907,13 @@ const App = () => {
       let year = parseInt(mmddyy[3]);
       // Assume 20xx for years 00-99
       year = year < 100 ? 2000 + year : year;
-      d = new Date(year, month, day);
+      const d = new Date(year, month, day);
       if (!isNaN(d.getTime())) return d;
     }
 
-    // Try MM/DD/YYYY format
-    const mmddyyyy = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-    if (mmddyyyy) {
-      const month = parseInt(mmddyyyy[1]) - 1;
-      const day = parseInt(mmddyyyy[2]);
-      const year = parseInt(mmddyyyy[3]);
-      d = new Date(year, month, day);
-      if (!isNaN(d.getTime())) return d;
-    }
+    // Try standard Date parsing (handles ISO, MM/DD/YYYY, etc.)
+    let d = new Date(str);
+    if (!isNaN(d.getTime())) return d;
 
     // Try YYYY-MM-DD format
     const yyyymmdd = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
