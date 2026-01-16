@@ -39,17 +39,37 @@ fi
 # Load environment variables
 export $(grep -v '^#' .env.local | xargs)
 
-# Check for required environment variables (backend only)
+# Check for Databricks environment variables (optional - fallback mode works without them)
+DATABRICKS_MODE="full"
 if [ -z "$DATABRICKS_HOST" ] || [ "$DATABRICKS_HOST" = "https://your-workspace.cloud.databricks.com" ]; then
-    echo "❌ DATABRICKS_HOST not set in .env.local"
-    echo "Set it to your Databricks workspace URL"
-    exit 1
+    DATABRICKS_MODE="fallback"
+    echo "⚠️  DATABRICKS_HOST not configured - running in fallback mode"
 fi
 
 if [ -z "$DATABRICKS_TOKEN" ] || [ "$DATABRICKS_TOKEN" = "your_databricks_token_here" ]; then
-    echo "❌ DATABRICKS_TOKEN not set in .env.local"
-    echo "Generate a token from User Settings > Access Tokens in Databricks"
-    exit 1
+    DATABRICKS_MODE="fallback"
+    echo "⚠️  DATABRICKS_TOKEN not configured - running in fallback mode"
+fi
+
+if [ "$DATABRICKS_MODE" = "fallback" ]; then
+    echo ""
+    echo "📌 Fallback mode enabled:"
+    echo "   - MLflow will use local SQLite database"
+    echo "   - AI Thinker will provide basic analysis (Opus 4.5 unavailable)"
+    echo "   - All other features work normally"
+    echo ""
+    echo "   To enable full features, set in .env.local:"
+    echo "   - DATABRICKS_HOST=https://your-workspace.cloud.databricks.com"
+    echo "   - DATABRICKS_TOKEN=your_token"
+    echo "   - OPUS_ENDPOINT_NAME=your-opus-endpoint (optional)"
+    echo ""
+else
+    echo "✅ Databricks credentials configured"
+    if [ -n "$OPUS_ENDPOINT_NAME" ]; then
+        echo "✅ AI Thinker endpoint: $OPUS_ENDPOINT_NAME"
+    else
+        echo "ℹ️  AI Thinker will use default endpoint: opus-4-5-thinker"
+    fi
 fi
 
 echo "✅ Environment variables loaded"
@@ -103,6 +123,11 @@ echo ""
 echo "🌐 Frontend: http://localhost:3000"
 echo "🔧 Backend API: http://localhost:8000"
 echo "📚 API Docs: http://localhost:8000/docs"
+echo "🧠 AI Thinker: http://localhost:8000/api/thinker/status"
+echo ""
+if [ "$DATABRICKS_MODE" = "fallback" ]; then
+    echo "⚠️  Running in fallback mode (no Databricks)"
+fi
 echo ""
 echo "Press Ctrl+C to stop all services"
 echo ""

@@ -40,6 +40,14 @@ except ImportError:
     SIMPLE_MODE_AVAILABLE = False
     simple_mode_router = None
 
+# AI Thinker - Opus 4.5 powered intelligent analysis
+try:
+    from backend.ai_thinker import thinker_router
+    THINKER_AVAILABLE = True
+except ImportError:
+    THINKER_AVAILABLE = False
+    thinker_router = None
+
 # Configure logging with both console and file handlers
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -201,6 +209,11 @@ if os.path.exists(static_dir):
 if SIMPLE_MODE_AVAILABLE and simple_mode_router:
     app.include_router(simple_mode_router)
     logger.info("✅ Simple Mode routes registered at /api/simple/*")
+
+# Register AI Thinker routes
+if THINKER_AVAILABLE and thinker_router:
+    app.include_router(thinker_router)
+    logger.info("✅ AI Thinker routes registered at /api/thinker/*")
 
 @app.get("/")
 async def root():
