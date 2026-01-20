@@ -607,7 +607,6 @@ const App = () => {
         const existing = groups.get(dateKey)!;
         existing.sum += val;
         existing.count += 1;
-        console.log('  DUPLICATE DATE FOUND:', dateKey, 'Count:', existing.count, 'Sum:', existing.sum);
       } else {
         groups.set(dateKey, { row: { ...row, [timeCol]: dateKey }, sum: val, count: 1 });
       }
@@ -624,6 +623,16 @@ const App = () => {
     console.log('  aggregatedData.length:', result.length);
     console.log('  Unique dates:', groups.size);
     console.log('  Aggregation method:', isAverageColumn ? 'AVERAGE' : 'SUM');
+
+    // Debug: Log sample aggregated values to verify scale
+    if (result.length > 0) {
+      const targetValues = result.slice(0, 5).map(r => r[targetCol]);
+      console.log('  Sample target values (first 5):', targetValues);
+      const maxVal = Math.max(...result.map(r => Number(r[targetCol]) || 0));
+      const minVal = Math.min(...result.map(r => Number(r[targetCol]) || 0));
+      const avgVal = result.reduce((sum, r) => sum + (Number(r[targetCol]) || 0), 0) / result.length;
+      console.log(`  Target range: min=${minVal.toLocaleString()}, max=${maxVal.toLocaleString()}, avg=${avgVal.toLocaleString()}`);
+    }
 
     return result;
   }, [filteredData, timeCol, targetCol]);
@@ -786,7 +795,7 @@ const App = () => {
         setFeatureColumns(cols);
         const probableDate = cols.find(c => {
           const lower = c.toLowerCase();
-          return lower.includes('date') || lower === 'ds' || lower.includes('time') || lower === 'week' || lower === 'year' || lower === 'month' || lower === 'day' || lower.includes('timestamp');
+          return lower.includes('date') || lower === 'ds' || lower.includes('time') || lower.includes('week') || lower === 'year' || lower === 'month' || lower === 'day' || lower.includes('timestamp');
         });
         if (probableDate) setFeatureDateCol(probableDate);
       }
@@ -1254,11 +1263,11 @@ const App = () => {
         row.date,
         row.dayOfWeek,
         row.isWeekend ? 'Yes' : 'No',
-        row.predicted.toFixed(2),
-        row.actual.toFixed(2),
-        row.error.toFixed(2),
-        row.mape.toFixed(2),
-        row.error >= 0 ? 'Under-forecast' : 'Over-forecast',
+        parseFloat(String(row.predicted)).toFixed(2),
+        parseFloat(String(row.actual)).toFixed(2),
+        parseFloat(String(row.error)).toFixed(2),
+        parseFloat(String(row.mape)).toFixed(2),
+        parseFloat(String(row.error)) >= 0 ? 'Under-forecast' : 'Over-forecast',
         row.status.replace('_', ' '),
         `"${(row.contextFlags || []).join(', ')}"`
       ].join(','))
@@ -1446,14 +1455,16 @@ const App = () => {
 
   // Analyze data and get model/hyperparameter recommendations
   const handleAnalyzeData = async () => {
-    if (!timeCol || !targetCol || filteredData.length === 0) {
+    // Use aggregatedData (date-aggregated) instead of filteredData (raw rows)
+    // This ensures observation count matches what training actually uses
+    if (!timeCol || !targetCol || aggregatedData.length === 0) {
       return;
     }
 
     setIsAnalyzingData(true);
     try {
       const result = await analyzeTrainingData(
-        filteredData,
+        aggregatedData,
         timeCol,
         targetCol,
         frequency
@@ -1635,10 +1646,24 @@ const App = () => {
       setTrainingStatus('Finalizing MLflow Registration...');
 
       console.log('📦 Backend Response:', backendResponse);
+      console.log('📦 Backend Response models:', backendResponse?.models);
+      console.log('📦 Backend Response models length:', backendResponse?.models?.length);
+
+      // DEBUG: Alert to verify we're reaching this point
+      // alert('DEBUG: Backend response received. Models: ' + (backendResponse?.models?.length || 0));
 
       // Backend now returns multiple model results - filter out failed ones for display
+      if (!backendResponse?.models || !Array.isArray(backendResponse.models)) {
+        console.error('❌ Invalid backend response - models is not an array:', backendResponse);
+        throw new Error('Invalid backend response: models array not found');
+      }
+
       const modelResults: ModelRunResult[] = backendResponse.models
-        .filter((m: any) => !m.error && m.metrics.mape !== 'N/A')  // Only successful models
+        .filter((m: any) => {
+          const passed = !m.error && m.metrics?.mape !== 'N/A';
+          console.log(`  Model ${m.model_name}: error=${m.error}, mape=${m.metrics?.mape}, passed=${passed}`);
+          return passed;
+        })  // Only successful models
         .map((m: any) => {
           console.log('Processing model:', m.model_name, 'isBest:', m.is_best, 'experimentUrl:', m.experiment_url);
           return {
@@ -1692,9 +1717,11 @@ const App = () => {
           .filter((m: any) => m.error || m.metrics.mape === 'N/A')
           .map((m: any) => `${m.model_type}: ${m.error || 'Unknown error'}`)
           .join('\n');
+        console.error('❌ All models failed:', failedModels);
         throw new Error(`All models failed to train:\n${failedModels}`);
       }
 
+      console.log('🔄 Calling generateForecastInsights...');
       const aiResult = await generateForecastInsights(
         analysis?.summary || '',
         targetCol,
@@ -1709,8 +1736,11 @@ const App = () => {
         regressorMethod
       );
 
+      console.log('✅ generateForecastInsights returned:', aiResult ? 'success' : 'null');
+
       // Extract covariate impacts from best model
       const bestModel = modelResults.find(m => m.isBest) || modelResults[0];
+      console.log('🔍 bestModel found:', bestModel ? bestModel.modelName : 'NOT FOUND');
       const bestModelData = backendResponse.models.find((m: any) => m.is_best) || backendResponse.models[0];
       const covariateImpacts = bestModelData?.covariate_impacts || [];
 
@@ -1768,17 +1798,23 @@ const App = () => {
         console.error('❌ Failed to generate executive summary:', error);
       } finally {
         setIsGeneratingSummary(false);
-        console.log('🔚 Executive summary generation finished, transitioning to results in 500ms...');
+        console.log('🔚 Executive summary generation finished');
       }
 
+      // Transition to results - using setTimeout to ensure state updates are processed
+      console.log('🚀 Transitioning to RESULTS step now');
       setTimeout(() => {
-        console.log('🚀 Transitioning to RESULTS step now');
         setIsTraining(false);
-        setTrainingStatus('');  // Clear the status when transitioning to results
+        setTrainingStatus('');
         setStep(AppStep.RESULTS);
-      }, 500);
+        console.log('✅ Step set to RESULTS');
+      }, 100);
 
     } catch (error: any) {
+      // Log the full error for debugging
+      console.error('❌❌❌ Training catch block error:', error);
+      console.error('❌❌❌ Error stack:', error.stack);
+
       // Set detailed error message for display
       let errorMessage = error.message || 'Training failed due to an unknown error.';
 
@@ -1789,6 +1825,7 @@ const App = () => {
         errorMessage = 'Network error. Please check your connection and ensure the backend server is running.';
       }
 
+      console.error('❌❌❌ Setting training error and resetting to CONFIG:', errorMessage);
       setTrainingError(errorMessage);
       setIsTraining(false);
       setStep(AppStep.CONFIG);
@@ -2224,7 +2261,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Data Intelligence</label>
                       <button
                         onClick={handleAnalyzeData}
-                        disabled={isAnalyzingData || !timeCol || !targetCol || filteredData.length === 0}
+                        disabled={isAnalyzingData || !timeCol || !targetCol || aggregatedData.length === 0}
                         className="w-full px-3 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed flex items-center justify-center space-x-2 text-sm font-medium"
                       >
                         {isAnalyzingData ? (
@@ -2750,7 +2787,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                   <div className="bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 p-4 rounded-lg">
                     <div className="flex items-center justify-between mb-3">
                       <div className="flex items-center space-x-2">
-                        <CheckCircle className="w-5 h-5 text-emerald-600" />
+                        <CheckCircle2 className="w-5 h-5 text-emerald-600" />
                         <h4 className="text-sm font-bold text-emerald-900">Forecast Quality Summary</h4>
                       </div>
                       <div className={`text-xs font-bold px-2 py-1 rounded ${
@@ -2773,7 +2810,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       </div>
                       <div className="bg-white p-3 rounded-md border border-emerald-100">
                         <div className="text-emerald-600 text-[10px] font-semibold uppercase">Accuracy (MAPE)</div>
-                        <div className="text-gray-900 font-bold text-sm">{activeResult.metrics?.mape?.toFixed(1)}%</div>
+                        <div className="text-gray-900 font-bold text-sm">{parseFloat(activeResult.metrics?.mape || '0').toFixed(1)}%</div>
                         <div className="text-gray-500 text-[10px]">Lower is better</div>
                       </div>
                       <div className="bg-white p-3 rounded-md border border-emerald-100">
@@ -2816,7 +2853,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
                         <div className="flex items-center space-x-1">
                           {aggregatedData.length >= 52 ? (
-                            <CheckCircle className="w-3.5 h-3.5 text-green-500" />
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
                           ) : (
                             <AlertTriangle className="w-3.5 h-3.5 text-yellow-500" />
                           )}
@@ -2828,7 +2865,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         </div>
                         <div className="flex items-center space-x-1">
                           {covariates.length > 0 ? (
-                            <CheckCircle className="w-3.5 h-3.5 text-green-500" />
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
                           ) : (
                             <Info className="w-3.5 h-3.5 text-blue-500" />
                           )}
@@ -2837,11 +2874,11 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                           </span>
                         </div>
                         <div className="flex items-center space-x-1">
-                          <CheckCircle className="w-3.5 h-3.5 text-green-500" />
+                          <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
                           <span className="text-gray-600">Reproducible (seed: {randomSeed})</span>
                         </div>
                         <div className="flex items-center space-x-1">
-                          <CheckCircle className="w-3.5 h-3.5 text-green-500" />
+                          <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
                           <span className="text-gray-600">
                             {trainingResult.results.length > 1
                               ? `Best of ${trainingResult.results.length} models`
@@ -3655,17 +3692,17 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                           {row.isWeekend && ' 🗓'}
                                         </span>
                                       </td>
-                                      <td className="px-2 py-2 text-right text-gray-700">{row.predicted.toFixed(2)}</td>
-                                      <td className="px-2 py-2 text-right text-gray-700 font-medium">{row.actual.toFixed(2)}</td>
-                                      <td className={`px-2 py-2 text-right font-medium ${row.error >= 0 ? 'text-blue-600' : 'text-purple-600'}`}>
-                                        {row.error >= 0 ? '+' : ''}{row.error.toFixed(2)}
+                                      <td className="px-2 py-2 text-right text-gray-700">{parseFloat(String(row.predicted)).toFixed(2)}</td>
+                                      <td className="px-2 py-2 text-right text-gray-700 font-medium">{parseFloat(String(row.actual)).toFixed(2)}</td>
+                                      <td className={`px-2 py-2 text-right font-medium ${parseFloat(String(row.error)) >= 0 ? 'text-blue-600' : 'text-purple-600'}`}>
+                                        {parseFloat(String(row.error)) >= 0 ? '+' : ''}{parseFloat(String(row.error)).toFixed(2)}
                                       </td>
                                       <td className={`px-2 py-2 text-right font-bold ${row.status === 'excellent' ? 'text-green-600' :
                                           row.status === 'good' ? 'text-blue-600' :
                                             row.status === 'acceptable' ? 'text-yellow-600' :
                                               row.status === 'review' ? 'text-orange-600' : 'text-red-600'
                                         }`}>
-                                        {row.mape.toFixed(2)}%
+                                        {parseFloat(String(row.mape)).toFixed(2)}%
                                       </td>
                                       <td className="px-2 py-2 text-center">
                                         <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${row.error >= 0
