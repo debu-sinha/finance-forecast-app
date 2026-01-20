@@ -76,3 +76,6 @@ validation_output/
 
 # E2E test results (screenshots, logs)
 tests/results/
+
+# Puppeteer E2E tests (local only)
+tests/*.cjs
