@@ -157,12 +157,19 @@ class AutopilotConfig:
             model_configs[model] = self._get_optimal_params(model, profile)
             logger.info(f"[CONFIG] {model} params: {model_configs[model].params}")
 
+        # Use safe_covariates (excludes leaky columns with >90% correlation)
+        # Fall back to covariate_columns if safe_covariates not available
+        covariates_to_use = profile.safe_covariates if profile.safe_covariates else profile.covariate_columns
+        if profile.leaky_covariates:
+            logger.warning(f"⚠️ EXCLUDING LEAKY COVARIATES: {profile.leaky_covariates}")
+            logger.info(f"Using {len(covariates_to_use)} safe covariates instead of {len(profile.covariate_columns)} total")
+
         config = ForecastConfig(
             # Auto-determined settings
             frequency=profile.frequency,
             date_column=profile.date_column,
             target_column=profile.target_column,
-            covariate_columns=profile.covariate_columns,
+            covariate_columns=covariates_to_use,
 
             # Forecast settings
             horizon=final_horizon,
