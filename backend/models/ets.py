@@ -299,9 +299,24 @@ def train_exponential_smoothing_model(
 
     # Limit ETS combinations for Databricks Apps
     param_combinations = list(set([(trend, seasonal) for trend in trend_options for seasonal in seasonal_options]))
+
+    # CRITICAL: Filter out degenerate ETS combinations that produce flat/uninformative forecasts
+    # (None, None) = simple exponential smoothing with no trend/seasonal = flat forecast
+    original_count = len(param_combinations)
+    param_combinations = [p for p in param_combinations if not (p[0] is None and p[1] is None)]
+
+    if len(param_combinations) < original_count:
+        logger.info(f"🚫 Excluded {original_count - len(param_combinations)} degenerate ETS combinations (flat forecast prevention)")
+
+    # Ensure we have at least some valid combinations
+    if len(param_combinations) == 0:
+        param_combinations = [('add', None), (None, 'add'), ('add', 'add')]
+        logger.warning("All ETS combinations were degenerate. Using fallback: trend or seasonal components.")
+
     max_ets_combinations = int(os.environ.get('ETS_MAX_COMBINATIONS', '4'))
     if len(param_combinations) > max_ets_combinations:
-        param_combinations.sort(key=lambda x: (x[0] is not None, x[1] is not None))
+        # Prefer combinations with trend/seasonal components (non-flat)
+        param_combinations.sort(key=lambda x: (x[0] is None, x[1] is None))
         param_combinations = param_combinations[:max_ets_combinations]
         logger.info(f"Limited ETS combinations to {max_ets_combinations}")
 

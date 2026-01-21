@@ -849,9 +849,26 @@ def train_sarimax_model(
         for P, D, Q in itertools.product(P_values, D_values, Q_values):
             all_orders.append(((p, d, q), (P, D, Q, seasonal_period)))
 
+    # CRITICAL: Filter out degenerate SARIMAX orders that produce flat/uninformative forecasts
+    # Same fix as ARIMA - (0,0,0), (0,1,0), (0,2,0) produce constant/random walk forecasts
+    degenerate_orders = {(0, 0, 0), (0, 1, 0), (0, 2, 0)}
+    original_count = len(all_orders)
+    all_orders = [o for o in all_orders if o[0] not in degenerate_orders]
+
+    if len(all_orders) < original_count:
+        excluded_count = original_count - len(all_orders)
+        logger.info(f"🚫 Excluded {excluded_count} degenerate SARIMAX orders (flat forecast prevention)")
+
+    # Ensure we have at least some valid orders
+    if len(all_orders) == 0:
+        all_orders = [((1, 1, 0), (0, 0, 0, seasonal_period)),
+                      ((0, 1, 1), (0, 0, 0, seasonal_period)),
+                      ((1, 1, 1), (0, 0, 0, seasonal_period))]
+        logger.warning("All SARIMAX orders were degenerate. Using fallback orders.")
+
     all_orders.sort(key=lambda x: sum(x[0]) + sum(x[1][:3]))
     orders = all_orders[:max_combinations]
-    logger.info(f"Limited SARIMAX combinations to {len(orders)} (from {len(all_orders)} total)")
+    logger.info(f"Limited SARIMAX combinations to {len(orders)} (from {original_count} total, {original_count - len(all_orders)} degenerate excluded)")
 
     with mlflow.start_run(run_name="SARIMAX_Tuning", nested=True) as parent_run:
         parent_run_id = parent_run.info.run_id
