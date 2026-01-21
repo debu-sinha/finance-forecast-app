@@ -395,33 +395,50 @@ def time_series_cross_validate(
     model_predict_fn,
     n_splits: int = 3,
     min_train_size: Optional[int] = None,
-    horizon: int = 1
+    horizon: int = 1,
+    gap: int = 0
 ) -> Dict[str, Any]:
     """
-    Perform time series cross-validation with expanding window.
+    Perform time series cross-validation with expanding window and optional gap.
+
+    Args:
+        y: Time series values
+        model_fit_fn: Function to fit model, takes y_train returns fitted model
+        model_predict_fn: Function to predict, takes (fitted_model, steps) returns predictions
+        n_splits: Number of CV folds
+        min_train_size: Minimum training set size
+        horizon: Forecast horizon (test set size per fold)
+        gap: Number of periods to skip between train and test (embargo/purging)
+             Prevents data leakage from overlapping information sets
+
+    Returns:
+        Dict with cv_scores, mean_mape, std_mape, n_splits
     """
     n = len(y)
     if min_train_size is None:
         min_train_size = max(n // 2, 10)  # At least 50% or 10 points
 
-    available_for_cv = n - min_train_size
+    # Account for gap in available data calculation
+    available_for_cv = n - min_train_size - gap
     if available_for_cv < n_splits * horizon:
         n_splits = max(1, available_for_cv // horizon)
-        logger.warning(f"Reduced CV splits to {n_splits} due to limited data")
+        logger.warning(f"Reduced CV splits to {n_splits} due to limited data (gap={gap})")
 
     if n_splits < 1:
         logger.warning("Not enough data for cross-validation, using simple holdout")
         return {"cv_scores": [], "mean_mape": None, "std_mape": None, "n_splits": 0}
 
-    fold_size = (n - min_train_size) // n_splits
+    fold_size = (n - min_train_size - gap) // n_splits
     cv_scores = []
 
     for i in range(n_splits):
         split_point = min_train_size + i * fold_size
-        test_end = min(split_point + horizon, n)
+        # Apply gap/embargo: skip 'gap' periods after training data
+        test_start = split_point + gap
+        test_end = min(test_start + horizon, n)
 
         y_train = y[:split_point]
-        y_test = y[split_point:test_end]
+        y_test = y[test_start:test_end]
 
         if len(y_test) == 0:
             continue
@@ -433,7 +450,7 @@ def time_series_cross_validate(
             # Use safe_mape to handle division by zero
             fold_mape = safe_mape(y_test, predictions)
             cv_scores.append(fold_mape)
-            logger.info(f"  CV Fold {i+1}/{n_splits}: train={len(y_train)}, test={len(y_test)}, MAPE={fold_mape:.2f}%")
+            logger.info(f"  CV Fold {i+1}/{n_splits}: train={len(y_train)}, gap={gap}, test={len(y_test)}, MAPE={fold_mape:.2f}%")
         except Exception as e:
             logger.warning(f"  CV Fold {i+1} failed: {e}")
             continue
@@ -1653,6 +1670,235 @@ def validate_forecast_output(
         logger.error(f"❌ Forecast validation FAILED: {result['issues']}")
 
     return result
+
+
+# =============================================================================
+# RESIDUAL DIAGNOSTICS
+# =============================================================================
+
+def compute_residual_acf_diagnostics(
+    residuals: np.ndarray,
+    max_lags: int = 10,
+    significance_level: float = 0.05
+) -> Dict[str, Any]:
+    """
+    Compute residual autocorrelation diagnostics to verify model quality.
+
+    A well-fitted model should have residuals that are white noise (no autocorrelation).
+    Significant autocorrelation in residuals indicates the model missed patterns.
+
+    Based on: Hyndman & Athanasopoulos "Forecasting: Principles and Practice"
+
+    Args:
+        residuals: Model residuals (y_actual - y_predicted)
+        max_lags: Maximum number of lags to check (default 10)
+        significance_level: Alpha for Ljung-Box test (default 0.05)
+
+    Returns:
+        Dict with:
+        - is_white_noise: True if residuals pass white noise test
+        - acf_values: Autocorrelation at each lag
+        - significant_lags: Lags with significant autocorrelation
+        - ljung_box_p: P-value from Ljung-Box test
+        - diagnostics: Human-readable diagnostic messages
+    """
+    residuals = np.asarray(residuals, dtype=np.float64)
+
+    # Remove NaN/Inf
+    valid_mask = np.isfinite(residuals)
+    residuals = residuals[valid_mask]
+
+    result = {
+        'is_white_noise': True,
+        'acf_values': [],
+        'significant_lags': [],
+        'ljung_box_p': None,
+        'ljung_box_statistic': None,
+        'diagnostics': [],
+        'n_residuals': len(residuals)
+    }
+
+    if len(residuals) < max_lags + 5:
+        result['diagnostics'].append(f"Insufficient residuals ({len(residuals)}) for ACF analysis")
+        return result
+
+    # Compute ACF manually (avoid statsmodels dependency for portability)
+    n = len(residuals)
+    mean_r = np.mean(residuals)
+    var_r = np.var(residuals)
+
+    if var_r == 0:
+        result['diagnostics'].append("Zero variance in residuals - model may be constant")
+        result['is_white_noise'] = False
+        return result
+
+    # ACF at each lag
+    acf_values = []
+    for lag in range(1, max_lags + 1):
+        if lag >= n:
+            break
+        acf = np.sum((residuals[lag:] - mean_r) * (residuals[:-lag] - mean_r)) / (n * var_r)
+        acf_values.append(float(acf))
+
+    result['acf_values'] = acf_values
+
+    # Bartlett's approximation for significance bound: ±1.96/sqrt(n)
+    sig_bound = stats.norm.ppf(1 - significance_level / 2) / np.sqrt(n)
+
+    # Find significant lags
+    significant_lags = []
+    for i, acf in enumerate(acf_values):
+        if abs(acf) > sig_bound:
+            significant_lags.append({
+                'lag': i + 1,
+                'acf': round(acf, 4),
+                'bound': round(sig_bound, 4)
+            })
+
+    result['significant_lags'] = significant_lags
+
+    # Ljung-Box test for overall white noise
+    # Q = n(n+2) * sum(acf[k]^2 / (n-k)) for k=1..m
+    Q = 0.0
+    for k, acf in enumerate(acf_values, start=1):
+        Q += (acf ** 2) / (n - k)
+    Q *= n * (n + 2)
+
+    # Q follows chi-squared with max_lags degrees of freedom
+    p_value = float(1.0 - stats.chi2.cdf(Q, df=len(acf_values)))
+    result['ljung_box_statistic'] = round(Q, 4)
+    result['ljung_box_p'] = round(p_value, 4)
+
+    # Determine if white noise
+    if p_value < significance_level:
+        result['is_white_noise'] = False
+        result['diagnostics'].append(
+            f"Ljung-Box test FAILED (p={p_value:.4f} < {significance_level}): "
+            f"Residuals have significant autocorrelation"
+        )
+        logger.warning(f"⚠️ Residual ACF diagnostic: Model residuals are NOT white noise (p={p_value:.4f})")
+    else:
+        result['diagnostics'].append(
+            f"Ljung-Box test PASSED (p={p_value:.4f}): Residuals are white noise"
+        )
+        logger.info(f"✅ Residual ACF diagnostic: Residuals are white noise (p={p_value:.4f})")
+
+    if significant_lags:
+        result['diagnostics'].append(
+            f"Significant autocorrelation at lags: {[s['lag'] for s in significant_lags]}"
+        )
+        if not result['is_white_noise']:
+            result['diagnostics'].append(
+                "Consider: (1) Adding seasonal terms, (2) Increasing model order, "
+                "(3) Using differencing"
+            )
+
+    return result
+
+
+# =============================================================================
+# CONFORMAL PREDICTION INTERVALS
+# =============================================================================
+
+def compute_conformal_prediction_intervals(
+    y_train: np.ndarray,
+    y_pred_train: np.ndarray,
+    forecast_values: np.ndarray,
+    coverage: float = 0.95,
+    method: str = 'split'
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Compute distribution-free conformal prediction intervals.
+
+    Conformal prediction provides prediction intervals with guaranteed coverage
+    without assuming normality of residuals.
+
+    Based on: Barber et al. "Conformal Prediction Under Covariate Shift" (2019)
+              and "Distribution-Free Predictive Inference for Regression" (2018)
+
+    Args:
+        y_train: Actual training values
+        y_pred_train: Predicted values for training set (from CV or holdout)
+        forecast_values: Point forecasts for future periods
+        coverage: Desired coverage probability (default 0.95)
+        method: 'split' for split conformal, 'quantile' for quantile-based
+
+    Returns:
+        Tuple of (lower_bounds, upper_bounds, diagnostics)
+        - Intervals have guaranteed coverage if calibration set is exchangeable
+    """
+    y_train = np.asarray(y_train, dtype=np.float64)
+    y_pred_train = np.asarray(y_pred_train, dtype=np.float64)
+    forecast_values = np.asarray(forecast_values, dtype=np.float64)
+
+    diagnostics = {
+        'method': method,
+        'coverage': coverage,
+        'n_calibration': len(y_train),
+        'conformity_scores': None,
+        'quantile_threshold': None
+    }
+
+    # Compute conformity scores (absolute residuals)
+    residuals = y_train - y_pred_train
+    conformity_scores = np.abs(residuals)
+
+    # Remove NaN/Inf
+    valid_mask = np.isfinite(conformity_scores)
+    conformity_scores = conformity_scores[valid_mask]
+
+    if len(conformity_scores) < 5:
+        logger.warning("Insufficient calibration data for conformal intervals, using parametric fallback")
+        # Fallback to parametric
+        residual_std = np.std(residuals[np.isfinite(residuals)])
+        z = _get_z_critical_value(coverage)
+        margin = z * residual_std
+        return forecast_values - margin, forecast_values + margin, diagnostics
+
+    diagnostics['n_calibration'] = len(conformity_scores)
+
+    if method == 'split':
+        # Split conformal: use quantile of conformity scores
+        # Finite sample correction: (1 + 1/n) * coverage quantile
+        n = len(conformity_scores)
+        adjusted_coverage = min(1.0, (1 + 1/n) * coverage)
+        quantile_threshold = float(np.quantile(conformity_scores, adjusted_coverage))
+
+        diagnostics['quantile_threshold'] = round(quantile_threshold, 4)
+        diagnostics['adjusted_coverage'] = round(adjusted_coverage, 4)
+
+        # Constant width intervals
+        lower_bounds = forecast_values - quantile_threshold
+        upper_bounds = forecast_values + quantile_threshold
+
+    elif method == 'quantile':
+        # Quantile-based: separate lower and upper
+        alpha = 1 - coverage
+        lower_residuals = residuals[np.isfinite(residuals)]
+        upper_residuals = residuals[np.isfinite(residuals)]
+
+        lower_q = float(np.quantile(lower_residuals, alpha / 2))
+        upper_q = float(np.quantile(upper_residuals, 1 - alpha / 2))
+
+        diagnostics['lower_quantile'] = round(lower_q, 4)
+        diagnostics['upper_quantile'] = round(upper_q, 4)
+
+        lower_bounds = forecast_values + lower_q  # lower_q is negative
+        upper_bounds = forecast_values + upper_q
+
+    else:
+        raise ValueError(f"Unknown conformal method: {method}")
+
+    # Ensure lower < upper
+    lower_bounds = np.minimum(lower_bounds, forecast_values)
+    upper_bounds = np.maximum(upper_bounds, forecast_values)
+
+    # Log diagnostics
+    avg_width = np.mean(upper_bounds - lower_bounds)
+    logger.info(f"✅ Conformal {coverage:.0%} PI: avg width={avg_width:.2f}, "
+               f"method={method}, n_cal={diagnostics['n_calibration']}")
+
+    return lower_bounds, upper_bounds, diagnostics
 
 
 def validate_forecast_reasonableness(
