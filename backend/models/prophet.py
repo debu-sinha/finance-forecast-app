@@ -135,6 +135,22 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
         # Return clean dates (ensure normalized, no time component)
         result = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
         result['ds'] = pd.to_datetime(result['ds']).dt.normalize()
+
+        # ==========================================================================
+        # P2 FIX: Clip negative forecasts for financial metrics
+        # ==========================================================================
+        # Financial metrics (revenue, volume, counts) cannot be negative.
+        # Prophet can produce negative forecasts, especially with additive
+        # seasonality and strong downward trends. Clip to zero.
+        # ==========================================================================
+        neg_forecast_count = (result['yhat'] < 0).sum()
+        if neg_forecast_count > 0:
+            logger.warning(f"⚠️ Clipping {neg_forecast_count} negative forecast values to 0 (financial data cannot be negative)")
+            result['yhat'] = result['yhat'].clip(lower=0)
+            result['yhat_lower'] = result['yhat_lower'].clip(lower=0)
+            # Ensure yhat_upper >= yhat after clipping
+            result['yhat_upper'] = result[['yhat', 'yhat_upper']].max(axis=1)
+
         return result
 
 def prepare_prophet_data(data: List[Dict[str, Any]], time_col: str, target_col: str, covariates: List[str]) -> pd.DataFrame:
@@ -261,37 +277,89 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
         train_df_local = train_df.copy()
         test_df_local = test_df.copy()
 
-        # Fill NaN in lag columns - Prophet cannot handle NaN in regressors
+        # ==========================================================================
+        # DATA LEAKAGE FIX: Fill lag NaNs using TRAIN-ONLY statistics
+        # ==========================================================================
+        # Previous bug: Filled NaN with 0, creating artificial signal
+        # Fix: Use training set mean for lag imputation (no test data leakage)
+        # ==========================================================================
         lag_cols = [c for c in covariates if c.startswith('lag_')]
+        lag_fill_values = {}  # Store train-only statistics for lag imputation
         for col in lag_cols:
             if col in train_df_local.columns:
-                train_df_local[col] = train_df_local[col].fillna(0)
+                # Compute fill value from TRAINING DATA ONLY
+                train_mean = train_df_local[col].mean()
+                lag_fill_values[col] = train_mean if not np.isnan(train_mean) else 0.0
+                train_df_local[col] = train_df_local[col].fillna(lag_fill_values[col])
             if col in test_df_local.columns:
-                test_df_local[col] = test_df_local[col].fillna(0)
+                # Use TRAIN-DERIVED fill value (no test data leakage)
+                fill_val = lag_fill_values.get(col, 0.0)
+                test_df_local[col] = test_df_local[col].fillna(fill_val)
 
-        # Track which regressors are actually added to ensure consistency between train and test
+        # ==========================================================================
+        # DATA LEAKAGE FIX: Feature selection uses TRAIN DATA ONLY
+        # ==========================================================================
+        # Previous bug: Checked test_df to decide regressor inclusion
+        # Fix: Only inspect training data for regressor selection decision
+        # ==========================================================================
         added_regressors = []
         for cov in covariates:
-            if cov in train_df_local.columns and cov in test_df_local.columns:
-                # Only add regressor if it has non-NaN values in BOTH train and test
-                if train_df_local[cov].notna().any() and test_df_local[cov].notna().any():
+            # CRITICAL: Only check TRAINING data for regressor inclusion
+            if cov in train_df_local.columns:
+                # Only add regressor if it has sufficient non-NaN values in TRAIN data
+                train_non_null_pct = train_df_local[cov].notna().mean()
+                if train_non_null_pct >= 0.5:  # At least 50% non-null in training
                     model.add_regressor(cov)
                     added_regressors.append(cov)
                 else:
-                    logger.warning(f"Skipping regressor '{cov}' - has NaN values in train or test data")
+                    logger.warning(f"Skipping regressor '{cov}' - only {train_non_null_pct:.1%} non-null in training data")
 
         model.fit(train_df_local)
 
         # Use only the regressors that were actually added to the model
-        # Use test_df_local which has NaN-filled lag columns
-        test_future = test_df_local[['ds'] + added_regressors].copy()
-        metrics = compute_metrics(test_df_local['y'].values, model.predict(test_future)['yhat'].values)
+        # Ensure regressors exist in test_df (fill missing with train mean if needed)
+        test_regressors_available = []
+        for reg in added_regressors:
+            if reg in test_df_local.columns:
+                test_regressors_available.append(reg)
+            else:
+                # Regressor selected from train but missing in test - use train mean
+                test_df_local[reg] = lag_fill_values.get(reg, 0.0)
+                test_regressors_available.append(reg)
+
+        test_future = test_df_local[['ds'] + test_regressors_available].copy()
+        eval_metrics = compute_metrics(test_df_local['y'].values, model.predict(test_future)['yhat'].values)
+
+        # OVERFITTING DETECTION: Calculate train metrics to detect overfitting
+        train_future = train_df_local[['ds'] + added_regressors].copy()
+        train_preds = model.predict(train_future)['yhat'].values
+        train_metrics = compute_metrics(train_df_local['y'].values, train_preds)
+
+        # Calculate overfitting ratio: eval_mape / train_mape
+        # High ratio (>3) indicates severe overfitting
+        train_mape = train_metrics.get('mape', 0.001)  # Avoid division by zero
+        eval_mape = eval_metrics.get('mape', 0)
+        overfit_ratio = eval_mape / max(train_mape, 0.001)
+
+        # Flag overfitting
+        is_overfit = overfit_ratio > 3.0  # Eval MAPE > 3x Train MAPE indicates overfitting
+
+        # Add overfitting metrics to results
+        metrics = eval_metrics.copy()
+        metrics['train_mape'] = train_mape
+        metrics['overfit_ratio'] = overfit_ratio
+        metrics['is_overfit'] = is_overfit
+
+        if is_overfit:
+            logger.warning(f"⚠️ OVERFITTING DETECTED: Train MAPE={train_mape:.2f}%, Eval MAPE={eval_mape:.2f}%, Ratio={overfit_ratio:.1f}x")
 
         if not skip_mlflow_logging:
-            for k, v in metrics.items(): client.log_metric(run_id, k, v)
+            for k, v in metrics.items():
+                if isinstance(v, (int, float, bool)):
+                    client.log_metric(run_id, str(k), float(v))
             client.set_terminated(run_id)
 
-        return {"params": params, "metrics": metrics, "run_id": run_id, "model": model, "status": "SUCCESS"}
+        return {"params": params, "metrics": metrics, "run_id": run_id, "model": model, "status": "SUCCESS", "is_overfit": is_overfit}
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
         if not skip_mlflow_logging and run_id:
@@ -334,24 +402,52 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     if future_features:
         logger.info(f"🔮 Received {len(future_features)} future feature rows from frontend")
         future_df = prepare_prophet_data(future_features, time_col, target_col, covariates)
-        
+
         if 'y' in future_df.columns:
             future_df = future_df.drop(columns=['y'])
         logger.info("🔒 Dropped 'y' from future features to prevent leakage")
-        
-        df = df.set_index('ds')
-        future_df = future_df.set_index('ds')
-        
+
+        # ==========================================================================
+        # CRITICAL FIX: Validate future features don't overlap with historical data
+        # ==========================================================================
+        # Overlapping dates can cause temporal leakage where future covariate values
+        # are used during model training/evaluation on historical periods
+        # ==========================================================================
+        historical_max_date = df['ds'].max()
+        future_min_date = future_df['ds'].min()
+
+        # Identify overlapping rows (dates that exist in both historical and future)
+        overlapping_dates = set(df['ds'].values) & set(future_df['ds'].values)
+
+        if overlapping_dates:
+            overlap_count = len(overlapping_dates)
+            logger.warning(f"⚠️ FUTURE FEATURES OVERLAP DETECTED: {overlap_count} dates overlap with historical data")
+            logger.warning(f"   Historical max: {historical_max_date}, Future min: {future_min_date}")
+            logger.warning(f"   Overlapping dates: {sorted(list(overlapping_dates))[:5]}...")
+
+            # SAFE APPROACH: Only use future features for dates AFTER historical data
+            # Do NOT update historical rows with future values (prevents leakage)
+            future_df_safe = future_df[future_df['ds'] > historical_max_date].copy()
+
+            if len(future_df_safe) == 0:
+                logger.warning("⚠️ All future features overlap with historical data - ignoring future features to prevent leakage")
+            else:
+                logger.info(f"✅ Using {len(future_df_safe)} future feature rows (after {historical_max_date})")
+                # Append only truly future rows
+                df = pd.concat([df, future_df_safe], ignore_index=True)
+                df = df.sort_values('ds').reset_index(drop=True)
+        else:
+            # No overlap - safe to append all future features
+            logger.info(f"✅ No overlap detected - appending {len(future_df)} future feature rows")
+            df = pd.concat([df, future_df], ignore_index=True)
+            df = df.sort_values('ds').reset_index(drop=True)
+
+        # Fill NaN in covariate columns
         for cov in covariates:
             if cov in df.columns:
                 df[cov] = df[cov].fillna(0)
-        
-        df.update(future_df)
-        new_rows = future_df[~future_df.index.isin(df.index)]
-        df = pd.concat([df, new_rows])
-        df = df.reset_index().sort_values('ds').reset_index(drop=True)
-        
-        logger.info(f"Merged dataframe now has {len(df)} rows. Updated historical covariates and added {len(new_rows)} future rows.")
+
+        logger.info(f"Merged dataframe now has {len(df)} rows (historical + future features).")
 
     original_covariates = covariates.copy() if covariates else []
     df = enhance_features_for_forecasting(
@@ -464,14 +560,42 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Hyperparameter tuning - use filtered values if provided from data analysis
         prophet_filters = (hyperparameter_filters or {}).get('Prophet', {})
 
-        # Default param_grid values
+        # Default param_grid values - STABILIZED to reduce overfitting
+        # Key insight: Lower prior scales = more flexibility = more overfitting
+        # We removed overfitting-prone low values (0.001, 0.01 for changepoint)
+
+        # ROBUST GROWTH SELECTION: Always test both linear and flat growth
+        # The hyperparameter search will select the best option based on eval metrics
+        # This approach works for any dataset - no hard-coded thresholds needed
+        y_values = history_df['y'].values
+        first_half_mean = np.mean(y_values[:len(y_values)//2])
+        second_half_mean = np.mean(y_values[len(y_values)//2:])
+        trend_ratio = second_half_mean / first_half_mean if first_half_mean > 0 else 1.0
+
+        # Always include both growth options - let the model selection pick the best
+        # This is robust because it doesn't rely on hard-coded thresholds
+        growth_options = ['linear', 'flat']
+        logger.info(f"📈 Trend analysis: first_half_mean={first_half_mean:,.0f}, second_half_mean={second_half_mean:,.0f}, ratio={trend_ratio:.2f}")
+        logger.info(f"   Testing both 'linear' and 'flat' growth - best will be selected based on eval metrics")
+
         default_param_grid = {
-            'changepoint_prior_scale': [0.001, 0.01, 0.05, 0.1, 0.5],
-            'seasonality_prior_scale': [0.01, 0.1, 1.0, 10.0],
+            # Higher values = more regularization = less overfitting
+            # Removed 0.001, 0.01 which cause severe overfitting
+            'changepoint_prior_scale': [0.05, 0.1, 0.3, 0.5],
+            # Moderate to high values for stable seasonality
+            'seasonality_prior_scale': [0.1, 1.0, 10.0],
             'seasonality_mode': ['additive', 'multiplicative'] if seasonality_mode == 'multiplicative' else ['additive'],
-            'yearly_seasonality': [True, False],
-            'weekly_seasonality': [True, False]
+            # For data < 3 years, disable yearly seasonality to prevent overfitting
+            'yearly_seasonality': [True, False] if len(history_df) >= 156 else [False],  # 156 weeks = 3 years
+            'weekly_seasonality': [True, False],
+            # Growth options - include 'flat' when strong trends detected to prevent over-extrapolation
+            'growth': growth_options
         }
+
+        # Log data size warning for seasonality
+        if len(history_df) < 104:  # Less than 2 years
+            logger.warning(f"⚠️ PROPHET STABILITY WARNING: Only {len(history_df)} data points (~{len(history_df)//52} years). "
+                          f"Recommend disabling yearly_seasonality for better generalization.")
 
         # Apply filters from data analysis if provided
         param_grid = {}
@@ -499,10 +623,11 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             param_combinations = random.sample(param_combinations, 20)
             logger.info(f"Limited Prophet hyperparameter combinations to 20")
 
-        best_metrics = {"rmse": float('inf'), "mape": float('inf'), "r2": -float('inf')}
+        best_metrics = {"rmse": float('inf'), "mape": float('inf'), "r2": -float('inf'), "overfit_ratio": float('inf')}
         best_params = None
         best_model = None
-        
+        all_results = []  # Track all results for logging
+
         # Parallel execution
         # If MLFLOW_SKIP_CHILD_RUNS=true, we only log the best model (reduces MLflow overhead significantly)
         max_workers = int(os.environ.get("MLFLOW_MAX_WORKERS", "4"))
@@ -518,15 +643,31 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 )
                 for params in param_combinations
             ]
-            
+
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
                 if result["status"] == "SUCCESS":
+                    all_results.append(result)
                     metrics = result["metrics"]
-                    if metrics["rmse"] < best_metrics["rmse"]:
-                        best_metrics = metrics
+                    is_overfit = result.get("is_overfit", False)
+                    overfit_ratio = metrics.get("overfit_ratio", 1.0)
+
+                    # STABILITY-AWARE MODEL SELECTION:
+                    # Prefer models that generalize well over those with lowest training error
+                    # Penalize overfitting models by using adjusted RMSE
+                    adjusted_rmse = metrics["rmse"] * (1 + max(0, overfit_ratio - 2) * 0.5)  # Penalty for overfit_ratio > 2
+
+                    if adjusted_rmse < best_metrics.get("adjusted_rmse", float('inf')):
+                        best_metrics = metrics.copy()
+                        best_metrics["adjusted_rmse"] = adjusted_rmse
                         best_params = result["params"]
                         best_model = result["model"]
+
+        # Log overfitting summary
+        overfit_count = sum(1 for r in all_results if r.get("is_overfit", False))
+        if overfit_count > 0:
+            logger.warning(f"⚠️ PROPHET STABILITY REPORT: {overfit_count}/{len(all_results)} hyperparameter combinations showed overfitting")
+            logger.info(f"   Selected model overfit_ratio: {best_metrics.get('overfit_ratio', 'N/A'):.2f}")
 
         if best_model is None:
             raise RuntimeError("All Prophet training runs failed")
@@ -613,7 +754,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         except Exception as e:
             logger.warning(f"Could not generate future derived features: {e}. Using historical means.")
 
-        # For user-provided covariates that weren't auto-generated, use mapping or means
+        # For user-provided covariates that weren't auto-generated, use mapping or appropriate defaults
         for cov in covariates:
             if cov in history_df.columns and cov not in future.columns:
                 # If we have future values in df (from future_features), use them
@@ -622,11 +763,23 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 cov_map = df.set_index('ds')[cov]
                 # Update future with values from df where available
                 future[cov] = future.index.map(cov_map)
-                # Fill remaining NaNs with mean (only for truly unknown covariates)
+                # Fill remaining NaNs with appropriate defaults
                 if future[cov].isna().any():
-                    mean_val = history_df[cov].mean()
-                    future[cov] = future[cov].fillna(mean_val)
-                    logger.info(f"   User covariate '{cov}': filled NaN with mean={mean_val:.4f}")
+                    # Detect if this is a binary indicator (0/1 values)
+                    unique_vals = history_df[cov].dropna().unique()
+                    is_binary = (len(unique_vals) <= 2 and
+                                 set(unique_vals).issubset({0, 1, 0.0, 1.0, True, False}))
+
+                    if is_binary:
+                        # For binary indicators (holidays, events), default to 0 (no event)
+                        # Using mean would create invalid values like 0.05 for holiday flags
+                        future[cov] = future[cov].fillna(0)
+                        logger.info(f"   Binary indicator '{cov}': filled NaN with 0 (no event)")
+                    else:
+                        # For continuous features, use mean (with warning)
+                        mean_val = history_df[cov].mean()
+                        future[cov] = future[cov].fillna(mean_val)
+                        logger.warning(f"   ⚠️ Continuous covariate '{cov}': filled NaN with mean={mean_val:.4f} (may reduce forecast accuracy)")
                 future = future.reset_index()
 
         # Log a sample of future features to verify they vary
@@ -695,10 +848,32 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     validation_forecast = best_model.predict(test_future)
     val_cols = ['ds', 'y'] + [c for c in covariates if c in test_df.columns]
     validation_data = test_df[val_cols].merge(validation_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], on='ds', how='left').rename(columns={'ds': time_col})
-    
+
+    # ==========================================================================
+    # P2 FIX: Clip negative forecasts in validation data
+    # ==========================================================================
+    if 'yhat' in validation_data.columns:
+        neg_val_count = (validation_data['yhat'] < 0).sum()
+        if neg_val_count > 0:
+            logger.warning(f"⚠️ Clipping {neg_val_count} negative validation forecasts to 0")
+            validation_data['yhat'] = validation_data['yhat'].clip(lower=0)
+            validation_data['yhat_lower'] = validation_data['yhat_lower'].clip(lower=0)
+            validation_data['yhat_upper'] = validation_data[['yhat', 'yhat_upper']].max(axis=1)
+
     # Forecast data - filter for dates AFTER all historical data (not just training data)
     # This ensures forecast_future contains only the true future horizon, not the test period
     forecast_future = forecast[forecast['ds'] > history_df['ds'].max()][['ds', 'yhat', 'yhat_lower', 'yhat_upper'] + [c for c in covariates if c in forecast.columns]].copy().rename(columns={'ds': time_col})
+
+    # ==========================================================================
+    # P2 FIX: Clip negative forecasts in future forecast data
+    # ==========================================================================
+    if 'yhat' in forecast_future.columns:
+        neg_fc_count = (forecast_future['yhat'] < 0).sum()
+        if neg_fc_count > 0:
+            logger.warning(f"⚠️ Clipping {neg_fc_count} negative future forecasts to 0")
+            forecast_future['yhat'] = forecast_future['yhat'].clip(lower=0)
+            forecast_future['yhat_lower'] = forecast_future['yhat_lower'].clip(lower=0)
+            forecast_future['yhat_upper'] = forecast_future[['yhat', 'yhat_upper']].max(axis=1)
     
     covariate_impacts = analyze_covariate_impact(final_model, df, covariates)
     

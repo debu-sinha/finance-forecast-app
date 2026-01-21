@@ -390,10 +390,19 @@ def train_exponential_smoothing_model(
         validation_data['yhat_lower'] = yhat_lower
         validation_data['yhat_upper'] = yhat_upper
 
-        # Refit and Forecast
-        full_data = pd.concat([train_df, test_df]).sort_values('ds')
+        # ==========================================================================
+        # DATA LEAKAGE FIX: Final model uses TRAIN DATA ONLY
+        # ==========================================================================
+        # Previous bug: Refit on full_data (train + test) leaked test info into model
+        # Fix: Final model trained on train_df only. Test data is held out for
+        # unbiased evaluation. Production deployment can retrain on all data later.
+        # ==========================================================================
+        # NOTE: For production, you may want to retrain on all available data AFTER
+        # evaluation is complete and the model has been validated. This code preserves
+        # proper train/test separation for evaluation integrity.
+        # ==========================================================================
         final_model = ExponentialSmoothing(
-            full_data['y'].values,
+            train_df['y'].values,  # TRAIN ONLY - no test data leakage
             seasonal_periods=seasonal_periods,
             trend=best_params['trend'],
             seasonal=best_params['seasonal'],
@@ -401,12 +410,16 @@ def train_exponential_smoothing_model(
         )
         final_fitted_model = final_model.fit(optimized=True)
 
+        # Forecast from end of TRAINING data (not test data)
         forecast_values = final_fitted_model.forecast(steps=horizon)
 
+        # ==========================================================================
+        # DATA LEAKAGE FIX: Confidence intervals from TRAIN residuals only
+        # ==========================================================================
         final_train_predictions = final_fitted_model.fittedvalues
         if len(final_train_predictions) > 0:
             forecast_lower, forecast_upper = compute_prediction_intervals(
-                y_train=full_data['y'].values,
+                y_train=train_df['y'].values,  # TRAIN ONLY
                 y_pred_train=final_train_predictions,
                 forecast_values=forecast_values,
                 confidence_level=0.95
@@ -415,12 +428,12 @@ def train_exponential_smoothing_model(
             forecast_lower = forecast_values * 0.9
             forecast_upper = forecast_values * 1.1
 
-        # Use forecast_start_date if provided (user's to_date), otherwise use end of data
+        # Use forecast_start_date if provided (user's to_date), otherwise use end of TRAINING data
         if forecast_start_date is not None:
             last_date = pd.to_datetime(forecast_start_date).normalize()
             logger.info(f"📅 Using user-specified forecast start: {last_date}")
         else:
-            last_date = full_data['ds'].max()
+            last_date = train_df['ds'].max()  # Use train data end (no test data leakage)
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
         logger.info(f"📅 ETS forecast dates: {future_dates.min()} to {future_dates.max()}")
 
@@ -441,8 +454,10 @@ def train_exponential_smoothing_model(
             eval_data_actual.to_csv("/tmp/eval.csv", index=False)
             mlflow.log_artifact("/tmp/eval.csv", "datasets/training")
 
-            full_data_actual = pd.DataFrame({'ds': full_data['ds'], 'y': full_data['y']})
-            full_data_actual.to_csv("/tmp/full_merged_data.csv", index=False)
+            # Log combined data for reference (NOTE: model trained on train only, not this)
+            combined_data = pd.concat([train_df, test_df]).sort_values('ds')
+            combined_data_actual = pd.DataFrame({'ds': combined_data['ds'], 'y': combined_data['y']})
+            combined_data_actual.to_csv("/tmp/full_merged_data.csv", index=False)
             mlflow.log_artifact("/tmp/full_merged_data.csv", "datasets/processed")
         except Exception as e:
             logger.warning(f"Could not log ETS datasets: {e}")
