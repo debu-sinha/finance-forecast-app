@@ -1985,3 +1985,154 @@ def validate_forecast_reasonableness(
             logger.warning(f"⚠️ Forecast concern: {concern}")
 
     return result
+
+
+# =============================================================================
+# FLAT FORECAST DETECTION
+# =============================================================================
+
+def detect_flat_forecast(
+    forecast_values: np.ndarray,
+    historical_values: np.ndarray,
+    relative_variance_threshold: float = 0.01,
+    absolute_variance_threshold: float = 1e-6
+) -> Dict[str, Any]:
+    """
+    Detect if a forecast is flat (constant or near-constant values).
+
+    A flat forecast indicates model failure - the model is essentially predicting
+    the same value for all future periods, which is uninformative.
+
+    Common causes:
+    1. Degenerate model orders (0,0,0), (0,1,0) for ARIMA/SARIMAX
+    2. Model coefficients converged to near-zero
+    3. Simple exponential smoothing with no trend/seasonal (ETS)
+    4. Insufficient data for parameter estimation
+
+    Args:
+        forecast_values: Array of forecast values
+        historical_values: Array of historical values (for context)
+        relative_variance_threshold: If forecast_var/historical_var < this, flat
+        absolute_variance_threshold: If forecast_var < this, definitely flat
+
+    Returns:
+        Dict with:
+        - is_flat: True if forecast is flat/constant
+        - forecast_variance: Variance of forecast values
+        - historical_variance: Variance of historical values
+        - variance_ratio: forecast_var / historical_var
+        - unique_values: Number of unique forecast values
+        - recommendation: What to do if flat
+    """
+    forecast_values = np.asarray(forecast_values, dtype=np.float64)
+    historical_values = np.asarray(historical_values, dtype=np.float64)
+
+    # Clean arrays
+    fc_clean = forecast_values[np.isfinite(forecast_values)]
+    hist_clean = historical_values[np.isfinite(historical_values)]
+
+    result = {
+        'is_flat': False,
+        'forecast_variance': 0.0,
+        'historical_variance': 0.0,
+        'variance_ratio': 0.0,
+        'unique_values': 0,
+        'flat_reason': None,
+        'recommendation': None
+    }
+
+    if len(fc_clean) < 2:
+        result['flat_reason'] = "Insufficient forecast points"
+        return result
+
+    # Calculate variances
+    fc_var = float(np.var(fc_clean))
+    hist_var = float(np.var(hist_clean)) if len(hist_clean) > 1 else 1.0
+
+    result['forecast_variance'] = fc_var
+    result['historical_variance'] = hist_var
+    result['unique_values'] = len(np.unique(np.round(fc_clean, 4)))
+
+    # Check 1: Absolute variance near zero
+    if fc_var < absolute_variance_threshold:
+        result['is_flat'] = True
+        result['flat_reason'] = f"Near-zero forecast variance ({fc_var:.2e})"
+        result['recommendation'] = "Model coefficients may have converged to zero. Try different orders or add differencing."
+        logger.error(f"🚨 FLAT FORECAST DETECTED: {result['flat_reason']}")
+        return result
+
+    # Check 2: Relative variance compared to historical
+    if hist_var > 0:
+        variance_ratio = fc_var / hist_var
+        result['variance_ratio'] = variance_ratio
+
+        if variance_ratio < relative_variance_threshold:
+            result['is_flat'] = True
+            result['flat_reason'] = f"Forecast variance ({fc_var:.4f}) is {variance_ratio:.4f}x historical variance ({hist_var:.4f})"
+            result['recommendation'] = "Forecast has much less variability than historical data. Consider adding trend/seasonal components."
+            logger.error(f"🚨 FLAT FORECAST DETECTED: {result['flat_reason']}")
+            return result
+
+    # Check 3: All values nearly identical
+    if result['unique_values'] == 1:
+        result['is_flat'] = True
+        result['flat_reason'] = f"All {len(fc_clean)} forecast values are identical ({fc_clean[0]:.2f})"
+        result['recommendation'] = "Model is producing constant predictions. Try a different model type or order."
+        logger.error(f"🚨 FLAT FORECAST DETECTED: {result['flat_reason']}")
+        return result
+
+    # Check 4: Very few unique values for long forecasts
+    if len(fc_clean) > 5 and result['unique_values'] <= 2:
+        result['is_flat'] = True
+        result['flat_reason'] = f"Only {result['unique_values']} unique values in {len(fc_clean)} period forecast"
+        result['recommendation'] = "Forecast is oscillating between very few values. Check for model degeneracy."
+        logger.warning(f"⚠️ NEAR-FLAT FORECAST: {result['flat_reason']}")
+        return result
+
+    logger.debug(f"✅ Forecast variance check passed: var_ratio={result['variance_ratio']:.4f}, unique={result['unique_values']}")
+    return result
+
+
+def get_fallback_arima_orders() -> List[Tuple[int, int, int]]:
+    """
+    Get fallback ARIMA orders known to produce non-flat forecasts.
+
+    These orders include AR and/or MA components that capture dynamics.
+    """
+    return [
+        (1, 1, 1),  # Basic ARIMA with differencing
+        (2, 1, 1),  # AR(2) for more dynamics
+        (1, 1, 2),  # MA(2) for moving average
+        (2, 1, 2),  # Full ARIMA
+        (1, 0, 1),  # ARMA without differencing
+    ]
+
+
+def get_fallback_sarimax_orders() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]]:
+    """
+    Get fallback SARIMAX orders known to produce non-flat forecasts.
+
+    These orders include AR and/or MA components that capture dynamics.
+    """
+    return [
+        ((1, 1, 1), (0, 0, 0, 12)),  # Basic ARIMA with differencing
+        ((2, 1, 1), (0, 0, 0, 12)),  # AR(2) for more dynamics
+        ((1, 1, 2), (0, 0, 0, 12)),  # MA(2) for moving average
+        ((1, 0, 1), (1, 0, 1, 12)),  # With seasonal components
+        ((2, 1, 2), (1, 0, 1, 12)),  # Full seasonal ARIMA
+    ]
+
+
+def get_fallback_ets_params() -> List[Tuple[Optional[str], Optional[str]]]:
+    """
+    Get fallback ETS parameters known to produce non-flat forecasts.
+
+    These combinations include trend and/or seasonal components.
+    """
+    return [
+        ('add', 'add'),    # Additive trend and seasonal
+        ('add', 'mul'),    # Additive trend, multiplicative seasonal
+        ('mul', 'add'),    # Multiplicative trend, additive seasonal
+        ('add', None),     # Trend only (Holt's linear)
+        (None, 'add'),     # Seasonal only
+    ]

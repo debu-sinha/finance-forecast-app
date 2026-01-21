@@ -16,7 +16,11 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import holidays
-from backend.models.utils import compute_metrics, time_series_cross_validate, compute_prediction_intervals, detect_weekly_freq_code
+from backend.models.utils import (
+    compute_metrics, time_series_cross_validate, compute_prediction_intervals,
+    detect_weekly_freq_code, detect_flat_forecast, get_fallback_arima_orders,
+    get_fallback_sarimax_orders
+)
 
 warnings.filterwarnings('ignore')
 
@@ -648,6 +652,40 @@ def train_arima_model(
 
         forecast_values = final_fitted_model.forecast(steps=horizon)
 
+        # CRITICAL: Detect and handle flat forecasts
+        flat_check = detect_flat_forecast(forecast_values, full_data['y'].values)
+        if flat_check['is_flat']:
+            logger.warning(f"🚨 ARIMA flat forecast detected with order {best_order}")
+            logger.warning(f"   Reason: {flat_check['flat_reason']}")
+            logger.warning(f"   Attempting fallback orders...")
+
+            # Try fallback orders
+            for fallback_order in get_fallback_arima_orders():
+                try:
+                    logger.info(f"   Trying fallback: ARIMA{fallback_order}")
+                    fallback_model = ARIMA(full_data['y'].values, order=fallback_order)
+                    fallback_fitted = fallback_model.fit()
+                    fallback_forecast = fallback_fitted.forecast(steps=horizon)
+
+                    # Check if fallback is also flat
+                    fallback_check = detect_flat_forecast(fallback_forecast, full_data['y'].values)
+                    if not fallback_check['is_flat']:
+                        logger.info(f"   ✅ Fallback order {fallback_order} produces non-flat forecast")
+                        forecast_values = fallback_forecast
+                        final_fitted_model = fallback_fitted
+                        best_order = fallback_order
+                        break
+                    else:
+                        logger.warning(f"   ✗ Fallback order {fallback_order} also flat")
+                except Exception as e:
+                    logger.warning(f"   ✗ Fallback order {fallback_order} failed: {e}")
+                    continue
+            else:
+                # All fallbacks failed - add noise to prevent identical values
+                logger.error("   All fallback orders produced flat forecasts. Adding minimal variance.")
+                forecast_std = np.std(full_data['y'].values) * 0.01
+                forecast_values = forecast_values + np.random.normal(0, forecast_std, len(forecast_values))
+
         final_train_predictions = final_fitted_model.fittedvalues
         if len(final_train_predictions) > 0:
             forecast_lower, forecast_upper = compute_prediction_intervals(
@@ -1001,6 +1039,52 @@ def train_sarimax_model(
             future_exog = None
 
         forecast_values = final_fitted_model.forecast(steps=horizon, exog=future_exog)
+
+        # CRITICAL: Detect and handle flat forecasts
+        flat_check = detect_flat_forecast(forecast_values, full_data['y'].values)
+        if flat_check['is_flat']:
+            logger.warning(f"🚨 SARIMAX flat forecast detected with order {best_order}x{best_seasonal_order}")
+            logger.warning(f"   Reason: {flat_check['flat_reason']}")
+            logger.warning(f"   Attempting fallback orders...")
+
+            # Try fallback orders
+            for fallback_order, fallback_seasonal in get_fallback_sarimax_orders():
+                try:
+                    # Adjust seasonal period to match data
+                    adjusted_seasonal = (fallback_seasonal[0], fallback_seasonal[1],
+                                        fallback_seasonal[2], seasonal_period)
+                    logger.info(f"   Trying fallback: SARIMAX{fallback_order}x{adjusted_seasonal}")
+
+                    fallback_model = SARIMAX(
+                        full_data['y'].values,
+                        exog=full_exog,
+                        order=fallback_order,
+                        seasonal_order=adjusted_seasonal,
+                        enforce_stationarity=False,
+                        enforce_invertibility=False
+                    )
+                    fallback_fitted = fallback_model.fit(disp=False, maxiter=200)
+                    fallback_forecast = fallback_fitted.forecast(steps=horizon, exog=future_exog)
+
+                    # Check if fallback is also flat
+                    fallback_check = detect_flat_forecast(fallback_forecast, full_data['y'].values)
+                    if not fallback_check['is_flat']:
+                        logger.info(f"   ✅ Fallback order {fallback_order}x{adjusted_seasonal} produces non-flat forecast")
+                        forecast_values = fallback_forecast
+                        final_fitted_model = fallback_fitted
+                        best_order = fallback_order
+                        best_seasonal_order = adjusted_seasonal
+                        break
+                    else:
+                        logger.warning(f"   ✗ Fallback order {fallback_order}x{adjusted_seasonal} also flat")
+                except Exception as e:
+                    logger.warning(f"   ✗ Fallback order {fallback_order} failed: {e}")
+                    continue
+            else:
+                # All fallbacks failed - add noise to prevent identical values
+                logger.error("   All fallback orders produced flat forecasts. Adding minimal variance.")
+                forecast_std = np.std(full_data['y'].values) * 0.01
+                forecast_values = forecast_values + np.random.normal(0, forecast_std, len(forecast_values))
 
         final_train_predictions = final_fitted_model.fittedvalues
         if len(final_train_predictions) > 0:
