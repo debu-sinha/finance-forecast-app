@@ -36,6 +36,12 @@ env:
   - name: XGBOOST_MAX_COMBINATIONS
     value: "4"  # XGBoost grid search combinations (local: 8-16)
 
+  # Cluster delegation for heavy compute
+  - name: DEDICATED_CLUSTER_ID
+    value: "0120-201807-wrsojhmy"
+  - name: ENABLE_CLUSTER_DELEGATION
+    value: "true"  # Delegates heavy training to DEDICATED_CLUSTER_ID
+
   # Unity Catalog configuration
   - name: UC_CATALOG_NAME
     value: "main"

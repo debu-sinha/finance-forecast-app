@@ -40,6 +40,16 @@ except ImportError:
     SIMPLE_MODE_AVAILABLE = False
     simple_mode_router = None
 
+# Job Delegation API - Offload heavy training to dedicated cluster
+try:
+    from backend.services.job_api import router as job_api_router
+    from backend.services.job_delegation import is_delegation_enabled
+    JOB_DELEGATION_AVAILABLE = True
+except ImportError:
+    JOB_DELEGATION_AVAILABLE = False
+    job_api_router = None
+    is_delegation_enabled = lambda: False
+
 # Configure logging with both console and file handlers
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -201,6 +211,12 @@ if os.path.exists(static_dir):
 if SIMPLE_MODE_AVAILABLE and simple_mode_router:
     app.include_router(simple_mode_router)
     logger.info("✅ Simple Mode routes registered at /api/simple/*")
+
+# Register Job Delegation API routes
+if JOB_DELEGATION_AVAILABLE and job_api_router:
+    app.include_router(job_api_router)
+    delegation_status = "enabled" if is_delegation_enabled() else "disabled (set ENABLE_CLUSTER_DELEGATION=true)"
+    logger.info(f"✅ Job Delegation API routes registered at /api/v2/jobs/* - Delegation: {delegation_status}")
 
 @app.get("/")
 async def root():
@@ -426,6 +442,16 @@ async def train_model(request: TrainRequest):
         # LOG DATE-FILTERED DATASET
         # ========================================
         log_dataframe_summary(df, f"DATE-FILTERED DATASET (from_date={request.from_date or 'N/A'}, to_date={effective_to_date})")
+
+        # ========================================
+        # CRITICAL: VALIDATE DATA IS SORTED BY DATE
+        # ========================================
+        # Time series splits REQUIRE chronologically sorted data.
+        # Without this, train/eval/holdout sets would have temporal leakage.
+        if not df['ds'].is_monotonic_increasing:
+            logger.warning("⚠️ Data not sorted chronologically - sorting by date to prevent temporal leakage")
+            df = df.sort_values('ds').reset_index(drop=True)
+            logger.info(f"✅ Data sorted: {df['ds'].min()} to {df['ds'].max()}")
 
         # ========================================
         # TRAIN / EVAL / HOLDOUT SPLIT
@@ -835,25 +861,93 @@ async def train_model(request: TrainRequest):
                         model_uri = f"runs:/{res.run_id}/model"
                         loaded_model = mlflow.pyfunc.load_model(model_uri)
 
-                        # Prepare holdout input
-                        holdout_input = pd.DataFrame({
-                            'periods': [holdout_size],
-                            'start_date': [str(eval_df['ds'].max().date())]  # Start from end of eval
-                        })
+                        # Prepare holdout input based on model signature
+                        # XGBoost uses Mode 1 (periods/start_date), Prophet/ARIMA use Mode 2 (ds)
+                        model_signature = loaded_model.metadata.signature
+                        expected_cols = []
+                        if model_signature and model_signature.inputs:
+                            expected_cols = [col_spec.get('name', '') for col_spec in model_signature.inputs.to_dict()]
+
+                        # Detect if model expects periods/start_date (XGBoost Mode 1)
+                        uses_periods_format = 'periods' in expected_cols and 'start_date' in expected_cols
+
+                        if uses_periods_format:
+                            # XGBoost Mode 1: periods + start_date
+                            holdout_dates = pd.to_datetime(holdout_df['ds'])
+                            start_date = holdout_dates.min()
+                            num_periods = len(holdout_dates)
+                            holdout_input = pd.DataFrame({
+                                'periods': [num_periods],
+                                'start_date': [start_date.strftime('%Y-%m-%d')]
+                            })
+                            logger.info(f"   {res.model_name}: Using periods/start_date format (periods={num_periods}, start={start_date.strftime('%Y-%m-%d')})")
+                        else:
+                            # Prophet/ARIMA Mode 2: ds column with dates
+                            holdout_input = holdout_df[['ds']].copy()
+                            holdout_input['ds'] = pd.to_datetime(holdout_input['ds']).dt.strftime('%Y-%m-%d')
+
+                        # Add covariates from holdout_df if model expects them (Mode 2 only)
+                        try:
+                            if model_signature and model_signature.inputs and not uses_periods_format:
+
+                                for col_name in expected_cols:
+                                    if col_name == 'ds':
+                                        continue  # Already added
+
+                                    if col_name in holdout_df.columns:
+                                        # Direct column available
+                                        holdout_input[col_name] = holdout_df[col_name].values
+                                    elif col_name in df.columns:
+                                        # Try to get from full dataset (for covariates)
+                                        # Match by date
+                                        holdout_dates = pd.to_datetime(holdout_input['ds'])
+                                        df_lookup = df.set_index('ds')[col_name]
+                                        holdout_input[col_name] = holdout_dates.map(df_lookup).fillna(0).values
+                                    else:
+                                        # Feature not available - set to 0 (common for binary indicators)
+                                        logger.warning(f"   ⚠️ Feature '{col_name}' not in holdout data - using default 0")
+                                        holdout_input[col_name] = 0
+
+                        except Exception as sig_error:
+                            logger.warning(f"   Could not extract signature: {sig_error}")
 
                         # Get predictions
                         holdout_predictions = loaded_model.predict(holdout_input)
 
-                        # Calculate holdout MAPE
+                        # DEBUG: Log prediction details
+                        logger.info(f"   {res.model_name} holdout debug:")
+                        logger.info(f"      Input shape: {holdout_input.shape}, columns: {list(holdout_input.columns)}")
+                        if isinstance(holdout_predictions, pd.DataFrame):
+                            logger.info(f"      Output shape: {holdout_predictions.shape}, columns: {list(holdout_predictions.columns)}")
+                        else:
+                            logger.info(f"      Output type: {type(holdout_predictions)}, len: {len(holdout_predictions) if hasattr(holdout_predictions, '__len__') else 'N/A'}")
+
+                        # Calculate holdout MAPE with robust outlier handling
                         if isinstance(holdout_predictions, pd.DataFrame) and 'yhat' in holdout_predictions.columns:
                             # Align predictions with actuals
                             pred_df = holdout_predictions[['ds', 'yhat']].copy()
                             pred_df['ds'] = pd.to_datetime(pred_df['ds'])
                             actual_df = holdout_df[['ds', 'y']].copy()
 
+                            # DEBUG: Log date ranges
+                            logger.info(f"      Prediction dates: {pred_df['ds'].min()} to {pred_df['ds'].max()} ({len(pred_df)} rows)")
+                            logger.info(f"      Holdout dates: {actual_df['ds'].min()} to {actual_df['ds'].max()} ({len(actual_df)} rows)")
+
                             merged = actual_df.merge(pred_df, on='ds', how='inner')
+                            logger.info(f"      Matched rows after merge: {len(merged)}/{len(actual_df)}")
+
                             if len(merged) > 0:
-                                holdout_mape = float(np.mean(np.abs((merged['y'] - merged['yhat']) / (merged['y'] + 1e-10))) * 100)
+                                # Use safe_mape from utils for robust calculation
+                                from backend.models.utils import safe_mape
+                                holdout_mape = safe_mape(merged['y'].values, merged['yhat'].values)
+
+                                # Log per-point details for debugging
+                                logger.info(f"      Per-point comparison:")
+                                for _, row in merged.iterrows():
+                                    pct_err = abs(row['y'] - row['yhat']) / max(abs(row['y']), 1e-10) * 100
+                                    logger.info(f"         {row['ds'].strftime('%Y-%m-%d')}: actual={row['y']:,.0f}, pred={row['yhat']:,.0f}, error={pct_err:.1f}%")
+
+                                # holdout_mape already computed by safe_mape above
                                 holdout_results.append({
                                     'model_name': res.model_name,
                                     'run_id': res.run_id,
@@ -1052,6 +1146,25 @@ async def train_model(request: TrainRequest):
             history_df[request.time_col] = history_df[request.time_col].astype(str)
         history_data = history_df.to_dict('records')
         logger.info(f"📊 Returning {len(history_data)} history records for chart visualization")
+
+        # Ensure we have a valid best model before returning
+        if best_model_name is None:
+            # Check if any models were trained at all
+            if model_results:
+                # Pick the first model that succeeded as fallback
+                for result in model_results:
+                    if result.model_name:
+                        best_model_name = result.model_name
+                        logger.warning(f"No best model selected via holdout - falling back to: {best_model_name}")
+                        break
+
+            if best_model_name is None:
+                # No models succeeded - raise meaningful error
+                error_msgs = [f"{r.model_name}: {r.test_result.message if r.test_result else 'Unknown error'}"
+                             for r in model_results if r.test_result and not r.test_result.passed]
+                error_detail = f"All models failed training. Details: {'; '.join(error_msgs) if error_msgs else 'Unknown error'}"
+                logger.error(error_detail)
+                raise HTTPException(status_code=500, detail=error_detail)
 
         return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data)
 

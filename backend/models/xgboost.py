@@ -95,9 +95,19 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         future_df = self._create_calendar_features(future_df)
 
         # Add lag features (use last known values, then predictions recursively)
+        # VALIDATION: Ensure we have sufficient historical values for lag features
         predictions = []
         last_values = self.last_known_values.copy()
-        hist_mean = np.mean(last_values) if last_values else 0
+
+        if not last_values:
+            raise ValueError("XGBoost model requires historical values for lag features. last_known_values is empty.")
+
+        hist_mean = np.mean(last_values)
+
+        # Log lag feature availability for debugging
+        if len(last_values) < 7:
+            logger = __import__('logging').getLogger(__name__)
+            logger.warning(f"XGBoost inference: Only {len(last_values)} historical values available. lag_7 will use fallback.")
 
         for i in range(len(future_df)):
             row = future_df.iloc[[i]].copy()
@@ -146,11 +156,16 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
 
         forecast_values = np.array(predictions)
 
+        # CRITICAL: Clip negative forecasts - financial metrics cannot be negative
+        forecast_values = np.maximum(forecast_values, 0.0)
+        lower_bounds = np.maximum(forecast_values * 0.9, 0.0)
+        upper_bounds = forecast_values * 1.1
+
         return pd.DataFrame({
             'ds': future_df['ds'],
             'yhat': forecast_values,
-            'yhat_lower': forecast_values * 0.9,
-            'yhat_upper': forecast_values * 1.1
+            'yhat_lower': lower_bounds,
+            'yhat_upper': upper_bounds
         })
 
 def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates: List[str] = None, include_lags: bool = True, frequency: str = 'daily') -> pd.DataFrame:
@@ -412,9 +427,8 @@ def train_xgboost_model(
     # but use vectorized numpy operations for speed
     test_featured = test_df.copy()
 
-    # Get train values for lag computation
-    train_y_values = train_df['y'].values
-    train_dates = train_df['ds'].values
+    # Get train values for lag computation - ensure numpy array for type safety
+    train_y_values: np.ndarray = np.asarray(train_df['y'].values, dtype=np.float64)
 
     # Pre-compute calendar features for test (these don't depend on target)
     test_featured['day_of_week'] = test_featured['ds'].dt.dayofweek
@@ -429,10 +443,34 @@ def train_xgboost_model(
     test_featured['is_quarter_end'] = test_featured['ds'].dt.is_quarter_end.astype(int)
     test_featured['week_of_month'] = (test_featured['ds'].dt.day - 1) // 7 + 1
 
-    # Compute lag features for test set using ONLY train data
-    # For the first test row, use last train values
-    # For subsequent test rows, could use predictions but we use actuals for validation
-    all_y = np.concatenate([train_y_values, test_df['y'].values])
+    # ==========================================================================
+    # CRITICAL FIX: Compute lag features for test set WITHOUT data leakage
+    # ==========================================================================
+    # For multi-step-ahead forecasting evaluation, we must NOT use test actuals
+    # for lag features. Instead, we use recursive prediction:
+    # - Test row 0: lag_1 = last train value
+    # - Test row 1: lag_1 = PREDICTION for row 0 (not actual!)
+    # - This simulates real production where we don't have future actuals
+    # ==========================================================================
+
+    # Define calendar features early for preliminary model
+    calendar_features = [
+        'day_of_week', 'day_of_month', 'month', 'week_of_year', 'is_weekend', 'quarter',
+        'is_month_start', 'is_month_end', 'is_quarter_start', 'is_quarter_end', 'week_of_month'
+    ]
+
+    # First, train a preliminary model to get predictions for recursive lags
+    # Use same features but without the test-dependent lag values
+    preliminary_feature_cols = [c for c in (calendar_features + valid_covariates) if c in train_featured.columns]
+    y_train = train_featured['y']  # Define early for preliminary model
+    preliminary_model: Optional[XGBRegressor] = None  # Initialize to avoid possibly unbound
+    if preliminary_feature_cols:
+        X_train_prelim = train_featured[preliminary_feature_cols].fillna(0)
+        preliminary_model = XGBRegressor(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=random_seed, objective='reg:squarederror', verbosity=0
+        )
+        preliminary_model.fit(X_train_prelim, y_train)
 
     test_lag_1 = []
     test_lag_7 = []
@@ -441,26 +479,61 @@ def train_xgboost_model(
     test_yoy_rolling = []
     test_yoy_ratio = []
 
+    # Track predictions for recursive lag computation
+    recursive_predictions = list(train_y_values)  # Start with train values only
+
     for i in range(len(test_df)):
-        idx_in_full = len(train_y_values) + i
-        # lag_1: value at position idx-1
-        test_lag_1.append(all_y[idx_in_full - 1] if idx_in_full >= 1 else 0)
-        # lag_7: value at position idx-7
-        test_lag_7.append(all_y[idx_in_full - 7] if idx_in_full >= 7 else all_y[0])
-        # rolling_mean_7: mean of values at positions idx-7 to idx-1
-        start_idx = max(0, idx_in_full - 7)
-        test_rolling_7.append(np.mean(all_y[start_idx:idx_in_full]) if idx_in_full > 0 else 0)
-        # YoY lag
-        yoy_idx = idx_in_full - yoy_lag
-        test_yoy_lag.append(all_y[yoy_idx] if yoy_idx >= 0 else np.mean(train_y_values))
+        n_train = len(train_y_values)
+
+        # lag_1: For test row i, use prediction from row i-1 (or last train if i=0)
+        # This prevents using test actuals as features (data leakage!)
+        if i == 0:
+            test_lag_1.append(train_y_values[-1])
+        else:
+            test_lag_1.append(recursive_predictions[-1])  # Use prior PREDICTION
+
+        # lag_7: Use values from 7 steps back (train values or predictions)
+        if i < 7:
+            # Some or all lag_7 values come from train
+            lag_7_idx = n_train - (7 - i)
+            test_lag_7.append(train_y_values[lag_7_idx] if lag_7_idx >= 0 else train_y_values[0])
+        else:
+            # All lag_7 values are predictions
+            test_lag_7.append(recursive_predictions[-(7-i+len(recursive_predictions)-n_train)] if len(recursive_predictions) > n_train else train_y_values[-1])
+
+        # rolling_mean_7: Mean of last 7 values (train or predictions)
+        available_values = recursive_predictions[-7:] if len(recursive_predictions) >= 7 else recursive_predictions
+        test_rolling_7.append(np.mean(available_values))
+
+        # YoY lag: These come from historical train data (no leakage risk)
+        yoy_idx = n_train + i - yoy_lag
+        if yoy_idx >= 0 and yoy_idx < n_train:
+            test_yoy_lag.append(train_y_values[yoy_idx])
+        else:
+            test_yoy_lag.append(np.mean(train_y_values))
+
         # YoY rolling avg
         yoy_start = max(0, yoy_idx - 3)
-        yoy_end = yoy_idx + 4
-        test_yoy_rolling.append(np.mean(all_y[yoy_start:min(yoy_end, len(train_y_values))]) if yoy_idx >= 0 else np.mean(train_y_values))
-        # YoY ratio
-        current_val = all_y[idx_in_full] if idx_in_full < len(all_y) else 0
-        yoy_val = test_yoy_lag[-1]
-        test_yoy_ratio.append(min(max(current_val / yoy_val if yoy_val != 0 else 1.0, 0.1), 10.0))
+        yoy_end = min(yoy_idx + 4, n_train)
+        if yoy_start < n_train and yoy_end > yoy_start:
+            test_yoy_rolling.append(np.mean(train_y_values[yoy_start:yoy_end]))
+        else:
+            test_yoy_rolling.append(np.mean(train_y_values))
+
+        # YoY ratio: Use 1.0 for test (we don't have current actuals at prediction time)
+        test_yoy_ratio.append(1.0)
+
+        # Generate prediction for this row to use as lag for next row
+        if preliminary_model is not None and preliminary_feature_cols:
+            row_features = test_featured.iloc[[i]][preliminary_feature_cols].fillna(0)
+            pred = preliminary_model.predict(row_features)[0]
+            recursive_predictions.append(pred)
+        else:
+            # Fallback: use historical mean
+            hist_mean = float(np.mean(train_y_values))
+            recursive_predictions.append(hist_mean)
+
+    logger.info(f"✅ Computed test lag features using recursive prediction (NO data leakage)")
 
     test_featured['lag_1'] = test_lag_1
     test_featured['lag_7'] = test_lag_7
@@ -474,7 +547,8 @@ def train_xgboost_model(
         for i in range(len(test_df)):
             idx_in_full = len(train_y_values) + i
             lag_idx = idx_in_full - 365
-            test_lag_365.append(all_y[lag_idx] if lag_idx >= 0 else np.mean(train_y_values))
+            # Use train_y_values for historical lookups (no data leakage)
+            test_lag_365.append(train_y_values[lag_idx] if 0 <= lag_idx < len(train_y_values) else np.mean(train_y_values))
         test_featured['lag_365'] = test_lag_365
 
     # Also create full_df for later use (retraining on all data)
@@ -482,11 +556,8 @@ def train_xgboost_model(
 
     logger.info(f"Created features WITHOUT data leakage: train={len(train_featured)}, test={len(test_featured)}")
 
-    # Define feature columns
-    calendar_features = [
-        'day_of_week', 'day_of_month', 'month', 'week_of_year', 'is_weekend', 'quarter',
-        'is_month_start', 'is_month_end', 'is_quarter_start', 'is_quarter_end', 'week_of_month'
-    ]
+    # Note: calendar_features already defined above for preliminary model
+    # Define lag features
     lag_features = ['lag_1', 'lag_7', 'rolling_mean_7', f'lag_{yoy_lag}', f'lag_{yoy_lag}_rolling_avg', 'yoy_ratio']
     if frequency == 'daily':
         lag_features.append('lag_365')
