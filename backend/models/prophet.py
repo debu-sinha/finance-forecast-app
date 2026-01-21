@@ -14,7 +14,10 @@ import concurrent.futures
 from mlflow.tracking import MlflowClient
 from mlflow.models.signature import infer_signature
 from backend.preprocessing import enhance_features_for_forecasting, get_derived_feature_columns, prepare_future_features, build_prophet_holidays_dataframe
-from backend.models.utils import compute_metrics, register_model_to_unity_catalog, analyze_covariate_impact
+from backend.models.utils import (
+    compute_metrics, register_model_to_unity_catalog, analyze_covariate_impact,
+    detect_flat_forecast, validate_forecast_reasonableness
+)
 
 warnings.filterwarnings('ignore')
 
@@ -863,6 +866,26 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     # Forecast data - filter for dates AFTER all historical data (not just training data)
     # This ensures forecast_future contains only the true future horizon, not the test period
     forecast_future = forecast[forecast['ds'] > history_df['ds'].max()][['ds', 'yhat', 'yhat_lower', 'yhat_upper'] + [c for c in covariates if c in forecast.columns]].copy().rename(columns={'ds': time_col})
+
+    # ==========================================================================
+    # FLAT FORECAST & REASONABLENESS CHECKS
+    # ==========================================================================
+    if len(forecast_future) > 0 and 'yhat' in forecast_future.columns:
+        forecast_values = forecast_future['yhat'].values
+        historical_values = history_df['y'].values
+
+        # Check for flat forecast (rare for Prophet but possible)
+        flat_check = detect_flat_forecast(forecast_values, historical_values)
+        if flat_check['is_flat']:
+            logger.error(f"🚨 PROPHET FLAT FORECAST DETECTED: {flat_check['flat_reason']}")
+            logger.warning("   Prophet flat forecasts are unusual - check for data issues or missing seasonality")
+
+        # Check for unreasonable forecast (e.g., "way above" historical)
+        reasonableness = validate_forecast_reasonableness(forecast_values, historical_values, max_change_ratio=3.0)
+        if not reasonableness['is_reasonable']:
+            for concern in reasonableness['concerns']:
+                logger.warning(f"⚠️ Prophet forecast concern: {concern}")
+            logger.warning("   Consider: (1) Adding changepoint_prior_scale constraint, (2) Cap/floor on growth")
 
     # ==========================================================================
     # P2 FIX: Clip negative forecasts in future forecast data

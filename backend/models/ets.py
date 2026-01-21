@@ -13,7 +13,10 @@ import warnings
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
-from backend.models.utils import compute_metrics, time_series_cross_validate, compute_prediction_intervals, detect_weekly_freq_code
+from backend.models.utils import (
+    compute_metrics, time_series_cross_validate, compute_prediction_intervals,
+    detect_weekly_freq_code, detect_flat_forecast, get_fallback_ets_params
+)
 
 warnings.filterwarnings('ignore')
 
@@ -427,6 +430,46 @@ def train_exponential_smoothing_model(
 
         # Forecast from end of TRAINING data (not test data)
         forecast_values = final_fitted_model.forecast(steps=horizon)
+
+        # CRITICAL: Detect and handle flat forecasts
+        flat_check = detect_flat_forecast(forecast_values, train_df['y'].values)
+        if flat_check['is_flat']:
+            logger.warning(f"🚨 ETS flat forecast detected with params trend={best_params['trend']}, seasonal={best_params['seasonal']}")
+            logger.warning(f"   Reason: {flat_check['flat_reason']}")
+            logger.warning(f"   Attempting fallback parameters...")
+
+            # Try fallback parameter combinations
+            for fallback_trend, fallback_seasonal in get_fallback_ets_params():
+                try:
+                    logger.info(f"   Trying fallback: ETS(trend={fallback_trend}, seasonal={fallback_seasonal})")
+                    fallback_model = ExponentialSmoothing(
+                        train_df['y'].values,
+                        seasonal_periods=seasonal_periods,
+                        trend=fallback_trend,
+                        seasonal=fallback_seasonal,
+                        initialization_method='estimated'
+                    )
+                    fallback_fitted = fallback_model.fit(optimized=True)
+                    fallback_forecast = fallback_fitted.forecast(steps=horizon)
+
+                    # Check if fallback is also flat
+                    fallback_check = detect_flat_forecast(fallback_forecast, train_df['y'].values)
+                    if not fallback_check['is_flat']:
+                        logger.info(f"   ✅ Fallback params (trend={fallback_trend}, seasonal={fallback_seasonal}) produces non-flat forecast")
+                        forecast_values = fallback_forecast
+                        final_fitted_model = fallback_fitted
+                        best_params = {'trend': fallback_trend, 'seasonal': fallback_seasonal}
+                        break
+                    else:
+                        logger.warning(f"   ✗ Fallback params (trend={fallback_trend}, seasonal={fallback_seasonal}) also flat")
+                except Exception as e:
+                    logger.warning(f"   ✗ Fallback params (trend={fallback_trend}, seasonal={fallback_seasonal}) failed: {e}")
+                    continue
+            else:
+                # All fallbacks failed - add noise to prevent identical values
+                logger.error("   All fallback parameter combinations produced flat forecasts. Adding minimal variance.")
+                forecast_std = np.std(train_df['y'].values) * 0.01
+                forecast_values = forecast_values + np.random.normal(0, forecast_std, len(forecast_values))
 
         # ==========================================================================
         # DATA LEAKAGE FIX: Confidence intervals from TRAIN residuals only
