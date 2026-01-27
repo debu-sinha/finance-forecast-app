@@ -22,6 +22,10 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+# Environment variable to control child run logging
+# Set MLFLOW_SKIP_CHILD_RUNS=true to only log the best model (reduces MLflow overhead significantly)
+SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
+
 
 class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for Exponential Smoothing model
@@ -194,67 +198,71 @@ def evaluate_ets_params(
     train_y: np.ndarray,
     test_y: np.ndarray,
     parent_run_id: str,
-    experiment_id: str
+    experiment_id: str,
+    skip_mlflow_logging: bool = False
 ) -> Optional[Dict[str, Any]]:
     """
-    Evaluate a single ETS parameter combination (thread-safe)
+    Evaluate a single ETS parameter combination (thread-safe).
+
+    Args:
+        skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
     """
-    try:
-        client = MlflowClient()
-        
-        # Create child run
-        child_run = client.create_run(
-            experiment_id=experiment_id,
-            tags={"mlflow.parentRunId": parent_run_id}
-        )
-        run_id = child_run.info.run_id
-        
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
+
+    if not skip_mlflow_logging:
         try:
-            # Log parameters
+            child_run = client.create_run(
+                experiment_id=experiment_id,
+                tags={"mlflow.parentRunId": parent_run_id}
+            )
+            run_id = child_run.info.run_id
+        except Exception as e:
+            logger.warning(f"Failed to create MLflow child run: {e}")
+            skip_mlflow_logging = True
+
+    try:
+        if not skip_mlflow_logging and run_id:
             client.log_param(run_id, "model_type", "ExponentialSmoothing")
             client.log_param(run_id, "trend", str(trend))
             client.log_param(run_id, "seasonal", str(seasonal))
-            
-            # Train model
-            model = ExponentialSmoothing(
-                train_y,
-                seasonal_periods=seasonal_periods,
-                trend=trend,
-                seasonal=seasonal,
-                initialization_method='estimated'
-            )
-            fitted_model = model.fit(optimized=True)
-            
-            # Validate on test set
-            test_predictions = fitted_model.forecast(steps=len(test_y))
-            metrics = compute_metrics(test_y, test_predictions)
-            
-            # Log metrics
+
+        # Train model
+        model = ExponentialSmoothing(
+            train_y,
+            seasonal_periods=seasonal_periods,
+            trend=trend,
+            seasonal=seasonal,
+            initialization_method='estimated'
+        )
+        fitted_model = model.fit(optimized=True)
+
+        # Validate on test set
+        test_predictions = fitted_model.forecast(steps=len(test_y))
+        metrics = compute_metrics(test_y, test_predictions)
+
+        if not skip_mlflow_logging and run_id:
             client.log_metric(run_id, "mape", metrics["mape"])
             client.log_metric(run_id, "rmse", metrics["rmse"])
             client.log_metric(run_id, "r2", metrics["r2"])
-            
-            # Set run name
             client.set_tag(run_id, "mlflow.runName", f"ETS({trend}/{seasonal})")
-            
-            # Terminate run
             client.set_terminated(run_id, "FINISHED")
-            
-            logger.info(f"  ✓ ETS({trend}/{seasonal}): MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
-            
-            return {
-                "params": {"trend": trend, "seasonal": seasonal},
-                "metrics": metrics,
-                "fitted_model": fitted_model
-            }
-            
-        except Exception as e:
-            client.set_terminated(run_id, "FAILED")
-            logger.warning(f"  ✗ ETS({trend}/{seasonal}) failed: {e}")
-            return None
-            
+
+        logger.info(f"  ✓ ETS({trend}/{seasonal}): MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
+
+        return {
+            "params": {"trend": trend, "seasonal": seasonal},
+            "metrics": metrics,
+            "fitted_model": fitted_model
+        }
+
     except Exception as e:
-        logger.warning(f"  ✗ ETS({trend}/{seasonal}) failed to create run: {e}")
+        if not skip_mlflow_logging and run_id:
+            try:
+                client.set_terminated(run_id, "FAILED")
+            except:
+                pass
+        logger.warning(f"  ✗ ETS({trend}/{seasonal}) failed: {e}")
         return None
 
 def train_exponential_smoothing_model(
@@ -340,10 +348,16 @@ def train_exponential_smoothing_model(
                 logger.warning(f"Could not log original data for ETS: {e}")
         
         max_workers = int(os.environ.get('MLFLOW_MAX_WORKERS', '2'))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
         logger.info(f"Running ETS hyperparameter tuning with {len(param_combinations)} combinations, {max_workers} parallel workers")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(evaluate_ets_params, trend, seasonal, seasonal_periods, train_df['y'].values, test_df['y'].values, parent_run_id, experiment_id)
+                executor.submit(
+                    evaluate_ets_params, trend, seasonal, seasonal_periods,
+                    train_df['y'].values, test_df['y'].values,
+                    parent_run_id, experiment_id, skip_mlflow_logging=SKIP_CHILD_RUNS
+                )
                 for trend, seasonal in param_combinations
             ]
             

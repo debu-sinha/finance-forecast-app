@@ -10,11 +10,95 @@ from mlflow.models.signature import infer_signature
 import logging
 import warnings
 import holidays
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from backend.models.utils import compute_metrics, compute_prediction_intervals, detect_weekly_freq_code
 
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
+
+# Environment variable to control child run logging
+# Set MLFLOW_SKIP_CHILD_RUNS=true to only log the best model (reduces MLflow overhead significantly)
+SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
+
+
+def evaluate_xgboost_params(
+    params: Dict[str, Any],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    random_seed: int,
+    parent_run_id: str,
+    experiment_id: str,
+    skip_mlflow_logging: bool = False
+) -> Optional[Dict[str, Any]]:
+    """
+    Evaluate a single XGBoost parameter combination (thread-safe).
+
+    This function is designed to be called in parallel via ThreadPoolExecutor.
+    When skip_mlflow_logging=True, it skips creating child MLflow runs to reduce overhead.
+    """
+    try:
+        from xgboost import XGBRegressor
+    except ImportError:
+        return None
+
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
+
+    if not skip_mlflow_logging:
+        try:
+            child_run = client.create_run(
+                experiment_id=experiment_id,
+                tags={"mlflow.parentRunId": parent_run_id}
+            )
+            run_id = child_run.info.run_id
+        except Exception as e:
+            logger.warning(f"Failed to create MLflow child run: {e}")
+            skip_mlflow_logging = True
+
+    try:
+        if not skip_mlflow_logging and run_id:
+            for key, value in params.items():
+                client.log_param(run_id, key, value)
+
+        model = XGBRegressor(
+            **params,
+            random_state=random_seed,
+            objective='reg:squarederror',
+            verbosity=0
+        )
+        model.fit(X_train, y_train)
+
+        predictions = model.predict(X_test)
+        metrics = compute_metrics(y_test.values, predictions)
+
+        if not skip_mlflow_logging and run_id:
+            client.log_metric(run_id, "mape", metrics["mape"])
+            client.log_metric(run_id, "rmse", metrics["rmse"])
+            client.log_metric(run_id, "r2", metrics["r2"])
+            client.set_tag(run_id, "mlflow.runName", f"XGB_d{params['max_depth']}_n{params['n_estimators']}")
+            client.set_terminated(run_id, "FINISHED")
+
+        logger.info(f"  ✓ XGBoost(depth={params['max_depth']}, n={params['n_estimators']}): MAPE={metrics['mape']:.2f}%")
+
+        return {
+            "params": params,
+            "metrics": metrics,
+            "model": model,
+            "run_id": run_id,
+            "status": "SUCCESS"
+        }
+
+    except Exception as e:
+        if not skip_mlflow_logging and run_id:
+            try:
+                client.set_terminated(run_id, "FAILED")
+            except:
+                pass
+        logger.warning(f"  ✗ XGBoost params {params} failed: {e}")
+        return {"params": params, "metrics": None, "status": "FAILED", "error": str(e)}
 
 
 class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
@@ -737,55 +821,39 @@ def train_xgboost_model(
             except Exception as e:
                 logger.warning(f"Could not log original data: {e}")
 
-        logger.info(f"Running XGBoost hyperparameter tuning with {len(param_grid)} combinations")
+        # PERFORMANCE OPTIMIZATION: Parallel hyperparameter tuning
+        # Uses ThreadPoolExecutor matching Prophet/ARIMA/ETS patterns
+        max_workers = int(os.environ.get("MLFLOW_MAX_WORKERS", "2"))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
+        logger.info(f"Running XGBoost hyperparameter tuning with {len(param_grid)} combinations (max_workers={max_workers})")
 
-        for params in param_grid:
-            try:
-                client = MlflowClient()
-                child_run = client.create_run(
-                    experiment_id=experiment_id,
-                    tags={"mlflow.parentRunId": parent_run_id}
+        all_results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_xgboost_params,
+                    params, X_train, y_train, X_test, y_test,
+                    random_seed, parent_run_id, experiment_id,
+                    skip_mlflow_logging=SKIP_CHILD_RUNS
                 )
-                run_id = child_run.info.run_id
+                for params in param_grid
+            ]
 
-                try:
-                    for key, value in params.items():
-                        client.log_param(run_id, key, value)
-
-                    model = XGBRegressor(
-                        **params,
-                        random_state=random_seed,
-                        objective='reg:squarederror',
-                        verbosity=0
-                    )
-                    model.fit(X_train, y_train)
-
-                    predictions = model.predict(X_test)
-                    metrics = compute_metrics(y_test.values, predictions)
-
-                    client.log_metric(run_id, "mape", metrics["mape"])
-                    client.log_metric(run_id, "rmse", metrics["rmse"])
-                    client.log_metric(run_id, "r2", metrics["r2"])
-                    client.set_tag(run_id, "mlflow.runName", f"XGB_d{params['max_depth']}_n{params['n_estimators']}")
-                    client.set_terminated(run_id, "FINISHED")
-
-                    logger.info(f"  ✓ XGBoost(depth={params['max_depth']}, n={params['n_estimators']}): MAPE={metrics['mape']:.2f}%")
+            for future in as_completed(futures):
+                result = future.result()
+                if result and result.get("status") == "SUCCESS":
+                    all_results.append(result)
+                    metrics = result["metrics"]
 
                     is_better = metrics["mape"] < best_metrics["mape"] or \
                                (abs(metrics["mape"] - best_metrics["mape"]) < 0.5 and metrics["rmse"] < best_metrics["rmse"])
 
                     if is_better:
                         best_metrics = metrics
-                        best_model = model
-                        best_params = params
+                        best_model = result["model"]
+                        best_params = result["params"]
                         logger.info(f"  ✨ New best XGBoost: MAPE={metrics['mape']:.2f}%")
-
-                except Exception as e:
-                    client.set_terminated(run_id, "FAILED")
-                    logger.warning(f"  ✗ XGBoost params {params} failed: {e}")
-
-            except Exception as e:
-                logger.warning(f"  ✗ Failed to create run for params {params}: {e}")
 
         if best_model is None:
             raise Exception("XGBoost training failed - no successful model fits")

@@ -28,6 +28,7 @@ Holiday Week Detection:
 import pandas as pd
 import numpy as np
 from typing import List, Optional, Dict, Tuple, Any
+from functools import lru_cache
 from dataclasses import dataclass, field
 import logging
 
@@ -1131,6 +1132,41 @@ def get_derived_feature_columns(promo_cols: Optional[List[str]] = None) -> List[
             holiday_proximity_features_daily)
 
 
+@lru_cache(maxsize=32)
+def _build_prophet_holidays_cached(
+    start_year: int,
+    end_year: int,
+    country: str
+) -> Tuple[Tuple, ...]:
+    """
+    Cached internal function to build holiday data.
+    Returns tuple of tuples for hashability, converted to DataFrame by wrapper.
+    """
+    holidays_list = []
+
+    # Define holidays with their multi-day effect windows
+    holiday_configs = [
+        ('thanksgiving', -1, 3), ('christmas', -7, 1), ('black_friday', 0, 2),
+        ('new_years', -1, 1), ('super_bowl', -1, 0), ('july4', -1, 1),
+        ('labor_day', -2, 0), ('memorial_day', -2, 0), ('easter', -1, 1),
+        ('valentines', -2, 0), ('halloween', -1, 0), ('mothers_day', -1, 0),
+        ('fathers_day', -1, 0),
+    ]
+
+    for year in range(start_year, end_year + 1):
+        year_dates = get_all_key_holiday_dates(year)
+        for holiday_name, lower_window, upper_window in holiday_configs:
+            if holiday_name in year_dates:
+                holidays_list.append((
+                    holiday_name,
+                    str(year_dates[holiday_name]),
+                    lower_window,
+                    upper_window
+                ))
+
+    return tuple(holidays_list)
+
+
 def build_prophet_holidays_dataframe(
     start_year: int,
     end_year: int,
@@ -1138,7 +1174,7 @@ def build_prophet_holidays_dataframe(
 ) -> pd.DataFrame:
     """
     Build a holidays DataFrame for Prophet with lower_window and upper_window
-    for multi-day effects.
+    for multi-day effects. Results are cached for performance.
 
     Prophet's holidays feature allows specifying windows around each holiday:
     - lower_window: days BEFORE the holiday that are affected (negative)
@@ -1153,71 +1189,23 @@ def build_prophet_holidays_dataframe(
     Returns:
         DataFrame with columns: holiday, ds, lower_window, upper_window
     """
-    holidays_list = []
+    # Use cached internal function
+    cached_data = _build_prophet_holidays_cached(start_year, end_year, country)
 
-    # Define holidays with their multi-day effect windows
-    # Format: (holiday_name, lower_window, upper_window)
-    holiday_configs = [
-        # Thanksgiving: Big spending Wed-Sun
-        ('thanksgiving', -1, 3),  # Wed prep -> Black Friday weekend
-
-        # Christmas: Extended shopping period
-        ('christmas', -7, 1),  # Week before + day after
-
-        # Black Friday: Fri-Mon shopping
-        ('black_friday', 0, 2),  # Fri-Sun
-
-        # New Year's: Eve + Day
-        ('new_years', -1, 1),
-
-        # Super Bowl: Day before + day itself
-        ('super_bowl', -1, 0),
-
-        # July 4th: Weekend celebration
-        ('july4', -1, 1),
-
-        # Labor Day: Weekend
-        ('labor_day', -2, 0),
-
-        # Memorial Day: Weekend
-        ('memorial_day', -2, 0),
-
-        # Easter: Weekend effect
-        ('easter', -1, 1),
-
-        # Valentine's Day: Day before + day
-        ('valentines', -2, 0),
-
-        # Halloween: Day before + day
-        ('halloween', -1, 0),
-
-        # Mother's Day: Weekend
-        ('mothers_day', -1, 0),
-
-        # Father's Day: Weekend
-        ('fathers_day', -1, 0),
-    ]
-
-    for year in range(start_year, end_year + 1):
-        year_dates = get_all_key_holiday_dates(year)
-
-        for holiday_name, lower_window, upper_window in holiday_configs:
-            if holiday_name in year_dates:
-                holidays_list.append({
-                    'holiday': holiday_name,
-                    'ds': year_dates[holiday_name],
-                    'lower_window': lower_window,
-                    'upper_window': upper_window,
-                })
-
-    if not holidays_list:
+    if not cached_data:
         return pd.DataFrame(columns=['holiday', 'ds', 'lower_window', 'upper_window'])
+
+    # Convert cached tuples to DataFrame
+    holidays_list = [
+        {'holiday': h[0], 'ds': h[1], 'lower_window': h[2], 'upper_window': h[3]}
+        for h in cached_data
+    ]
 
     holidays_df = pd.DataFrame(holidays_list)
     holidays_df['ds'] = pd.to_datetime(holidays_df['ds'])
 
     logger.info(f"Built Prophet holidays DataFrame: {len(holidays_df)} holiday entries "
-                f"for years {start_year}-{end_year}")
+                f"for years {start_year}-{end_year} (cached)")
 
     return holidays_df
 

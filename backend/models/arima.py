@@ -26,6 +26,10 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+# Environment variable to control child run logging
+# Set MLFLOW_SKIP_CHILD_RUNS=true to only log the best model (reduces MLflow overhead significantly)
+SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
+
 
 class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
     """MLflow-compatible wrapper for ARIMA model
@@ -384,69 +388,73 @@ def evaluate_arima_params(
     train_y: np.ndarray,
     test_y: np.ndarray,
     parent_run_id: str,
-    experiment_id: str
+    experiment_id: str,
+    skip_mlflow_logging: bool = False
 ) -> Optional[Dict[str, Any]]:
     """
-    Evaluate a single ARIMA parameter combination (thread-safe)
+    Evaluate a single ARIMA parameter combination (thread-safe).
+
+    Args:
+        skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
     """
-    try:
-        client = MlflowClient()
-        
-        # Create child run
-        child_run = client.create_run(
-            experiment_id=experiment_id,
-            tags={"mlflow.parentRunId": parent_run_id}
-        )
-        run_id = child_run.info.run_id
-        
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
+
+    if not skip_mlflow_logging:
         try:
-            # Log parameters
+            child_run = client.create_run(
+                experiment_id=experiment_id,
+                tags={"mlflow.parentRunId": parent_run_id}
+            )
+            run_id = child_run.info.run_id
+        except Exception as e:
+            logger.warning(f"Failed to create MLflow child run: {e}")
+            skip_mlflow_logging = True
+
+    try:
+        if not skip_mlflow_logging and run_id:
             client.log_param(run_id, "model_type", "ARIMA")
             client.log_param(run_id, "order", str(order))
             client.log_param(run_id, "p", order[0])
             client.log_param(run_id, "d", order[1])
             client.log_param(run_id, "q", order[2])
-            
-            # Train model
-            model = ARIMA(train_y, order=order)
-            fitted_model = model.fit()
 
-            # Get AIC for model selection (lower is better)
-            aic = fitted_model.aic
+        # Train model
+        model = ARIMA(train_y, order=order)
+        fitted_model = model.fit()
 
-            # Validate on test set
-            test_predictions = fitted_model.forecast(steps=len(test_y))
-            metrics = compute_metrics(test_y, test_predictions)
-            metrics["aic"] = aic
+        # Get AIC for model selection (lower is better)
+        aic = fitted_model.aic
 
-            # Log metrics
+        # Validate on test set
+        test_predictions = fitted_model.forecast(steps=len(test_y))
+        metrics = compute_metrics(test_y, test_predictions)
+        metrics["aic"] = aic
+
+        if not skip_mlflow_logging and run_id:
             client.log_metric(run_id, "mape", metrics["mape"])
             client.log_metric(run_id, "rmse", metrics["rmse"])
             client.log_metric(run_id, "r2", metrics["r2"])
             client.log_metric(run_id, "aic", aic)
-
-            # Set run name
             client.set_tag(run_id, "mlflow.runName", f"ARIMA_{order}")
-
-            # Terminate run
             client.set_terminated(run_id, "FINISHED")
 
-            logger.info(f"  ✓ ARIMA{order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
+        logger.info(f"  ✓ ARIMA{order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
 
-            return {
-                "order": order,
-                "metrics": metrics,
-                "fitted_model": fitted_model,
-                "aic": aic
-            }
-            
-        except Exception as e:
-            client.set_terminated(run_id, "FAILED")
-            logger.warning(f"  ✗ ARIMA{order} failed: {e}")
-            return None
-            
+        return {
+            "order": order,
+            "metrics": metrics,
+            "fitted_model": fitted_model,
+            "aic": aic
+        }
+
     except Exception as e:
-        logger.warning(f"  ✗ ARIMA{order} failed to create run: {e}")
+        if not skip_mlflow_logging and run_id:
+            try:
+                client.set_terminated(run_id, "FAILED")
+            except:
+                pass
+        logger.warning(f"  ✗ ARIMA{order} failed: {e}")
         return None
 
 def evaluate_sarimax_params(
@@ -457,42 +465,55 @@ def evaluate_sarimax_params(
     train_exog: Optional[np.ndarray],
     test_exog: Optional[np.ndarray],
     parent_run_id: str,
-    experiment_id: str
+    experiment_id: str,
+    skip_mlflow_logging: bool = False
 ) -> Optional[Dict[str, Any]]:
-    """Evaluate a single SARIMAX parameter combination (thread-safe)"""
+    """
+    Evaluate a single SARIMAX parameter combination (thread-safe).
+
+    Args:
+        skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
+    """
     from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-    try:
-        client = MlflowClient()
+    client = MlflowClient() if not skip_mlflow_logging else None
+    run_id = None
 
-        child_run = client.create_run(
-            experiment_id=experiment_id,
-            tags={"mlflow.parentRunId": parent_run_id}
-        )
-        run_id = child_run.info.run_id
-
+    if not skip_mlflow_logging:
         try:
+            child_run = client.create_run(
+                experiment_id=experiment_id,
+                tags={"mlflow.parentRunId": parent_run_id}
+            )
+            run_id = child_run.info.run_id
+        except Exception as e:
+            logger.warning(f"Failed to create MLflow child run: {e}")
+            skip_mlflow_logging = True
+
+    try:
+        if not skip_mlflow_logging and run_id:
             client.log_param(run_id, "model_type", "SARIMAX")
             client.log_param(run_id, "order", str(order))
             client.log_param(run_id, "seasonal_order", str(seasonal_order))
 
-            model = SARIMAX(
-                train_y,
-                exog=train_exog,
-                order=order,
-                seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False
-            )
-            fitted_model = model.fit(disp=False, maxiter=100)
+        model = SARIMAX(
+            train_y,
+            exog=train_exog,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        )
+        fitted_model = model.fit(disp=False, maxiter=100)
 
-            # Get AIC for model selection (lower is better)
-            aic = fitted_model.aic
+        # Get AIC for model selection (lower is better)
+        aic = fitted_model.aic
 
-            test_predictions = fitted_model.forecast(steps=len(test_y), exog=test_exog)
-            metrics = compute_metrics(test_y, test_predictions)
-            metrics["aic"] = aic
+        test_predictions = fitted_model.forecast(steps=len(test_y), exog=test_exog)
+        metrics = compute_metrics(test_y, test_predictions)
+        metrics["aic"] = aic
 
+        if not skip_mlflow_logging and run_id:
             client.log_metric(run_id, "mape", metrics["mape"])
             client.log_metric(run_id, "rmse", metrics["rmse"])
             client.log_metric(run_id, "r2", metrics["r2"])
@@ -500,23 +521,23 @@ def evaluate_sarimax_params(
             client.set_tag(run_id, "mlflow.runName", f"SARIMAX{order}x{seasonal_order}")
             client.set_terminated(run_id, "FINISHED")
 
-            logger.info(f"  ✓ SARIMAX{order}x{seasonal_order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
+        logger.info(f"  ✓ SARIMAX{order}x{seasonal_order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
 
-            return {
-                "order": order,
-                "seasonal_order": seasonal_order,
-                "metrics": metrics,
-                "fitted_model": fitted_model,
-                "aic": aic
-            }
-
-        except Exception as e:
-            client.set_terminated(run_id, "FAILED")
-            logger.warning(f"  ✗ SARIMAX{order}x{seasonal_order} failed: {e}")
-            return None
+        return {
+            "order": order,
+            "seasonal_order": seasonal_order,
+            "metrics": metrics,
+            "fitted_model": fitted_model,
+            "aic": aic
+        }
 
     except Exception as e:
-        logger.warning(f"  ✗ SARIMAX{order}x{seasonal_order} failed to create run: {e}")
+        if not skip_mlflow_logging and run_id:
+            try:
+                client.set_terminated(run_id, "FAILED")
+            except:
+                pass
+        logger.warning(f"  ✗ SARIMAX{order}x{seasonal_order} failed: {e}")
         return None
 
 def train_arima_model(
@@ -625,10 +646,15 @@ def train_arima_model(
                 logger.warning(f"Could not log original data for ARIMA: {e}")
         
         max_workers = int(os.environ.get('MLFLOW_MAX_WORKERS', '1'))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
         logger.info(f"Running ARIMA hyperparameter tuning with {len(orders)} combinations, {max_workers} parallel workers")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(evaluate_arima_params, order, train_df['y'].values, test_df['y'].values, parent_run_id, experiment_id)
+                executor.submit(
+                    evaluate_arima_params, order, train_df['y'].values, test_df['y'].values,
+                    parent_run_id, experiment_id, skip_mlflow_logging=SKIP_CHILD_RUNS
+                )
                 for order in orders
             ]
             
@@ -1028,6 +1054,8 @@ def train_sarimax_model(
                 logger.warning(f"Could not log original data: {e}")
 
         max_workers = int(os.environ.get('MLFLOW_MAX_WORKERS', '1'))
+        if SKIP_CHILD_RUNS:
+            logger.info(f"📊 MLFLOW_SKIP_CHILD_RUNS=true: Skipping child run logging to reduce MLflow overhead")
         logger.info(f"Running SARIMAX hyperparameter tuning with {len(orders)} combinations, {max_workers} workers")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1035,7 +1063,8 @@ def train_sarimax_model(
                 executor.submit(
                     evaluate_sarimax_params, order, seasonal_order,
                     train_df['y'].values, test_df['y'].values,
-                    train_exog, test_exog, parent_run_id, experiment_id
+                    train_exog, test_exog, parent_run_id, experiment_id,
+                    skip_mlflow_logging=SKIP_CHILD_RUNS
                 )
                 for order, seasonal_order in orders
             ]
