@@ -132,6 +132,11 @@ class JobStateStore(ABC):
         """Delete a job."""
         pass
 
+    @abstractmethod
+    async def count_running_jobs(self, user_id: Optional[str] = None) -> int:
+        """Count jobs in running/submitting state."""
+        pass
+
 
 class SQLiteJobStateStore(JobStateStore):
     """
@@ -285,6 +290,26 @@ class SQLiteJobStateStore(JobStateStore):
     async def get_running_jobs(self) -> List[TrainingJob]:
         """Get all jobs currently in running state."""
         return await self.list_jobs(status=JobStatus.RUNNING, limit=100)
+
+    async def count_running_jobs(self, user_id: Optional[str] = None) -> int:
+        """Count jobs in running/submitting state, optionally filtered by user."""
+        conn = self._get_connection()
+        try:
+            if user_id:
+                cursor = conn.execute(
+                    """SELECT COUNT(*) FROM training_jobs
+                       WHERE user_id = ? AND status IN (?, ?)""",
+                    (user_id, JobStatus.RUNNING.value, JobStatus.SUBMITTING.value)
+                )
+            else:
+                cursor = conn.execute(
+                    """SELECT COUNT(*) FROM training_jobs
+                       WHERE status IN (?, ?)""",
+                    (JobStatus.RUNNING.value, JobStatus.SUBMITTING.value)
+                )
+            return cursor.fetchone()[0]
+        finally:
+            conn.close()
 
     def _row_to_job(self, row: sqlite3.Row) -> TrainingJob:
         """Convert a database row to TrainingJob."""
