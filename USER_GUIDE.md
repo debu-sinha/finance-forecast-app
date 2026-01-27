@@ -52,6 +52,7 @@ Step 1: Upload    -->    Step 2: Configure    -->    Step 3: Train    -->    Ste
 **Simple Mode automatically:**
 - Detects your data frequency (daily/weekly/monthly)
 - Selects the best models for your data
+- **Detects data leakage** (covariates with >90% correlation to target)
 - Optimizes all parameters
 - Provides plain-English explanations
 
@@ -99,8 +100,23 @@ The system will automatically detect:
 | **Value Column** | Which column to forecast |
 | **Frequency** | Daily, weekly, or monthly |
 | **Patterns** | Trend, seasonality, holidays |
+| **Data Leakage** | Covariates too correlated with target |
 
 Review the "Data Profile" section to confirm detection is correct.
+
+### Step 2b: Review Data Leakage Warnings
+
+The system automatically checks for **data leakage** - covariates that are suspiciously correlated with your target variable (>90% correlation). These are auto-excluded because they would cause overfitting.
+
+| Indicator | Meaning |
+|-----------|---------|
+| **Red covariate button** | This column has >90% correlation with target |
+| **Warning icon** | Data leakage detected - column excluded |
+| **Correlation %** | How correlated the column is with your target |
+
+**Example:** If forecasting `Total_Volume`, a column like `Total_Subscribers` that's derived from `Total_Volume` would be flagged as leaky.
+
+**Why this matters:** Using leaky covariates leads to unrealistically good training metrics (e.g., 0.8% MAPE) but terrible real-world forecasts (e.g., 32% MAPE).
 
 ### Step 3: Set Forecast Horizon (Optional)
 
@@ -428,8 +444,10 @@ The system automatically detects and adjusts for:
 | "No data to display" | Check CSV has correct column headers |
 | Dates not recognized | Use YYYY-MM-DD format |
 | Training takes too long | Reduce data size or select fewer models |
-| Poor accuracy | Add more history, check for outliers |
+| Poor accuracy | Add more history, check for outliers, check for data leakage |
 | "Column not found" | Verify column names match exactly |
+| Very high MAPE (>100%) | Using aggregate mode with multi-slice data - switch to by-slice mode |
+| Red covariate warning | Column has data leakage - auto-excluded to prevent overfitting |
 
 ### Error Messages
 
@@ -475,9 +493,12 @@ The system automatically detects and adjusts for:
 | **Seasonality** | Repeating patterns (weekly, monthly, yearly) |
 | **Trend** | Long-term direction (up, down, flat) |
 | **Confidence Interval** | Range where true value likely falls |
+| **Data Leakage** | When a covariate is derived from or highly correlated with the target, causing overfitting |
+| **By-Slice Mode** | Train separate models for each business segment |
+| **Aggregate Mode** | Combine all segments into one model (can reduce accuracy for multi-segment data) |
 
 ---
 
-**Version:** 1.3.1
+**Version:** 1.4.0
 **Last Updated:** January 2026
 

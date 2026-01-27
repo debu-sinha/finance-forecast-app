@@ -79,6 +79,11 @@ class DataProfile:
     future_covariates_valid: bool = True
     future_covariates_issues: List[str] = field(default_factory=list)
 
+    # Data leakage detection
+    leaky_covariates: List[str] = field(default_factory=list)
+    correlation_details: List[Dict[str, Any]] = field(default_factory=list)
+    safe_covariates: List[str] = field(default_factory=list)  # Covariates after removing leaky ones
+
 
 class DataProfiler:
     """
@@ -209,6 +214,16 @@ class DataProfiler:
         )
         logger.info(f"[STEP 8 OUTPUT] covariate_columns = {covariate_columns}")
 
+        # Step 8b: Detect data leakage (highly correlated covariates)
+        logger.info("[STEP 8b] Detecting data leakage (high correlation covariates)...")
+        leaky_covariates, correlation_details = self._detect_leaky_covariates(
+            df, target_column, covariate_columns
+        )
+        # Create safe covariates list by removing leaky ones
+        safe_covariates = [c for c in covariate_columns if c not in leaky_covariates]
+        logger.info(f"[STEP 8b OUTPUT] leaky_covariates = {leaky_covariates}")
+        logger.info(f"[STEP 8b OUTPUT] safe_covariates = {safe_covariates}")
+
         # Step 9: Calculate quality score (use unique_dates for accurate calculation)
         logger.info("[STEP 9] Calculating quality score...")
         quality_score = self._calculate_quality_score(
@@ -235,6 +250,18 @@ class DataProfiler:
                 recommendation="Select a specific segment/slice to forecast, or use batch forecasting for all segments."
             ))
             logger.info(f"[STEP 10 OUTPUT] Added multi-slice warning")
+
+        # Add HIGH PRIORITY warning for data leakage
+        if leaky_covariates:
+            leaky_list = ', '.join(leaky_covariates)
+            warnings.insert(0, Warning(  # Insert at beginning for high visibility
+                level="high",
+                message=f"⚠️ DATA LEAKAGE DETECTED: Column(s) [{leaky_list}] have >90% correlation with target '{target_column}'. "
+                        f"Using these as covariates will cause severe overfitting and poor forecast accuracy.",
+                recommendation=f"UNSELECT these columns from covariates: {leaky_list}. "
+                              f"They likely contain target-derived values that won't be available for future predictions."
+            ))
+            logger.warning(f"[STEP 10 OUTPUT] Added DATA LEAKAGE warning for: {leaky_covariates}")
 
         # Step 11: Generate recommendations
         logger.info("[STEP 11] Generating recommendations...")
@@ -298,6 +325,8 @@ class DataProfiler:
         logger.info(f"[OUTPUT] holiday_coverage_score: {holiday_coverage}")
         logger.info(f"[OUTPUT] has_trend: {has_trend}, has_seasonality: {has_seasonality}")
         logger.info(f"[OUTPUT] covariate_columns: {covariate_columns}")
+        logger.info(f"[OUTPUT] leaky_covariates: {leaky_covariates}")
+        logger.info(f"[OUTPUT] safe_covariates: {safe_covariates}")
         logger.info(f"[OUTPUT] recommended_horizon: {recommended_horizon}")
         logger.info(f"[OUTPUT] recommended_models: {recommended_models}")
         logger.info(f"[OUTPUT] has_multiple_slices: {has_multiple_slices}, slice_count: {slice_count}")
@@ -356,6 +385,11 @@ class DataProfiler:
             has_future_covariates=has_future_covariates,
             future_covariates_valid=future_valid,
             future_covariates_issues=future_issues,
+
+            # Data leakage detection
+            leaky_covariates=leaky_covariates,
+            correlation_details=correlation_details,
+            safe_covariates=safe_covariates,
         )
 
     def _detect_date_column(self, df: pd.DataFrame) -> str:
@@ -715,6 +749,83 @@ class DataProfiler:
                     covariates.append(col)
 
         return covariates
+
+    def _detect_leaky_covariates(
+        self, df: pd.DataFrame, target_column: str, covariate_columns: List[str],
+        correlation_threshold: float = 0.90
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Detect covariates that are highly correlated with target (potential data leakage).
+
+        Data leakage occurs when covariates contain information about the target that
+        wouldn't be available at prediction time. This often manifests as very high
+        correlation (>0.9) between a covariate and the target.
+
+        Args:
+            df: DataFrame with data
+            target_column: Name of target column
+            covariate_columns: List of covariate column names
+            correlation_threshold: Correlation above which to flag as leaky (default 0.90)
+
+        Returns:
+            Tuple of (list of leaky columns, list of correlation details)
+        """
+        leaky_columns = []
+        correlation_details = []
+
+        target_values = df[target_column].dropna()
+        if len(target_values) < 10:
+            return [], []
+
+        for cov in covariate_columns:
+            if cov not in df.columns:
+                continue
+
+            try:
+                cov_values = df[cov].dropna()
+                if len(cov_values) < 10:
+                    continue
+
+                # Align indices for correlation
+                common_idx = target_values.index.intersection(cov_values.index)
+                if len(common_idx) < 10:
+                    continue
+
+                correlation = target_values.loc[common_idx].corr(cov_values.loc[common_idx])
+
+                if pd.isna(correlation):
+                    continue
+
+                abs_corr = abs(correlation)
+
+                if abs_corr >= correlation_threshold:
+                    leaky_columns.append(cov)
+                    correlation_details.append({
+                        'column': cov,
+                        'correlation': round(correlation, 4),
+                        'abs_correlation': round(abs_corr, 4),
+                        'is_leaky': True,
+                        'reason': f"Very high correlation ({abs_corr:.1%}) with target suggests data leakage"
+                    })
+                    logger.warning(
+                        f"⚠️ POTENTIAL DATA LEAKAGE: '{cov}' has {abs_corr:.1%} correlation "
+                        f"with target '{target_column}'. This may cause poor forecast accuracy."
+                    )
+                elif abs_corr >= 0.7:
+                    # High but not extreme - just log for awareness
+                    correlation_details.append({
+                        'column': cov,
+                        'correlation': round(correlation, 4),
+                        'abs_correlation': round(abs_corr, 4),
+                        'is_leaky': False,
+                        'reason': f"High correlation ({abs_corr:.1%}) - monitor for potential issues"
+                    })
+                    logger.info(f"High correlation detected: '{cov}' has {abs_corr:.1%} correlation with target")
+
+            except Exception as e:
+                logger.warning(f"Could not compute correlation for '{cov}': {e}")
+
+        return leaky_columns, correlation_details
 
     def _calculate_quality_score(
         self, df: pd.DataFrame, target_column: str,

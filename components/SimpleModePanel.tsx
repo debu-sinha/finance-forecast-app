@@ -70,6 +70,16 @@ interface DataProfile {
   all_columns?: string[];
   numeric_columns?: string[];
   date_columns?: string[];
+  // Data leakage detection
+  leaky_covariates?: string[];
+  safe_covariates?: string[];
+  correlation_details?: Array<{
+    column: string;
+    correlation: number;
+    abs_correlation: number;
+    is_leaky: boolean;
+    reason: string;
+  }>;
 }
 
 interface Warning {
@@ -1311,14 +1321,23 @@ export const SimpleModePanel: React.FC = () => {
 
           setState(s => {
             const newTargetCol = data.profile.target_column || s.selectedTargetCol;
+            // Get leaky covariates to exclude
+            const leakyCovariates = data.profile.leaky_covariates || [];
+            // Log leakage warnings prominently
+            if (leakyCovariates.length > 0) {
+              console.warn(`⚠️ DATA LEAKAGE DETECTED: Columns with >90% correlation: ${leakyCovariates.join(', ')}`);
+              console.warn(`⚠️ These have been auto-deselected. Re-selecting them may cause poor forecast accuracy.`);
+            }
             return {
               ...s,
               profile: data,
               horizon: data.profile.recommended_horizon,
               selectedDateCol: data.profile.date_column || s.selectedDateCol,
               selectedTargetCol: newTargetCol,
-              // Remove target from covariates if backend updated target column
-              selectedCovariates: s.selectedCovariates.filter(c => c !== newTargetCol),
+              // Remove target AND leaky covariates from selected covariates
+              selectedCovariates: s.selectedCovariates.filter(c =>
+                c !== newTargetCol && !leakyCovariates.includes(c)
+              ),
             };
           });
         }
@@ -1341,6 +1360,13 @@ export const SimpleModePanel: React.FC = () => {
         console.log(`⚠️ Blocked: "${col}" is the target column`);
         return s;
       }
+
+      // Warn if selecting a leaky covariate
+      const isLeaky = s.profile?.leaky_covariates?.includes(col);
+      if (isLeaky && !s.selectedCovariates.includes(col)) {
+        console.warn(`⚠️ WARNING: "${col}" has high correlation with target - potential data leakage!`);
+      }
+
       const wasSelected = s.selectedCovariates.includes(col);
       const newCovariates = wasSelected
         ? s.selectedCovariates.filter(c => c !== col)
@@ -1352,6 +1378,11 @@ export const SimpleModePanel: React.FC = () => {
         selectedCovariates: newCovariates,
       };
     });
+  };
+
+  // Helper to check if a column is leaky (high correlation with target)
+  const isLeakyCovariate = (col: string): boolean => {
+    return state.profile?.leaky_covariates?.includes(col) ?? false;
   };
 
   const handleForecast = async () => {
@@ -1399,14 +1430,28 @@ export const SimpleModePanel: React.FC = () => {
       if (state.forecastMode === 'by_slice' && state.selectedSliceCols.length > 0) {
         params.set('forecast_mode', 'by_slice');
         params.set('slice_columns', state.selectedSliceCols.join(','));
-        const sliceValuesJoined = state.selectedSliceValues.join('|||');
+
+        // If no explicit selection (default "all"), compute all combinations
+        let sliceValuesToSend = state.selectedSliceValues;
+        if (!state.sliceSelectionExplicit && state.selectedSliceValues.length === 0 && state.rawData) {
+          // Default "all selected" - compute all unique combinations
+          const allCombinations = new Set<string>();
+          state.rawData.forEach(row => {
+            const combo = state.selectedSliceCols.map(col => String(row[col] || 'Unknown')).join(' | ');
+            allCombinations.add(combo);
+          });
+          sliceValuesToSend = Array.from(allCombinations);
+          console.log('📊 Default "all selected" - computed all combinations:', sliceValuesToSend.length);
+        }
+
+        const sliceValuesJoined = sliceValuesToSend.join('|||');
         params.set('slice_values', sliceValuesJoined);
 
         console.log('📤 SENDING TO BACKEND:');
         console.log('  - forecast_mode: by_slice');
         console.log('  - slice_columns:', state.selectedSliceCols.join(','));
         console.log('  - slice_values (raw):', sliceValuesJoined);
-        console.log('  - slice_values (parsed):', state.selectedSliceValues);
+        console.log('  - slice_values (count):', sliceValuesToSend.length);
       } else if (state.detectedSlices.length > 0) {
         params.set('forecast_mode', 'aggregate');
         console.log('📤 SENDING TO BACKEND: forecast_mode: aggregate');
@@ -2087,8 +2132,10 @@ export const SimpleModePanel: React.FC = () => {
 
                               // Handle click for numeric columns (toggle covariate) or date columns
                               const handleChipClick = () => {
+                                console.log(`🔘 Chip clicked: "${col}", isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isCovariate=${isCovariate}`);
                                 if (isNumericGroup && !isTarget) {
                                   // Toggle covariate selection
+                                  console.log(`📊 Toggling covariate: "${col}" - currently ${isCovariate ? 'selected' : 'not selected'}`);
                                   setState(s => ({
                                     ...s,
                                     selectedCovariates: isCovariate
@@ -2096,7 +2143,10 @@ export const SimpleModePanel: React.FC = () => {
                                       : [...s.selectedCovariates, col],
                                   }));
                                 } else if (isDateGroup && !isDate) {
+                                  console.log(`📅 Setting date column to: "${col}"`);
                                   setState(s => ({ ...s, selectedDateCol: col }));
+                                } else {
+                                  console.log(`⚠️ Click ignored: isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isDateGroup=${isDateGroup}, isDate=${isDate}`);
                                 }
                               };
 
@@ -2117,8 +2167,16 @@ export const SimpleModePanel: React.FC = () => {
                                   draggable
                                   onDragStart={(e) => handleDragStart(e, col)}
                                   onDragEnd={handleDragEnd}
-                                  onClick={handleChipClick}
-                                  onDoubleClick={handleChipDoubleClick}
+                                  onMouseUp={(e) => {
+                                    // Only fire click if not dragging (prevents drag interference)
+                                    if (!state.draggingColumn) {
+                                      if (e.detail === 2) {
+                                        handleChipDoubleClick();
+                                      } else {
+                                        handleChipClick();
+                                      }
+                                    }
+                                  }}
                                   className={`px-2 py-1 text-xs rounded-full select-none transition-all ${
                                     isDragging
                                       ? 'opacity-50 scale-95 bg-gray-200 cursor-grabbing'
@@ -2399,6 +2457,32 @@ export const SimpleModePanel: React.FC = () => {
                         </div>
                       </div>
                     </div>
+
+                    {/* Warning: Aggregate mode with multi-slice data */}
+                    {state.forecastMode === 'aggregate' && state.detectedSlices.length > 0 && (
+                      <div className="mt-4 p-4 bg-amber-50 rounded-lg border border-amber-300">
+                        <div className="flex items-start gap-3">
+                          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                          <div>
+                            <h5 className="font-semibold text-amber-800">Aggregate Mode May Reduce Accuracy</h5>
+                            <p className="text-sm text-amber-700 mt-1">
+                              Your data has <strong>{state.detectedSlices.length} segment column(s)</strong> with different business patterns.
+                              Mixing these patterns in aggregate mode often leads to poor forecast accuracy.
+                            </p>
+                            <div className="mt-2 flex items-center gap-2">
+                              <span className="text-xs text-amber-600">Recommendation:</span>
+                              <button
+                                onClick={() => setState(s => ({ ...s, forecastMode: 'by_slice' }))}
+                                className="text-xs px-2 py-1 bg-purple-100 text-purple-700 rounded hover:bg-purple-200 transition-colors font-medium"
+                              >
+                                Switch to By-Slice Mode
+                              </button>
+                              <span className="text-xs text-amber-600">for better accuracy</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Detailed Example Explanation - DYNAMIC based on actual data */}
                     <div className="mt-4 p-4 bg-white rounded-lg border border-gray-200">
@@ -2832,14 +2916,24 @@ export const SimpleModePanel: React.FC = () => {
                                 {filteredColumns.map(col => (
                                   <button
                                     key={col}
-                                    onClick={() => handleCovariateToggle(col)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      console.log(`🎄 Holiday/Feature button clicked: "${col}"`);
+                                      handleCovariateToggle(col);
+                                    }}
+                                    title={isLeakyCovariate(col) ? `⚠️ HIGH CORRELATION: This column has >90% correlation with target and may cause data leakage` : undefined}
                                     className={`px-2 py-1 text-xs rounded-lg border transition-colors ${
-                                      state.selectedCovariates.includes(col)
-                                        ? 'bg-purple-100 border-purple-300 text-purple-700'
-                                        : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
+                                      isLeakyCovariate(col)
+                                        ? state.selectedCovariates.includes(col)
+                                          ? 'bg-red-100 border-red-400 text-red-700 ring-2 ring-red-300'
+                                          : 'bg-red-50 border-red-300 text-red-600 hover:bg-red-100'
+                                        : state.selectedCovariates.includes(col)
+                                          ? 'bg-purple-100 border-purple-300 text-purple-700'
+                                          : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
                                     }`}
                                   >
-                                    {state.selectedCovariates.includes(col) && <Check className="w-3 h-3 inline mr-1" />}
+                                    {isLeakyCovariate(col) && <AlertTriangle className="w-3 h-3 inline mr-1 text-red-500" />}
+                                    {state.selectedCovariates.includes(col) && !isLeakyCovariate(col) && <Check className="w-3 h-3 inline mr-1" />}
                                     {col}
                                   </button>
                                 ))}
@@ -2855,14 +2949,24 @@ export const SimpleModePanel: React.FC = () => {
                     {getAvailableCovariates().map(col => (
                       <button
                         key={col}
-                        onClick={() => handleCovariateToggle(col)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          console.log(`📊 Feature button clicked: "${col}"`);
+                          handleCovariateToggle(col);
+                        }}
+                        title={isLeakyCovariate(col) ? `⚠️ HIGH CORRELATION: This column has >90% correlation with target and may cause data leakage` : undefined}
                         className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
-                          state.selectedCovariates.includes(col)
-                            ? 'bg-purple-100 border-purple-300 text-purple-700'
-                            : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
+                          isLeakyCovariate(col)
+                            ? state.selectedCovariates.includes(col)
+                              ? 'bg-red-100 border-red-400 text-red-700 ring-2 ring-red-300'
+                              : 'bg-red-50 border-red-300 text-red-600 hover:bg-red-100'
+                            : state.selectedCovariates.includes(col)
+                              ? 'bg-purple-100 border-purple-300 text-purple-700'
+                              : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
                         }`}
                       >
-                        {state.selectedCovariates.includes(col) && <Check className="w-3 h-3 inline mr-1" />}
+                        {isLeakyCovariate(col) && <AlertTriangle className="w-3 h-3 inline mr-1 text-red-500" />}
+                        {state.selectedCovariates.includes(col) && !isLeakyCovariate(col) && <Check className="w-3 h-3 inline mr-1" />}
                         {col}
                       </button>
                     ))}
@@ -4508,55 +4612,131 @@ export const SimpleModePanel: React.FC = () => {
 
             {showComponents && (
               <div className="p-6 border-t border-gray-200">
-                <div className="bg-blue-50 rounded-lg p-3 mb-4 text-center">
-                  <code className="text-blue-800 font-mono">{state.forecast.components.formula}</code>
-                </div>
+                {/* For by_slice mode, show per-slice breakdown */}
+                {state.forecast.forecast_mode === 'by_slice' && state.forecast.slice_forecasts && state.forecast.slice_forecasts.length > 0 ? (
+                  <div>
+                    <div className="bg-purple-50 rounded-lg p-3 mb-4">
+                      <p className="text-purple-800 text-sm">
+                        <strong>Multi-Slice Forecast:</strong> Total = Sum of all individual slice forecasts
+                      </p>
+                      <code className="text-purple-700 font-mono text-xs block mt-2">
+                        Total = {state.forecast.slice_forecasts.map(s => s.slice_id).join(' + ')}
+                      </code>
+                    </div>
 
-                {/* Totals */}
-                <div className="grid grid-cols-4 gap-4 mb-4">
-                  <div className="text-center p-3 bg-gray-50 rounded-lg">
-                    <div className="text-xs text-gray-500 uppercase">Base</div>
-                    <div className="font-semibold">${state.forecast.components.totals.base.toLocaleString()}</div>
-                  </div>
-                  <div className="text-center p-3 bg-gray-50 rounded-lg">
-                    <div className="text-xs text-gray-500 uppercase">Trend</div>
-                    <div className="font-semibold">${state.forecast.components.totals.trend.toLocaleString()}</div>
-                  </div>
-                  <div className="text-center p-3 bg-gray-50 rounded-lg">
-                    <div className="text-xs text-gray-500 uppercase">Seasonal</div>
-                    <div className="font-semibold">${state.forecast.components.totals.seasonal.toLocaleString()}</div>
-                  </div>
-                  <div className="text-center p-3 bg-gray-50 rounded-lg">
-                    <div className="text-xs text-gray-500 uppercase">Holiday</div>
-                    <div className="font-semibold">${state.forecast.components.totals.holiday.toLocaleString()}</div>
-                  </div>
-                </div>
+                    {/* Per-slice forecast breakdown */}
+                    <div className="space-y-4">
+                      {state.forecast.slice_forecasts.map((slice, idx) => {
+                        const color = ['#7c3aed', '#2563eb', '#059669', '#d97706', '#dc2626', '#ec4899'][idx % 6];
+                        const avgForecast = slice.forecast.reduce((a, b) => a + b, 0) / slice.forecast.length;
+                        const totalForecast = slice.forecast.reduce((a, b) => a + b, 0);
 
-                {/* Period breakdown table */}
-                <div className="overflow-x-auto">
-                  <table className="min-w-full divide-y divide-gray-200 text-sm">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Forecast</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Lower</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Upper</th>
-                        <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Breakdown</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-200">
-                      {state.forecast.components.periods.slice(0, 12).map((period, idx) => (
-                        <tr key={idx}>
-                          <td className="px-3 py-2 text-gray-800">{period.date}</td>
-                          <td className="px-3 py-2 text-right font-medium">${period.forecast.toLocaleString()}</td>
-                          <td className="px-3 py-2 text-right text-gray-500">${period.lower.toLocaleString()}</td>
-                          <td className="px-3 py-2 text-right text-gray-500">${period.upper.toLocaleString()}</td>
-                          <td className="px-3 py-2 text-gray-600 text-xs font-mono">{period.explanation}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                        return (
+                          <div key={idx} className="border border-gray-200 rounded-lg overflow-hidden">
+                            <div
+                              className="px-4 py-3 flex items-center justify-between"
+                              style={{ backgroundColor: `${color}10`, borderLeft: `4px solid ${color}` }}
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}></span>
+                                <span className="font-semibold text-gray-800">{slice.slice_id}</span>
+                              </div>
+                              <div className="flex items-center gap-4 text-sm">
+                                <span className="text-gray-600">Model: <strong>{slice.best_model}</strong></span>
+                                <span className="text-gray-600">MAPE: <strong>{(slice.holdout_mape || 0).toFixed(1)}%</strong></span>
+                              </div>
+                            </div>
+                            <div className="px-4 py-3 bg-gray-50">
+                              <div className="grid grid-cols-3 gap-4 text-center text-sm mb-3">
+                                <div>
+                                  <div className="text-xs text-gray-500 uppercase">Avg per Period</div>
+                                  <div className="font-bold text-gray-800">${avgForecast.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-gray-500 uppercase">Total ({slice.dates.length} periods)</div>
+                                  <div className="font-bold text-gray-800">${totalForecast.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-gray-500 uppercase">Data Points</div>
+                                  <div className="font-bold text-gray-800">{slice.data_points.toLocaleString()}</div>
+                                </div>
+                              </div>
+                              {/* First few forecast values */}
+                              <div className="text-xs text-gray-600 font-mono bg-white rounded p-2 border border-gray-200">
+                                Forecast: [{slice.forecast.slice(0, 6).map(v => v.toLocaleString(undefined, { maximumFractionDigits: 0 })).join(', ')}{slice.forecast.length > 6 ? ', ...' : ''}]
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Summary row */}
+                    <div className="mt-4 p-4 bg-gradient-to-r from-purple-100 to-indigo-100 rounded-lg border border-purple-200">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-purple-800">Combined Total (All Slices)</span>
+                        <span className="text-xl font-bold text-purple-900">
+                          ${state.forecast.slice_forecasts.reduce((total, slice) =>
+                            total + slice.forecast.reduce((a, b) => a + b, 0), 0
+                          ).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  /* Original aggregate breakdown */
+                  <>
+                    <div className="bg-blue-50 rounded-lg p-3 mb-4 text-center">
+                      <code className="text-blue-800 font-mono">{state.forecast.components.formula}</code>
+                    </div>
+
+                    {/* Totals */}
+                    <div className="grid grid-cols-4 gap-4 mb-4">
+                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                        <div className="text-xs text-gray-500 uppercase">Base</div>
+                        <div className="font-semibold">${state.forecast.components.totals.base.toLocaleString()}</div>
+                      </div>
+                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                        <div className="text-xs text-gray-500 uppercase">Trend</div>
+                        <div className="font-semibold">${state.forecast.components.totals.trend.toLocaleString()}</div>
+                      </div>
+                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                        <div className="text-xs text-gray-500 uppercase">Seasonal</div>
+                        <div className="font-semibold">${state.forecast.components.totals.seasonal.toLocaleString()}</div>
+                      </div>
+                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                        <div className="text-xs text-gray-500 uppercase">Holiday</div>
+                        <div className="font-semibold">${state.forecast.components.totals.holiday.toLocaleString()}</div>
+                      </div>
+                    </div>
+
+                    {/* Period breakdown table */}
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full divide-y divide-gray-200 text-sm">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
+                            <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Forecast</th>
+                            <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Lower</th>
+                            <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase">Upper</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Breakdown</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-200">
+                          {state.forecast.components.periods.slice(0, 12).map((period, idx) => (
+                            <tr key={idx}>
+                              <td className="px-3 py-2 text-gray-800">{period.date}</td>
+                              <td className="px-3 py-2 text-right font-medium">${period.forecast.toLocaleString()}</td>
+                              <td className="px-3 py-2 text-right text-gray-500">${period.lower.toLocaleString()}</td>
+                              <td className="px-3 py-2 text-right text-gray-500">${period.upper.toLocaleString()}</td>
+                              <td className="px-3 py-2 text-gray-600 text-xs font-mono">{period.explanation}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>

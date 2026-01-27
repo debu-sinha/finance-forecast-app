@@ -53,8 +53,9 @@ backend/tests/test_batch_e2e.py
 test_*.py
 test_*.csv
 
-# Development documentation (internal only)
-docs/
+# Development documentation (internal session notes only)
+docs/SESSION_NOTES*.md
+docs/SIMPLE_MODE_PROGRESS.md
 
 # Local config
 *.local.md
@@ -76,3 +77,6 @@ validation_output/
 
 # E2E test results (screenshots, logs)
 tests/results/
+
+# Puppeteer E2E tests (local only)
+tests/*.cjs

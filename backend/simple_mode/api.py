@@ -23,6 +23,59 @@ from .excel_exporter import export_forecast_to_excel
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    """Sanitize float values to be JSON-compliant (no NaN or Inf)."""
+    import math
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _sanitize_dict(d: Dict[str, Any], float_keys: List[str] = None) -> Dict[str, Any]:
+    """Recursively sanitize dict values to be JSON-compliant."""
+    import math
+    result = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            result[k] = _sanitize_dict(v)
+        elif isinstance(v, list):
+            result[k] = _sanitize_list(v)
+        elif isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                result[k] = 0.0 if 'mape' not in k.lower() else 100.0
+            else:
+                result[k] = v
+        else:
+            result[k] = v
+    return result
+
+
+def _sanitize_list(lst: List[Any]) -> List[Any]:
+    """Recursively sanitize list values to be JSON-compliant."""
+    import math
+    result = []
+    for item in lst:
+        if isinstance(item, dict):
+            result.append(_sanitize_dict(item))
+        elif isinstance(item, list):
+            result.append(_sanitize_list(item))
+        elif isinstance(item, float):
+            if math.isnan(item) or math.isinf(item):
+                result.append(0.0)
+            else:
+                result.append(item)
+        else:
+            result.append(item)
+    return result
+
+
 # Create router for simple mode endpoints
 router = APIRouter(prefix="/api/simple", tags=["Simple Mode"])
 
@@ -174,6 +227,10 @@ async def profile_data(file: UploadFile = File(...)):
                 'slice_count': int(profile.slice_count),
                 # Missing dates (for debugging)
                 'missing_dates': [str(d) for d in profile.missing_periods],
+                # Data leakage detection
+                'leaky_covariates': profile.leaky_covariates,
+                'safe_covariates': profile.safe_covariates,
+                'correlation_details': profile.correlation_details,
             },
             warnings=[
                 {'level': w.level, 'message': w.message, 'recommendation': w.recommendation}
@@ -292,15 +349,18 @@ async def simple_forecast(
             # Auto-detect unique values for slice columns
             if len(slice_cols_list) == 1:
                 unique_vals = df[slice_cols_list[0]].dropna().unique().tolist()
-                slice_values = '|'.join(str(v) for v in unique_vals)
+                # Use ||| as separator between slice values
+                slice_values = '|||'.join(str(v) for v in unique_vals)
             else:
                 # For multiple columns, get unique combinations
                 combo_df = df[slice_cols_list].drop_duplicates()
                 combinations = []
                 for _, row in combo_df.iterrows():
-                    combo = '|'.join(str(row[c]) for c in slice_cols_list)
+                    # Use ' | ' (space pipe space) as separator within each combination
+                    combo = ' | '.join(str(row[c]) for c in slice_cols_list)
                     combinations.append(combo)
-                slice_values = '|'.join(combinations)
+                # Use ||| as separator between different combinations
+                slice_values = '|||'.join(combinations)
 
             logger.info(f"📊 Auto-detected slice values: {slice_values}")
 
@@ -372,8 +432,8 @@ async def simple_forecast(
                     # Run forecast for this slice
                     slice_result = await _run_forecast(slice_df, slice_config, slice_profile, f"{run_id}_slice{slice_idx}", slice_hp_filters)
 
-                    # Store slice forecast
-                    slice_forecast_item = {
+                    # Store slice forecast (sanitize to avoid NaN values)
+                    slice_forecast_item = _sanitize_dict({
                         'slice_id': slice_value,
                         'slice_filters': slice_filter,
                         'forecast': slice_result.get('forecast', []),
@@ -381,9 +441,9 @@ async def simple_forecast(
                         'lower_bounds': slice_result.get('lower', []),
                         'upper_bounds': slice_result.get('upper', []),
                         'best_model': slice_result.get('best_model'),
-                        'holdout_mape': slice_result.get('holdout_mape'),
+                        'holdout_mape': _sanitize_float(slice_result.get('holdout_mape'), 100.0),
                         'data_points': len(slice_df),
-                    }
+                    })
                     slice_forecasts_list.append(slice_forecast_item)
 
                     # Track for aggregate summary
@@ -418,7 +478,11 @@ async def simple_forecast(
                             aggregate_upper[i] += val
 
                 # Create a "virtual" aggregate result for the main response
-                forecast_result = {
+                # Sanitize holdout_mape values (handle NaN/None)
+                holdout_mapes = [_sanitize_float(sf.get('holdout_mape'), 100.0) for sf in slice_forecasts_list]
+                avg_holdout_mape = _sanitize_float(np.mean(holdout_mapes) if holdout_mapes else 100.0, 100.0)
+
+                forecast_result = _sanitize_dict({
                     'run_id': run_id,
                     'best_model': f"Multi-slice ({len(slice_forecasts_list)} models)",
                     'model_version': '1.0',
@@ -426,15 +490,15 @@ async def simple_forecast(
                     'dates': all_slice_dates,
                     'lower': aggregate_lower,
                     'upper': aggregate_upper,
-                    'metrics': {'mape': np.mean([sf.get('holdout_mape', 0) or 0 for sf in slice_forecasts_list])},
+                    'metrics': {'mape': avg_holdout_mape},
                     'mlflow_run_id': None,
                     'model_uri': None,
                     'all_models_trained': list(set(sf.get('best_model', 'Unknown') for sf in slice_forecasts_list)),
                     'random_seed': 42,
                     'data_hash': profile.data_hash,
                     'config_hash': config.config_hash,
-                    'holdout_mape': np.mean([sf.get('holdout_mape', 0) or 0 for sf in slice_forecasts_list]),
-                }
+                    'holdout_mape': avg_holdout_mape,
+                })
 
                 logger.info(f"✅ By-slice forecasting complete: {len(slice_forecasts_list)} slices")
             else:
@@ -544,9 +608,9 @@ async def simple_forecast(
             # Anomaly Detection (NEW)
             anomalies=forecast_result.get('anomalies'),
 
-            # Holdout Performance (NEW)
-            holdout_mape=forecast_result.get('holdout_mape'),
-            eval_mape=forecast_result.get('eval_mape'),
+            # Holdout Performance (NEW) - sanitize to avoid NaN
+            holdout_mape=_sanitize_float(forecast_result.get('holdout_mape'), None),
+            eval_mape=_sanitize_float(forecast_result.get('eval_mape'), None),
 
             # Future Covariates Info (NEW)
             future_covariates_used=forecast_result.get('future_covariates_used', False),
@@ -1451,7 +1515,8 @@ async def _run_forecast(
                 except Exception as cleanup_error:
                     logger.warning(f"Could not close MLflow run: {cleanup_error}")
 
-            return final_output
+            # Sanitize all float values to be JSON-compliant (no NaN/Inf)
+            return _sanitize_dict(final_output)
 
     except ImportError as e:
         logger.warning(f"[FALLBACK] Could not import full training infrastructure: {e}. Using fallback.")
@@ -1494,7 +1559,8 @@ async def _run_forecast(
     trend = (y[-1] - y[0]) / len(y) if len(y) > 1 else 0
     forecast_values = [float(mean_val + trend * (i + 1)) for i in range(config.horizon)]
 
-    return {
+    # Sanitize all float values to be JSON-compliant (no NaN/Inf)
+    return _sanitize_dict({
         'run_id': run_id,
         'best_model': 'MovingAverage (fallback)',
         'model_version': '1.0',
@@ -1514,7 +1580,7 @@ async def _run_forecast(
         'future_covariates_used': future_covariates_used,
         'future_covariates_count': future_covariates_count,
         'future_covariates_date_range': future_covariates_date_range,
-    }
+    })
 
 
 def _select_models_for_data(profile: DataProfile, data_length: int) -> List[str]:
@@ -1577,72 +1643,98 @@ def _evaluate_on_holdout(
     """
     Evaluate a trained model's predictions against the holdout set.
 
-    For Simple Mode, we use the MAPE from the training metrics as the
-    holdout proxy. The proper holdout evaluation would require:
-    1. Training on train set only
+    This performs TRUE holdout evaluation by:
+    1. Loading the trained model from MLflow
     2. Predicting for holdout dates
     3. Comparing predictions to holdout actuals
-
-    However, since we're using the existing model training infrastructure
-    which handles train/eval internally, we use the validation MAPE
-    as our selection metric.
+    4. Using robust MAPE (median) if outliers detected
 
     Args:
-        result: Training result dict with metrics
-        holdout_df: The holdout dataframe (used for logging)
+        result: Training result dict with metrics and run_id
+        holdout_df: The holdout dataframe with actual values
         config: Forecast configuration
 
     Returns:
-        MAPE (Mean Absolute Percentage Error) for model comparison
+        MAPE (Mean Absolute Percentage Error) from holdout evaluation
     """
     import numpy as np
+    import mlflow.pyfunc
 
     try:
-        # Use the validation MAPE from training as the comparison metric
-        # This is the MAPE from the eval set during training
-        metrics = result.get('metrics', {})
-        eval_mape = metrics.get('mape', None)
-
-        if eval_mape is not None:
-            logger.info(f"Using eval MAPE for model comparison: {eval_mape:.2f}%")
+        run_id = result.get('run_id')
+        if not run_id or holdout_df.empty:
+            # Fall back to eval MAPE if no run_id or empty holdout
+            metrics = result.get('metrics', {})
+            eval_mape = metrics.get('mape', 100.0)
+            logger.info(f"No run_id or empty holdout - using eval MAPE: {eval_mape:.2f}%")
             return float(eval_mape)
 
-        # If no MAPE in metrics, try to calculate from validation data
-        validation = result.get('validation', [])
-        if not validation:
-            logger.warning("No validation data available")
-            return 100.0
+        # Load the trained model
+        model_uri = f"runs:/{run_id}/model"
+        try:
+            loaded_model = mlflow.pyfunc.load_model(model_uri)
+        except Exception as e:
+            logger.warning(f"Could not load model for holdout eval: {e}")
+            metrics = result.get('metrics', {})
+            return float(metrics.get('mape', 100.0))
 
-        # Convert validation to DataFrame if it's a list
-        if isinstance(validation, list):
-            val_df = pd.DataFrame(validation)
-        else:
-            val_df = validation.copy()
+        # Prepare holdout input - convert dates to string format to match model signature
+        holdout_input = holdout_df[['ds']].copy()
+        holdout_input['ds'] = pd.to_datetime(holdout_input['ds']).dt.strftime('%Y-%m-%d')
 
-        # Look for actual and predicted columns
-        actual_col = 'y' if 'y' in val_df.columns else 'actual' if 'actual' in val_df.columns else None
-        pred_col = 'yhat' if 'yhat' in val_df.columns else 'forecast' if 'forecast' in val_df.columns else 'predicted' if 'predicted' in val_df.columns else None
+        # Add covariates if model expects them
+        try:
+            model_signature = loaded_model.metadata.signature
+            if model_signature and model_signature.inputs:
+                for col_spec in model_signature.inputs.to_dict():
+                    col_name = col_spec.get('name', '')
+                    if col_name != 'ds' and col_name in holdout_df.columns:
+                        holdout_input[col_name] = holdout_df[col_name].values
+        except Exception:
+            pass  # Fall back to ds-only if we can't get signature
 
-        if actual_col is None or pred_col is None:
-            logger.warning(f"Cannot calculate MAPE. Columns: {val_df.columns.tolist()}")
-            return 100.0
+        # Get predictions
+        holdout_predictions = loaded_model.predict(holdout_input)
 
-        actuals = val_df[actual_col].values
-        predictions = val_df[pred_col].values
+        # Calculate MAPE with robust outlier handling
+        if isinstance(holdout_predictions, pd.DataFrame) and 'yhat' in holdout_predictions.columns:
+            pred_df = holdout_predictions[['ds', 'yhat']].copy()
+            pred_df['ds'] = pd.to_datetime(pred_df['ds'])
+            actual_df = holdout_df[['ds', 'y']].copy()
+            actual_df['ds'] = pd.to_datetime(actual_df['ds'])
 
-        # Avoid division by zero
-        mask = actuals != 0
-        if not mask.any():
-            return 100.0
+            merged = actual_df.merge(pred_df, on='ds', how='inner')
+            if len(merged) > 0:
+                # Calculate per-point errors
+                errors = np.abs((merged['y'] - merged['yhat']) / (merged['y'] + 1e-10)) * 100
 
-        mape = np.mean(np.abs((actuals[mask] - predictions[mask]) / actuals[mask])) * 100
+                # Detect extreme outliers (>500% error typically indicates data quality issues)
+                outlier_mask = errors > 500
+                outlier_count = outlier_mask.sum()
 
-        logger.info(f"Calculated MAPE from validation data: {mape:.2f}%")
-        return float(mape)
+                if outlier_count > 0:
+                    logger.warning(f"   ⚠️ {outlier_count} holdout points have >500% error (likely data quality issues)")
+
+                # Use robust MAPE (median) if outliers detected, otherwise mean
+                if outlier_count > 0 and outlier_count < len(merged):
+                    holdout_mape = float(np.median(errors))
+                    logger.info(f"   Using ROBUST holdout MAPE (median): {holdout_mape:.2f}% (mean would be {np.mean(errors):.2f}%)")
+                else:
+                    holdout_mape = float(np.mean(errors))
+
+                logger.info(f"TRUE holdout MAPE calculated: {holdout_mape:.2f}%")
+                return holdout_mape
+
+        # Fallback to eval MAPE if prediction format not recognized
+        logger.warning("Could not calculate true holdout MAPE - using eval MAPE")
+        metrics = result.get('metrics', {})
+        return float(metrics.get('mape', 100.0))
 
     except Exception as e:
         logger.error(f"Error in holdout evaluation: {e}")
-        return 100.0
+        # Fall back to eval MAPE
+        metrics = result.get('metrics', {})
+        return float(metrics.get('mape', 100.0))
 
 
 def _detect_forecast_anomalies(

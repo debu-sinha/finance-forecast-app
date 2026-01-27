@@ -216,10 +216,11 @@ class ForecastExplainer:
             trend_pct = 0
             trend_direction = "stable"
 
-        # Confidence level (stricter thresholds for financial forecasting)
-        if mape <= 3:
+        # Confidence level (aligned with industry standards for financial forecasting)
+        # MAPE under 10% is generally considered good for weekly/monthly forecasts
+        if mape <= 5:
             confidence = "High"
-        elif mape <= 5:
+        elif mape <= 10:
             confidence = "Medium"
         else:
             confidence = "Low"

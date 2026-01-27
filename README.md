@@ -32,6 +32,7 @@ A comprehensive **prototype and reference implementation** for an AI-powered tim
 ### Key Features
 
 *   **Simple Mode (NEW!)**: Autopilot forecasting for finance users - upload data, get forecast. No ML knowledge required.
+*   **Data Leakage Detection (v1.4.0)**: Automatically identifies covariates with >90% correlation to target and excludes them to prevent overfitting.
 *   **AutoML Forecasting Paradigm**: Automatically trains and compares multiple model types (Prophet, ARIMA, Exponential Smoothing, SARIMAX, XGBoost) to find the best fit for your data.
 *   **World-Class Holiday Handling (v1.3.0)**:
     - Multi-day holiday effect windows for Prophet (Thanksgiving -1 to +3 days, Christmas -7 to +1 days, etc.)
@@ -562,13 +563,24 @@ Profile uploaded data without running forecast. Returns auto-detected settings s
     "data_quality_score": 92.5,
     "holiday_coverage_score": 45.0,
     "recommended_models": ["prophet", "xgboost"],
-    "recommended_horizon": 12
+    "recommended_horizon": 12,
+    "leaky_covariates": ["total_subscribers"],
+    "safe_covariates": ["is_promo", "marketing_spend"],
+    "correlation_details": [
+      {
+        "column": "total_subscribers",
+        "correlation": 0.9847,
+        "abs_correlation": 0.9847,
+        "is_leaky": true,
+        "reason": "98.5% correlation with target (threshold: 90%)"
+      }
+    ]
   },
   "warnings": [
     {
-      "level": "medium",
-      "message": "Only 18 months of data. Holiday forecasts may be less accurate.",
-      "recommendation": "Provide 2+ years of data for best holiday accuracy."
+      "level": "high",
+      "message": "Data leakage detected: total_subscribers has 98.5% correlation with target.",
+      "recommendation": "This column has been excluded to prevent overfitting."
     }
   ]
 }
@@ -1098,7 +1110,16 @@ holidays>=0.35
 
 ---
 
-## Recent Updates (December 2024)
+## Recent Updates (January 2026)
+
+### v1.4.0 - Data Leakage Detection
+- **Automatic Data Leakage Detection**: Identifies covariates with >90% correlation to target variable
+- **Visual Indicators**: Leaky columns shown in red with warning icon in UI
+- **Auto-Exclusion**: Leaky covariates automatically deselected on data load
+- **Aggregate Mode Warning**: UI warning when aggregate mode selected for multi-slice data
+- **Safe Covariates**: New `safe_covariates` field excludes leaky columns from model training
+
+### Previous Updates (December 2024)
 
 ### New Features
 - **Batch Deployment with Router Model**: Deploy all batch-trained models to a single serving endpoint with automatic segment routing

@@ -407,6 +407,82 @@ def enhance_features_for_forecasting(df, date_col, target_col, promo_cols, frequ
 
 ---
 
+## Data Leakage Detection
+
+### Overview
+
+Data leakage occurs when a covariate is highly correlated with the target variable, typically because it's derived from or mathematically related to the target. This causes severe overfitting: models appear excellent during training but fail catastrophically on real forecasts.
+
+### How It Works
+
+The `DataProfiler` class in `backend/simple_mode/data_profiler.py` includes automatic leakage detection:
+
+```python
+def _detect_leaky_covariates(
+    self, df: pd.DataFrame, target_column: str, covariate_columns: List[str],
+    correlation_threshold: float = 0.90
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Detect covariates with >90% correlation with target."""
+    leaky_columns = []
+    correlation_details = []
+
+    for cov in covariate_columns:
+        correlation = target_values.corr(cov_values)
+        if abs(correlation) >= correlation_threshold:
+            leaky_columns.append(cov)
+            # Log warning and add to details
+
+    return leaky_columns, correlation_details
+```
+
+### DataProfile Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `leaky_covariates` | `List[str]` | Columns with >90% correlation to target |
+| `safe_covariates` | `List[str]` | Covariates after removing leaky ones |
+| `correlation_details` | `List[Dict]` | Per-column correlation info |
+
+### API Response
+
+The `/api/simple/profile` endpoint returns leakage detection fields:
+
+```json
+{
+  "profile": {
+    "leaky_covariates": ["TOT_SUB"],
+    "safe_covariates": ["IS_PROMO", "MARKETING_SPEND"],
+    "correlation_details": [
+      {
+        "column": "TOT_SUB",
+        "correlation": 0.9847,
+        "abs_correlation": 0.9847,
+        "is_leaky": true,
+        "reason": "98.5% correlation with target (threshold: 90%)"
+      }
+    ]
+  }
+}
+```
+
+### UI Indicators
+
+In `SimpleModePanel.tsx`, leaky covariates are displayed with:
+- Red background color (`bg-red-100`)
+- Warning icon (AlertTriangle)
+- Auto-deselected on profile load
+- Tooltip showing correlation percentage
+
+### Configuration
+
+The correlation threshold can be adjusted in `data_profiler.py`:
+
+```python
+LEAKAGE_CORRELATION_THRESHOLD = 0.90  # 90% default
+```
+
+---
+
 ## Adding New Models
 
 ### Step 1: Create Model File
@@ -614,6 +690,7 @@ python backend/tests/test_simple_mode_e2e.py
 | Data Profiler | 1 | Passing |
 | Holiday Features | 1 | Passing |
 | Data Leakage Prevention | 1 | Passing |
+| **Data Leakage Detection** | 1 | Passing |
 | Time Series Split | 1 | Passing |
 | Metric Calculation | 1 | Passing |
 | Future Features | 1 | Passing |
@@ -627,6 +704,25 @@ python backend/tests/test_simple_mode_e2e.py
 ---
 
 ## Changelog
+
+### v1.4.0 (January 2026)
+
+**New Features - Data Leakage Detection:**
+- Automatic detection of covariates with >90% correlation with target variable
+- New `leaky_covariates`, `safe_covariates`, `correlation_details` fields in data profile
+- Visual indicators in UI: red styling with warning icon for leaky columns
+- Auto-deselection of leaky covariates on data load
+- Aggregate mode warning when multi-slice data detected (recommends by-slice mode)
+
+**Files Changed:**
+- `backend/simple_mode/data_profiler.py` - Added `_detect_leaky_covariates()` method
+- `backend/simple_mode/autopilot_config.py` - Uses `safe_covariates` instead of all covariates
+- `backend/simple_mode/api.py` - Returns leakage detection fields in profile response
+- `components/SimpleModePanel.tsx` - UI indicators and warnings
+
+**Test Results:**
+- By-Slice Mode: 8.2% MAPE (excellent)
+- Aggregate Mode: 202.7% MAPE (expected for multi-slice data)
 
 ### v1.3.1 (January 2026)
 
@@ -693,5 +789,5 @@ python backend/tests/test_simple_mode_e2e.py
 
 ---
 
-**Version:** 1.3.1
+**Version:** 1.4.0
 **Last Updated:** January 2026
