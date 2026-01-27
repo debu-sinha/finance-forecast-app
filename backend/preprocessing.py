@@ -67,6 +67,74 @@ KEY_HOLIDAYS_FIXED = [
     ("new_years_eve", 12, 31),
 ]
 
+# Fiscal quarter-end dates - critical for finance forecasting
+# These dates often have spending spikes as budgets close out
+# Q4 end (Dec 31) is covered by new_years_eve above
+FISCAL_QUARTER_ENDS = [
+    ("fiscal_q1_end", 3, 31),   # Q1 close
+    ("fiscal_q2_end", 6, 30),   # Q2 close (half-year)
+    ("fiscal_q3_end", 9, 30),   # Q3 close
+]
+
+# Minimum data requirements by frequency for lag features
+LAG_DATA_REQUIREMENTS = {
+    'daily': {'lag': 364, 'min_rows': 400, 'seasonal_period': 7},
+    'weekly': {'lag': 52, 'min_rows': 60, 'seasonal_period': 52},
+    'monthly': {'lag': 12, 'min_rows': 15, 'seasonal_period': 12},
+}
+
+
+def validate_lag_data_sufficiency(
+    n_rows: int,
+    frequency: str,
+    raise_error: bool = False
+) -> Dict[str, bool]:
+    """
+    Validate if there's sufficient data for lag features.
+
+    This function provides early feedback before training to help users
+    understand what features will be available based on their data size.
+
+    Args:
+        n_rows: Number of data rows
+        frequency: Data frequency ('daily', 'weekly', 'monthly')
+        raise_error: If True, raise ValueError when data is insufficient
+
+    Returns:
+        Dict with validation results:
+        - 'can_add_yoy_lag': Whether YoY lag features can be added
+        - 'can_add_seasonal': Whether seasonal features are meaningful
+        - 'recommended_min_rows': Minimum recommended rows
+    """
+    config = LAG_DATA_REQUIREMENTS.get(frequency, LAG_DATA_REQUIREMENTS['weekly'])
+    min_rows = config['min_rows']
+    seasonal_period = config['seasonal_period']
+
+    can_add_yoy_lag = n_rows >= min_rows
+    can_add_seasonal = n_rows >= seasonal_period * 2  # Need 2+ cycles
+
+    result = {
+        'can_add_yoy_lag': can_add_yoy_lag,
+        'can_add_seasonal': can_add_seasonal,
+        'recommended_min_rows': min_rows,
+        'current_rows': n_rows,
+        'seasonal_period': seasonal_period,
+    }
+
+    if raise_error and not can_add_yoy_lag:
+        raise ValueError(
+            f"Insufficient data for {frequency} frequency: {n_rows} rows provided, "
+            f"need at least {min_rows} for meaningful lag features"
+        )
+
+    if not can_add_yoy_lag:
+        logger.warning(
+            f"Data sufficiency warning: {n_rows} rows for {frequency} data. "
+            f"YoY lag features require {min_rows}+ rows for reliable results."
+        )
+
+    return result
+
 
 def get_thanksgiving_date(year: int) -> pd.Timestamp:
     """Get the date of Thanksgiving (4th Thursday of November) for a given year."""
@@ -138,6 +206,13 @@ def get_all_key_holiday_dates(year: int) -> Dict[str, pd.Timestamp]:
 
     # Fixed-date holidays
     for name, month, day in KEY_HOLIDAYS_FIXED:
+        try:
+            holidays_dict[name] = pd.Timestamp(year=year, month=month, day=day)
+        except:
+            pass
+
+    # Fiscal quarter-end dates - critical for finance forecasting
+    for name, month, day in FISCAL_QUARTER_ENDS:
         try:
             holidays_dict[name] = pd.Timestamp(year=year, month=month, day=day)
         except:

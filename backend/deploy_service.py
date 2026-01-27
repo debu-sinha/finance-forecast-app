@@ -233,18 +233,32 @@ def test_model_inference(
                 if required_covariates:
                     logger.info(f"   📋 Model requires covariates: {required_covariates[:5]}{'...' if len(required_covariates) > 5 else ''}")
 
-            # Try simple mode first (works for XGBoost, ARIMA, ETS, SARIMAX)
-            test_input = pd.DataFrame({
-                "periods": [test_periods],
-                "start_date": [test_start.strftime("%Y-%m-%d")],
-                "ds": [test_start.strftime("%Y-%m-%d")]  # Some models use 'ds' instead of 'start_date'
-            })
+            # Detect input mode from schema:
+            # - Mode 1 (periods/start_date): XGBoost, ARIMA, ETS, SARIMAX
+            # - Mode 2 (ds column with dates): Prophet
+            schema_str = result["input_schema"].get("schema", "") if result["input_schema"] else ""
+            uses_periods_mode = 'periods' in schema_str and 'start_date' in schema_str
+
+            if uses_periods_mode:
+                # Mode 1: periods + start_date (XGBoost, ARIMA, ETS, SARIMAX)
+                test_input = pd.DataFrame({
+                    "periods": [test_periods],
+                    "start_date": [test_start.strftime("%Y-%m-%d")]
+                })
+                logger.info(f"   🔮 Test input (Mode 1 - periods): periods={test_periods}, start_date={test_start.strftime('%Y-%m-%d')}")
+            else:
+                # Mode 2: ds column with specific dates (Prophet)
+                freq_map = {"daily": "D", "weekly": "W", "monthly": "MS"}
+                pandas_freq = freq_map.get(frequency, "W")
+                future_dates = pd.date_range(start=test_start, periods=test_periods, freq=pandas_freq)
+                test_input = pd.DataFrame({"ds": [d.strftime("%Y-%m-%d") for d in future_dates]})
+                logger.info(f"   🔮 Test input (Mode 2 - dates): {test_periods} dates from {test_start.strftime('%Y-%m-%d')}, frequency={frequency}")
 
             # Add required covariates with default values (0 for binary covariates)
             for cov in required_covariates:
                 test_input[cov] = 0
-
-            logger.info(f"   🔮 Test input (constructed): periods={test_periods}, start_date={test_start.strftime('%Y-%m-%d')}, frequency={frequency}")
+            if required_covariates:
+                logger.info(f"   📋 Added {len(required_covariates)} covariates with default value 0")
 
         # Step 4: Run inference and measure time
         inference_start = time.time()

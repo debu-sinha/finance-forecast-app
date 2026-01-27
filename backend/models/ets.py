@@ -576,14 +576,39 @@ def train_exponential_smoothing_model(
                     "name": "ets_env"
                 }
             )
+
+            # Verify model was logged by checking artifact URI
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"   ✅ ETS model logged successfully to: {artifact_uri}")
+
+            # Also save a pickle backup for robustness
+            model_backup_path = "/tmp/ets_model_backup.pkl"
+            with open(model_backup_path, 'wb') as f:
+                pickle.dump({
+                    'model': final_fitted_model,
+                    'wrapper': model_wrapper,
+                    'params': best_params,
+                    'frequency': frequency,
+                    'seasonal_periods': seasonal_periods
+                }, f)
+            mlflow.log_artifact(model_backup_path, "model_backup")
+            logger.info(f"   ✅ ETS model backup saved to model_backup/")
+
         except Exception as e:
-            logger.warning(f"Failed to log ETS pyfunc model: {e}")
+            logger.error(f"   ❌ Failed to log ETS pyfunc model: {e}")
             try:
                 model_path = "/tmp/ets_model.pkl"
                 with open(model_path, 'wb') as f:
-                    pickle.dump({'model': final_fitted_model, 'params': best_params, 'freq': pd_freq}, f)
+                    pickle.dump({
+                        'model': final_fitted_model,
+                        'params': best_params,
+                        'freq': pd_freq,
+                        'frequency': frequency
+                    }, f)
                 mlflow.log_artifact(model_path, "model")
-            except Exception: pass
+                logger.warning(f"   ⚠️ Logged ETS model as pickle fallback")
+            except Exception as fallback_error:
+                logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
         
         best_run_id = parent_run_id
         best_artifact_uri = parent_run.info.artifact_uri

@@ -859,7 +859,35 @@ async def train_model(request: TrainRequest):
                         # Load the model and predict on holdout
                         import mlflow.pyfunc
                         model_uri = f"runs:/{res.run_id}/model"
-                        loaded_model = mlflow.pyfunc.load_model(model_uri)
+                        logger.info(f"   {res.model_name}: Loading model from {model_uri}")
+
+                        try:
+                            loaded_model = mlflow.pyfunc.load_model(model_uri)
+                            logger.info(f"   {res.model_name}: Model loaded successfully")
+                        except Exception as load_error:
+                            logger.error(f"   {res.model_name}: Failed to load model from {model_uri}: {load_error}")
+                            # Try loading from backup
+                            try:
+                                backup_uri = f"runs:/{res.run_id}/model_backup"
+                                logger.info(f"   {res.model_name}: Attempting to load from backup: {backup_uri}")
+                                import pickle
+                                client = mlflow.tracking.MlflowClient()
+                                local_path = client.download_artifacts(res.run_id, "model_backup")
+                                backup_files = [f for f in os.listdir(local_path) if f.endswith('.pkl')]
+                                if backup_files:
+                                    with open(os.path.join(local_path, backup_files[0]), 'rb') as f:
+                                        backup_data = pickle.load(f)
+                                    logger.info(f"   {res.model_name}: Loaded model from backup")
+                                    # Use the wrapper from backup if available
+                                    if 'wrapper' in backup_data:
+                                        loaded_model = backup_data['wrapper']
+                                    else:
+                                        raise Exception("Backup doesn't contain model wrapper")
+                                else:
+                                    raise Exception("No backup pickle files found")
+                            except Exception as backup_error:
+                                logger.error(f"   {res.model_name}: Backup load also failed: {backup_error}")
+                                raise load_error  # Re-raise original error
 
                         # Prepare holdout input based on model signature
                         # XGBoost uses Mode 1 (periods/start_date), Prophet/ARIMA use Mode 2 (ds)
@@ -919,6 +947,16 @@ async def train_model(request: TrainRequest):
                         logger.info(f"      Input shape: {holdout_input.shape}, columns: {list(holdout_input.columns)}")
                         if isinstance(holdout_predictions, pd.DataFrame):
                             logger.info(f"      Output shape: {holdout_predictions.shape}, columns: {list(holdout_predictions.columns)}")
+                            # Check for all-zero predictions (common sign of model loading issues)
+                            if 'yhat' in holdout_predictions.columns:
+                                pred_values = holdout_predictions['yhat'].values
+                                non_zero_count = (pred_values != 0).sum()
+                                if non_zero_count == 0:
+                                    logger.error(f"   ❌ {res.model_name}: ALL PREDICTIONS ARE ZERO! This indicates a model loading or inference issue.")
+                                    logger.error(f"      Possible causes: Model not properly serialized, date format mismatch, or feature mismatch")
+                                    logger.error(f"      Input sample: {holdout_input.head(2).to_dict()}")
+                                else:
+                                    logger.info(f"      Prediction stats: min={pred_values.min():,.0f}, max={pred_values.max():,.0f}, mean={pred_values.mean():,.0f}")
                         else:
                             logger.info(f"      Output type: {type(holdout_predictions)}, len: {len(holdout_predictions) if hasattr(holdout_predictions, '__len__') else 'N/A'}")
 
@@ -1267,6 +1305,11 @@ async def register_model_endpoint(model_uri: str, model_name: str = os.getenv("U
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Maximum number of segments allowed in a single batch request
+# Prevents resource exhaustion on Databricks Apps (4 vCPU, 12GB RAM limit)
+MAX_BATCH_SIZE = 100
+
+
 @app.post("/api/train-batch", response_model=BatchTrainResponse)
 async def train_batch(request: BatchTrainRequest):
     """
@@ -1277,6 +1320,20 @@ async def train_batch(request: BatchTrainRequest):
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
     import traceback
+
+    # Validate batch size to prevent resource exhaustion
+    if len(request.requests) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size {len(request.requests)} exceeds maximum allowed ({MAX_BATCH_SIZE}). "
+                   f"Please split into smaller batches."
+        )
+
+    if len(request.requests) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Batch request must contain at least one segment."
+        )
 
     logger.info(f"")
     logger.info(f"{'='*60}")

@@ -140,6 +140,13 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
         result['ds'] = pd.to_datetime(result['ds']).dt.normalize()
 
         # ==========================================================================
+        # Diagnostic logging for inference predictions
+        # ==========================================================================
+        if hasattr(self.model, 'history') and 'y' in self.model.history.columns:
+            hist_mean = self.model.history['y'].mean()
+            logger.info(f"🔮 Inference diagnostics: historical mean={hist_mean:,.0f}, prediction range: [{result['yhat'].min():,.0f}, {result['yhat'].max():,.0f}]")
+
+        # ==========================================================================
         # P2 FIX: Clip negative forecasts for financial metrics
         # ==========================================================================
         # Financial metrics (revenue, volume, counts) cannot be negative.
@@ -148,6 +155,11 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
         # ==========================================================================
         neg_forecast_count = (result['yhat'] < 0).sum()
         if neg_forecast_count > 0:
+            logger.error(f"🚨 INFERENCE ERROR: {neg_forecast_count}/{len(result)} predictions are NEGATIVE!")
+            logger.error(f"   Input dates: {result['ds'].iloc[0]} to {result['ds'].iloc[-1]}")
+            logger.error(f"   Prediction values: min={result['yhat'].min():,.0f}, max={result['yhat'].max():,.0f}")
+            if hasattr(self.model, 'history') and 'y' in self.model.history.columns:
+                logger.error(f"   Historical y: min={self.model.history['y'].min():,.0f}, max={self.model.history['y'].max():,.0f}")
             logger.warning(f"⚠️ Clipping {neg_forecast_count} negative forecast values to 0 (financial data cannot be negative)")
             result['yhat'] = result['yhat'].clip(lower=0)
             result['yhat_lower'] = result['yhat_lower'].clip(lower=0)
@@ -156,25 +168,54 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
 
         return result
 
+def _clean_numeric_string(series: pd.Series) -> pd.Series:
+    """
+    Clean numeric strings that may contain formatting characters.
+
+    Handles:
+    - Comma-separated thousands: "29,031" -> 29031
+    - Currency symbols: "$1,234" -> 1234
+    - Whitespace: " 123 " -> 123
+
+    This is critical for CSV files exported from Excel where numbers
+    are formatted with thousand separators.
+    """
+    if series.dtype == 'object':
+        # Remove common formatting characters
+        cleaned = series.astype(str).str.replace(',', '', regex=False)
+        cleaned = cleaned.str.replace('$', '', regex=False)
+        cleaned = cleaned.str.replace(' ', '', regex=False)
+        return pd.to_numeric(cleaned, errors='coerce')
+    return pd.to_numeric(series, errors='coerce')
+
+
 def prepare_prophet_data(data: List[Dict[str, Any]], time_col: str, target_col: str, covariates: List[str]) -> pd.DataFrame:
     df = pd.DataFrame(data)
     prophet_df = pd.DataFrame()
     prophet_df['ds'] = pd.to_datetime(df[time_col])
-    
+
     # Handle target column - it may not exist in future features data
     if target_col in df.columns:
-        prophet_df['y'] = pd.to_numeric(df[target_col], errors='coerce')
+        # FIX: Handle comma-formatted numbers (e.g., "29,031" from Excel exports)
+        prophet_df['y'] = _clean_numeric_string(df[target_col])
+
+        # Log warning if many values were coerced to NaN
+        nan_count = prophet_df['y'].isna().sum()
+        if nan_count > 0:
+            logger.warning(f"⚠️ {nan_count}/{len(df)} target values could not be parsed as numbers. "
+                          f"Check for non-numeric values in '{target_col}' column.")
     else:
         # For future features without target, set y to NaN
         prophet_df['y'] = np.nan
-    
+
     for cov in covariates:
         if cov in df.columns:
-            prophet_df[cov] = pd.to_numeric(df[cov], errors='coerce')
+            # FIX: Handle comma-formatted numbers in covariates too
+            prophet_df[cov] = _clean_numeric_string(df[cov])
         else:
             # Initialize missing covariates with NaN so they can be filled during merge/update
             prophet_df[cov] = np.nan
-    
+
     # Do not drop NaNs here, as they may contain future covariates
     return prophet_df.sort_values('ds').reset_index(drop=True)
 
@@ -263,6 +304,7 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
             daily_seasonality=False,
             changepoint_prior_scale=params['changepoint_prior_scale'],
             seasonality_prior_scale=params['seasonality_prior_scale'],
+            holidays_prior_scale=params.get('holidays_prior_scale', 10.0),
             growth=params.get('growth', 'linear'),
             interval_width=0.95,
             uncertainty_samples=1000,
@@ -587,6 +629,9 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             'changepoint_prior_scale': [0.05, 0.1, 0.3, 0.5],
             # Moderate to high values for stable seasonality
             'seasonality_prior_scale': [0.1, 1.0, 10.0],
+            # Holidays prior scale controls holiday effect strength - critical for finance forecasting
+            # Lower values = more regularization, higher values = stronger holiday effects
+            'holidays_prior_scale': [0.1, 1.0, 10.0],
             'seasonality_mode': ['additive', 'multiplicative'] if seasonality_mode == 'multiplicative' else ['additive'],
             # For data < 3 years, disable yearly seasonality to prevent overfitting
             'yearly_seasonality': [True, False] if len(history_df) >= 156 else [False],  # 156 weeks = 3 years
@@ -686,6 +731,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             daily_seasonality=False,
             changepoint_prior_scale=best_params['changepoint_prior_scale'],
             seasonality_prior_scale=best_params['seasonality_prior_scale'],
+            holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
             growth=best_params.get('growth', 'linear'),
             interval_width=0.95,
             uncertainty_samples=1000,
@@ -795,9 +841,66 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                     logger.info(f"   {col}: {vals}")
 
         forecast = final_model.predict(future)
-        
-        # Log model
-        model_wrapper = ProphetModelWrapper(best_model, time_col, target_col, covariates, frequency)
+
+        # ==========================================================================
+        # AUTOMATIC FALLBACK: Detect unreasonable forecasts and retrain with growth='flat'
+        # ==========================================================================
+        # Prophet with linear growth can produce extreme extrapolations if it detects
+        # changepoints that cause steep trend changes. This is especially problematic
+        # for financial data where negative values are impossible.
+        # ==========================================================================
+        historical_mean = history_df['y'].mean()
+        forecast_mean = forecast[forecast['ds'] > history_df['ds'].max()]['yhat'].mean()
+        has_negative = (forecast['yhat'] < 0).any()
+        ratio = abs(forecast_mean / historical_mean) if historical_mean != 0 else 1.0
+        is_unreasonable = has_negative or (forecast_mean < 0) or (ratio > 5.0) or (ratio < 0.2)
+
+        if is_unreasonable and best_params.get('growth', 'linear') != 'flat':
+            logger.warning(f"🔄 AUTOMATIC FALLBACK: Detected unreasonable Prophet forecast!")
+            logger.warning(f"   Historical mean: {historical_mean:,.0f}, Forecast mean: {forecast_mean:,.0f}, Ratio: {ratio:.2f}")
+            logger.warning(f"   Has negative values: {has_negative}")
+            logger.warning(f"   Retraining with growth='flat' to prevent extreme extrapolation...")
+
+            # Retrain final model with growth='flat'
+            fallback_model = Prophet(
+                seasonality_mode=best_params['seasonality_mode'],
+                yearly_seasonality=best_params['yearly_seasonality'],
+                weekly_seasonality=best_params['weekly_seasonality'],
+                daily_seasonality=False,
+                changepoint_prior_scale=best_params['changepoint_prior_scale'],
+                seasonality_prior_scale=best_params['seasonality_prior_scale'],
+                holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
+                growth='flat',  # Force flat growth for stability
+                interval_width=0.95,
+                uncertainty_samples=1000,
+                holidays=custom_holidays_df
+            )
+            if custom_holidays_df is None:
+                try:
+                    fallback_model.add_country_holidays(country_name=country)
+                except:
+                    pass
+            for cov in covariates:
+                if cov in history_df.columns:
+                    fallback_model.add_regressor(cov)
+
+            fallback_model.fit(history_df)
+            forecast = fallback_model.predict(future)
+            final_model = fallback_model  # Use fallback model for wrapper
+
+            # Verify the fallback is reasonable
+            new_forecast_mean = forecast[forecast['ds'] > history_df['ds'].max()]['yhat'].mean()
+            new_has_negative = (forecast['yhat'] < 0).any()
+            logger.info(f"   ✅ Fallback model forecast mean: {new_forecast_mean:,.0f} (was {forecast_mean:,.0f})")
+            logger.info(f"   ✅ Fallback model has negative: {new_has_negative} (was {has_negative})")
+            best_params['growth'] = 'flat'  # Update params for logging
+
+        # Log model - CRITICAL: Use final_model (trained on full data), NOT best_model (trained only on train split)
+        # Using best_model was causing negative predictions during holdout evaluation because:
+        # - best_model was trained on train split only
+        # - When predicting future dates, it extrapolated beyond its training data
+        # - final_model is trained on full history and makes better predictions
+        model_wrapper = ProphetModelWrapper(final_model, time_col, target_col, covariates, frequency)
         
         input_example_data = {'ds': [str(d.date()) for d in future['ds'].iloc[-3:]]}
         if original_covariates:
@@ -821,16 +924,55 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         logger.info(f"      Sample: {input_example.iloc[0].to_dict()}")
         logger.info(f"   📦 Dependencies: mlflow, pandas, numpy, prophet, holidays")
 
-        mlflow.pyfunc.log_model(
-            artifact_path="model",
-            python_model=model_wrapper,
-            signature=signature,
-            input_example=input_example,
-            code_paths=["backend"],
-            metadata={"description": "Prophet model", "covariates": str(covariates), "frequency": frequency},
-            conda_env={"dependencies": [f"python={os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}", "pip", {"pip": ["mlflow", "pandas", "numpy", "prophet", "holidays"]}]}
-        )
-        logger.info(f"   ✅ Prophet model logged successfully to: model/")
+        # Log model with verification and fallback
+        try:
+            mlflow.pyfunc.log_model(
+                artifact_path="model",
+                python_model=model_wrapper,
+                signature=signature,
+                input_example=input_example,
+                code_paths=["backend"],
+                metadata={"description": "Prophet model", "covariates": str(covariates), "frequency": frequency},
+                conda_env={"dependencies": [f"python={os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}", "pip", {"pip": ["mlflow", "pandas", "numpy", "prophet", "holidays"]}]}
+            )
+
+            # Verify model was logged by checking artifact URI
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"   ✅ Prophet model logged successfully to: {artifact_uri}")
+
+            # Also save a pickle backup for robustness
+            import pickle
+            model_backup_path = "/tmp/prophet_model_backup.pkl"
+            with open(model_backup_path, 'wb') as f:
+                pickle.dump({
+                    'model': best_model,
+                    'wrapper': model_wrapper,
+                    'signature': signature,
+                    'covariates': covariates,
+                    'frequency': frequency
+                }, f)
+            mlflow.log_artifact(model_backup_path, "model_backup")
+            logger.info(f"   ✅ Model backup saved to model_backup/")
+
+        except Exception as log_error:
+            logger.error(f"   ❌ Failed to log Prophet pyfunc model: {log_error}")
+            # Fallback: save as pickle artifact
+            try:
+                import pickle
+                model_path = "/tmp/prophet_model.pkl"
+                with open(model_path, 'wb') as f:
+                    pickle.dump({
+                        'model': best_model,
+                        'wrapper': model_wrapper,
+                        'signature': signature,
+                        'covariates': covariates,
+                        'frequency': frequency
+                    }, f)
+                mlflow.log_artifact(model_path, "model")
+                logger.warning(f"   ⚠️ Logged Prophet model as pickle fallback")
+            except Exception as fallback_error:
+                logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
+
         logger.info(f"   {'='*50}")
         mlflow.log_metrics(best_metrics)
         mlflow.log_params(best_params)
@@ -891,8 +1033,23 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     # P2 FIX: Clip negative forecasts in future forecast data
     # ==========================================================================
     if 'yhat' in forecast_future.columns:
+        # Diagnostic logging for forecast values
+        logger.info(f"📊 Forecast value diagnostics:")
+        logger.info(f"   Historical y range: min={history_df['y'].min():,.0f}, max={history_df['y'].max():,.0f}, mean={history_df['y'].mean():,.0f}")
+        logger.info(f"   Forecast yhat range: min={forecast_future['yhat'].min():,.0f}, max={forecast_future['yhat'].max():,.0f}, mean={forecast_future['yhat'].mean():,.0f}")
+
         neg_fc_count = (forecast_future['yhat'] < 0).sum()
         if neg_fc_count > 0:
+            logger.error(f"🚨 CRITICAL: {neg_fc_count}/{len(forecast_future)} forecasts are NEGATIVE!")
+            logger.error(f"   This indicates a fundamental model issue. Negative values before clipping:")
+            neg_rows = forecast_future[forecast_future['yhat'] < 0]
+            for _, row in neg_rows.head(5).iterrows():
+                logger.error(f"      {row[time_col]}: yhat={row['yhat']:,.0f}")
+            logger.error(f"   Possible causes:")
+            logger.error(f"   1. Model was trained with wrong growth type ('flat' needed for this data)")
+            logger.error(f"   2. Covariates have extreme impact causing negative predictions")
+            logger.error(f"   3. Data scale issue during training")
+
             logger.warning(f"⚠️ Clipping {neg_fc_count} negative future forecasts to 0")
             forecast_future['yhat'] = forecast_future['yhat'].clip(lower=0)
             forecast_future['yhat_lower'] = forecast_future['yhat_lower'].clip(lower=0)

@@ -389,28 +389,34 @@ def evaluate_arima_params(
             # Train model
             model = ARIMA(train_y, order=order)
             fitted_model = model.fit()
-            
+
+            # Get AIC for model selection (lower is better)
+            aic = fitted_model.aic
+
             # Validate on test set
             test_predictions = fitted_model.forecast(steps=len(test_y))
             metrics = compute_metrics(test_y, test_predictions)
-            
+            metrics["aic"] = aic
+
             # Log metrics
             client.log_metric(run_id, "mape", metrics["mape"])
             client.log_metric(run_id, "rmse", metrics["rmse"])
             client.log_metric(run_id, "r2", metrics["r2"])
-            
+            client.log_metric(run_id, "aic", aic)
+
             # Set run name
             client.set_tag(run_id, "mlflow.runName", f"ARIMA_{order}")
-            
+
             # Terminate run
             client.set_terminated(run_id, "FINISHED")
-            
-            logger.info(f"  ✓ ARIMA{order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
-            
+
+            logger.info(f"  ✓ ARIMA{order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
+
             return {
                 "order": order,
                 "metrics": metrics,
-                "fitted_model": fitted_model
+                "fitted_model": fitted_model,
+                "aic": aic
             }
             
         except Exception as e:
@@ -459,22 +465,28 @@ def evaluate_sarimax_params(
             )
             fitted_model = model.fit(disp=False, maxiter=100)
 
+            # Get AIC for model selection (lower is better)
+            aic = fitted_model.aic
+
             test_predictions = fitted_model.forecast(steps=len(test_y), exog=test_exog)
             metrics = compute_metrics(test_y, test_predictions)
+            metrics["aic"] = aic
 
             client.log_metric(run_id, "mape", metrics["mape"])
             client.log_metric(run_id, "rmse", metrics["rmse"])
             client.log_metric(run_id, "r2", metrics["r2"])
+            client.log_metric(run_id, "aic", aic)
             client.set_tag(run_id, "mlflow.runName", f"SARIMAX{order}x{seasonal_order}")
             client.set_terminated(run_id, "FINISHED")
 
-            logger.info(f"  ✓ SARIMAX{order}x{seasonal_order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
+            logger.info(f"  ✓ SARIMAX{order}x{seasonal_order}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}, AIC={aic:.1f}")
 
             return {
                 "order": order,
                 "seasonal_order": seasonal_order,
                 "metrics": metrics,
-                "fitted_model": fitted_model
+                "fitted_model": fitted_model,
+                "aic": aic
             }
 
         except Exception as e:
@@ -786,14 +798,39 @@ def train_arima_model(
                     "name": "arima_env"
                 }
             )
+
+            # Verify model was logged by checking artifact URI
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"   ✅ ARIMA model logged successfully to: {artifact_uri}")
+
+            # Also save a pickle backup for robustness
+            model_backup_path = "/tmp/arima_model_backup.pkl"
+            with open(model_backup_path, 'wb') as f:
+                pickle.dump({
+                    'model': final_fitted_model,
+                    'wrapper': model_wrapper,
+                    'order': best_order,
+                    'frequency': frequency,
+                    'weekly_freq_code': weekly_freq_code
+                }, f)
+            mlflow.log_artifact(model_backup_path, "model_backup")
+            logger.info(f"   ✅ ARIMA model backup saved to model_backup/")
+
         except Exception as e:
-            logger.warning(f"Failed to log ARIMA pyfunc model: {e}")
+            logger.error(f"   ❌ Failed to log ARIMA pyfunc model: {e}")
             try:
                 model_path = "/tmp/arima_model.pkl"
                 with open(model_path, 'wb') as f:
-                    pickle.dump({'model': final_fitted_model, 'order': best_order, 'freq': pd_freq}, f)
+                    pickle.dump({
+                        'model': final_fitted_model,
+                        'order': best_order,
+                        'freq': pd_freq,
+                        'frequency': frequency
+                    }, f)
                 mlflow.log_artifact(model_path, "model")
-            except Exception: pass
+                logger.warning(f"   ⚠️ Logged ARIMA model as pickle fallback")
+            except Exception as fallback_error:
+                logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
         
         best_run_id = parent_run_id
         best_artifact_uri = parent_run.info.artifact_uri
@@ -828,6 +865,32 @@ def train_sarimax_model(
     # Determine seasonal period based on frequency
     seasonal_period_map = {'daily': 7, 'weekly': 52, 'monthly': 12, 'yearly': 1}
     seasonal_period = seasonal_period_map.get(frequency, 12)
+
+    # Validate seasonal period is appropriate for data length
+    # Need at least 2 complete seasonal cycles for meaningful seasonality estimation
+    data_length = len(train_df)
+    min_required = seasonal_period * 2
+    if data_length < min_required:
+        original_period = seasonal_period
+        # Fall back to shorter seasonal period or disable seasonality
+        if frequency == 'weekly' and data_length >= 26:
+            seasonal_period = 26  # Use half-year seasonality
+            logger.warning(
+                f"⚠️ SARIMAX: Insufficient data for full seasonality (need {min_required} rows, have {data_length}). "
+                f"Reduced seasonal period from {original_period} to {seasonal_period}."
+            )
+        elif frequency == 'weekly' and data_length >= 13:
+            seasonal_period = 13  # Use quarterly seasonality
+            logger.warning(
+                f"⚠️ SARIMAX: Reduced seasonal period from {original_period} to {seasonal_period} (quarterly)."
+            )
+        else:
+            # Disable seasonal component
+            seasonal_period = 1
+            logger.warning(
+                f"⚠️ SARIMAX: Data too short for seasonal modeling ({data_length} rows). "
+                f"Disabling seasonality (setting period=1). Need at least {min_required} rows for period={original_period}."
+            )
 
     # Add country holidays as binary features
     train_df = train_df.copy()
@@ -1186,8 +1249,40 @@ def train_sarimax_model(
                     "name": "sarimax_env"
                 }
             )
+
+            # Verify model was logged by checking artifact URI
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"   ✅ SARIMAX model logged successfully to: {artifact_uri}")
+
+            # Also save a pickle backup for robustness
+            model_backup_path = "/tmp/sarimax_model_backup.pkl"
+            with open(model_backup_path, 'wb') as f:
+                pickle.dump({
+                    'model': final_fitted_model,
+                    'wrapper': model_wrapper,
+                    'order': best_order,
+                    'seasonal_order': best_seasonal_order,
+                    'frequency': frequency,
+                    'covariates': valid_covariates
+                }, f)
+            mlflow.log_artifact(model_backup_path, "model_backup")
+            logger.info(f"   ✅ SARIMAX model backup saved to model_backup/")
+
         except Exception as e:
-            logger.warning(f"Failed to log SARIMAX pyfunc model: {e}")
+            logger.error(f"   ❌ Failed to log SARIMAX pyfunc model: {e}")
+            try:
+                model_path = "/tmp/sarimax_model.pkl"
+                with open(model_path, 'wb') as f:
+                    pickle.dump({
+                        'model': final_fitted_model,
+                        'order': best_order,
+                        'seasonal_order': best_seasonal_order,
+                        'frequency': frequency
+                    }, f)
+                mlflow.log_artifact(model_path, "model")
+                logger.warning(f"   ⚠️ Logged SARIMAX model as pickle fallback")
+            except Exception as fallback_error:
+                logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
 
         best_run_id = parent_run_id
         best_artifact_uri = parent_run.info.artifact_uri

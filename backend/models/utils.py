@@ -253,6 +253,40 @@ def safe_smape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -
     return float(np.mean(smape))
 
 
+def safe_wape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -> float:
+    """
+    Compute Weighted Absolute Percentage Error (WAPE).
+
+    WAPE is the preferred metric in finance forecasting because:
+    - It handles zeros naturally (no division by zero per-sample)
+    - It gives appropriate weight to larger values
+    - It's scale-independent and comparable across segments
+
+    Formula: WAPE = sum(|y_true - y_pred|) / sum(|y_true|) * 100
+
+    Returns WAPE as percentage (0-100+), not decimal.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+
+    # Sum of absolute actuals
+    sum_actuals = np.sum(np.abs(y_true))
+
+    if sum_actuals < epsilon:
+        # If all actuals are zero, return MAE-based approximation
+        logger.warning("WAPE undefined (sum of actuals near zero) - returning scaled MAE")
+        mae = np.mean(np.abs(y_pred))
+        # Return as percentage of mean prediction (arbitrary scale for comparability)
+        return float(min(mae * 100, 500.0)) if np.sum(np.abs(y_pred)) > epsilon else 0.0
+
+    # Calculate WAPE
+    sum_errors = np.sum(np.abs(y_true - y_pred))
+    wape = (sum_errors / sum_actuals) * 100
+
+    # Cap at reasonable maximum
+    return float(np.clip(wape, 0, 500.0))
+
+
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -> float:
     """
     Compute MAPE with protection against division by zero.
@@ -364,6 +398,10 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     # Compute MAPE with zero protection
     mape = safe_mape(y_true, y_pred)
 
+    # Compute WAPE - preferred metric for finance forecasting
+    # Handles zeros better than MAPE and gives appropriate weight to larger values
+    wape = safe_wape(y_true, y_pred)
+
     # Compute R2 - inline for performance
     ss_res = np.sum(diff * diff)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
@@ -376,6 +414,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     # Final sanitization - ensure valid output
     rmse = 0.0 if not np.isfinite(rmse) else round(rmse, 2)
     mape = 100.0 if not np.isfinite(mape) else round(mape, 2)
+    wape = 100.0 if not np.isfinite(wape) else round(wape, 2)
     r2 = 0.0 if not np.isfinite(r2) else round(r2, 4)
 
     # Warn if MAPE is unreasonably high (potential model failure)
@@ -386,8 +425,123 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     return {
         "rmse": rmse,
         "mape": mape,
+        "wape": wape,
         "r2": r2
     }
+
+
+def check_stationarity(
+    series: np.ndarray,
+    significance: float = 0.05
+) -> Dict[str, Any]:
+    """
+    Perform combined ADF + KPSS stationarity test for robust detection.
+
+    Using both tests together provides more reliable stationarity detection:
+    - ADF tests H0: series has a unit root (non-stationary)
+    - KPSS tests H0: series is stationary around a deterministic trend
+
+    Interpretation:
+    | ADF | KPSS | Conclusion |
+    |-----|------|------------|
+    | Reject | Fail to Reject | Stationary |
+    | Fail to Reject | Reject | Non-stationary |
+    | Reject | Reject | Trend stationary (need differencing or detrending) |
+    | Fail to Reject | Fail to Reject | Not conclusive |
+
+    Args:
+        series: Time series values
+        significance: Significance level for tests (default 0.05)
+
+    Returns:
+        Dict with test results and recommended action
+    """
+    try:
+        from statsmodels.tsa.stattools import adfuller, kpss
+    except ImportError:
+        logger.warning("statsmodels not installed. Skipping stationarity test.")
+        return {
+            "stationary": None,
+            "action": "Unable to test - statsmodels not installed",
+            "adf_pvalue": None,
+            "kpss_pvalue": None,
+            "adf_stationary": None,
+            "kpss_stationary": None,
+        }
+
+    series = np.asarray(series, dtype=np.float64)
+
+    # Remove NaN values
+    series = series[~np.isnan(series)]
+
+    if len(series) < 20:
+        logger.warning(f"Series too short for stationarity test ({len(series)} < 20 points)")
+        return {
+            "stationary": None,
+            "action": "Series too short for reliable stationarity test",
+            "adf_pvalue": None,
+            "kpss_pvalue": None,
+            "adf_stationary": None,
+            "kpss_stationary": None,
+        }
+
+    result = {
+        "adf_pvalue": None,
+        "kpss_pvalue": None,
+        "adf_stationary": None,
+        "kpss_stationary": None,
+        "stationary": None,
+        "action": None,
+    }
+
+    # ADF Test (H0: non-stationary, i.e., has unit root)
+    try:
+        adf_result = adfuller(series, autolag='AIC')
+        result["adf_pvalue"] = float(adf_result[1])
+        result["adf_stationary"] = adf_result[1] < significance
+    except Exception as e:
+        logger.warning(f"ADF test failed: {e}")
+        result["adf_stationary"] = None
+
+    # KPSS Test (H0: stationary)
+    try:
+        # Use 'c' for constant (level stationarity) - most common case
+        kpss_result = kpss(series, regression='c', nlags='auto')
+        result["kpss_pvalue"] = float(kpss_result[1])
+        # KPSS: reject H0 (p < significance) means NOT stationary
+        result["kpss_stationary"] = kpss_result[1] > significance
+    except Exception as e:
+        logger.warning(f"KPSS test failed: {e}")
+        result["kpss_stationary"] = None
+
+    # Combined interpretation
+    adf_stat = result["adf_stationary"]
+    kpss_stat = result["kpss_stationary"]
+
+    if adf_stat is None or kpss_stat is None:
+        result["stationary"] = None
+        result["action"] = "Test inconclusive - one or more tests failed"
+    elif adf_stat and kpss_stat:
+        # Both agree: stationary
+        result["stationary"] = True
+        result["action"] = "Series is stationary - no differencing needed"
+    elif not adf_stat and not kpss_stat:
+        # Both agree: non-stationary
+        result["stationary"] = False
+        result["action"] = "Series is non-stationary - apply differencing (d=1)"
+    elif adf_stat and not kpss_stat:
+        # ADF says stationary, KPSS says not - trend stationary
+        result["stationary"] = False
+        result["action"] = "Series is trend-stationary - detrend or apply differencing"
+    else:
+        # ADF says not stationary, KPSS says stationary - rare, usually difference
+        result["stationary"] = False
+        result["action"] = "Conflicting results - recommend differencing (d=1) for safety"
+
+    logger.info(f"Stationarity check: ADF p={result['adf_pvalue']:.4f}, KPSS p={result['kpss_pvalue']:.4f} -> {result['action']}")
+
+    return result
+
 
 def time_series_cross_validate(
     y: np.ndarray,

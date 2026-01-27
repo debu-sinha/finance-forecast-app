@@ -1,11 +1,15 @@
 """
 Pydantic models for request/response validation
 """
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional, Literal
+from pydantic import BaseModel, Field, field_validator
 
 
 import os
+
+# Minimum data points required for reliable forecasting
+# 52 weeks = 1 year of weekly data, which is minimum for seasonal pattern detection
+MIN_DATA_POINTS = 52
 
 class DataRow(BaseModel):
     """Represents a single row of data"""
@@ -17,13 +21,25 @@ class DataRow(BaseModel):
 
 class TrainRequest(BaseModel):
     """Request model for training endpoint"""
-    data: List[Dict[str, Any]] = Field(..., description="Time series data rows")
+    data: List[Dict[str, Any]] = Field(..., description="Time series data rows (minimum 52 points required)")
     time_col: str = Field(..., description="Name of the time/date column")
     target_col: str = Field(..., description="Name of the target column to forecast")
     covariates: List[str] = Field(default=[], description="List of covariate column names")
     horizon: int = Field(default=12, description="Number of periods to forecast")
-    frequency: str = Field(default="monthly", description="Frequency: 'weekly', 'monthly', or 'daily'")
-    seasonality_mode: str = Field(default="multiplicative", description="'additive' or 'multiplicative'")
+    frequency: Literal['daily', 'weekly', 'monthly'] = Field(default="monthly", description="Data frequency: 'daily', 'weekly', or 'monthly'")
+    seasonality_mode: Literal['additive', 'multiplicative'] = Field(default="multiplicative", description="Seasonality mode: 'additive' or 'multiplicative'")
+
+    @field_validator('data')
+    @classmethod
+    def validate_minimum_data_points(cls, v):
+        """Ensure minimum data points for reliable forecasting."""
+        if len(v) < MIN_DATA_POINTS:
+            raise ValueError(
+                f"Minimum {MIN_DATA_POINTS} data points required for reliable forecasting. "
+                f"Received only {len(v)} rows. For seasonal pattern detection, at least "
+                f"1 year of data (52 weekly points, 12 monthly points, or 365 daily points) is recommended."
+            )
+        return v
     test_size: Optional[int] = Field(default=None, description="Size of test set for validation")
     regressor_method: str = Field(default="mean", description="How to fill future covariates: 'mean', 'last_value', 'linear_trend'")
     models: List[str] = Field(default=["prophet"], description="Models to train: 'prophet', 'arima', 'exponential_smoothing', 'sarimax', 'xgboost'")

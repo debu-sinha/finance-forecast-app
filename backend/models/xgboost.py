@@ -976,10 +976,43 @@ def train_xgboost_model(
                     "name": "xgboost_env"
                 }
             )
-            logger.info(f"   ✅ XGBoost model logged successfully to: model/")
+
+            # Verify model was logged by checking artifact URI
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"   ✅ XGBoost model logged successfully to: {artifact_uri}")
+
+            # Also save a pickle backup for robustness
+            import pickle
+            model_backup_path = "/tmp/xgboost_model_backup.pkl"
+            with open(model_backup_path, 'wb') as f:
+                pickle.dump({
+                    'model': best_xgb_model,
+                    'wrapper': model_wrapper,
+                    'params': best_params,
+                    'feature_columns': feature_columns,
+                    'covariates': valid_covariates,
+                    'frequency': frequency
+                }, f)
+            mlflow.log_artifact(model_backup_path, "model_backup")
+            logger.info(f"   ✅ XGBoost model backup saved to model_backup/")
             logger.info(f"   {'='*50}")
+
         except Exception as e:
-            logger.warning(f"Failed to log XGBoost pyfunc model: {e}")
+            logger.error(f"   ❌ Failed to log XGBoost pyfunc model: {e}")
+            try:
+                import pickle
+                model_path = "/tmp/xgboost_model.pkl"
+                with open(model_path, 'wb') as f:
+                    pickle.dump({
+                        'model': best_xgb_model,
+                        'params': best_params,
+                        'feature_columns': feature_columns,
+                        'frequency': frequency
+                    }, f)
+                mlflow.log_artifact(model_path, "model")
+                logger.warning(f"   ⚠️ Logged XGBoost model as pickle fallback")
+            except Exception as fallback_error:
+                logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
         
         best_run_id = parent_run_id
         best_artifact_uri = parent_run.info.artifact_uri
