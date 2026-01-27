@@ -865,13 +865,21 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         logger.info(f"   Has negative: {has_negative}, Ratio: {ratio:.2f}, Current growth: {current_growth}")
         logger.info(f"   is_unreasonable: {is_unreasonable}")
 
+        # ==========================================================================
+        # MULTI-LEVEL FALLBACK STRATEGY
+        # ==========================================================================
+        # Level 1: If unreasonable with linear growth → try flat growth
+        # Level 2: If STILL unreasonable with flat growth → try without covariates
+        # Level 3: If STILL unreasonable → use minimal model (flat + no regressors + no holidays)
+        # ==========================================================================
+
         if is_unreasonable and current_growth != 'flat':
-            logger.warning(f"🔄 AUTOMATIC FALLBACK: Detected unreasonable Prophet forecast!")
+            # LEVEL 1: Try flat growth (keeps covariates)
+            logger.warning(f"🔄 FALLBACK LEVEL 1: Detected unreasonable Prophet forecast!")
             logger.warning(f"   Historical mean: {historical_mean:,.0f}, Forecast mean: {forecast_mean:,.0f}, Ratio: {ratio:.2f}")
             logger.warning(f"   Has negative values: {has_negative}")
             logger.warning(f"   Retraining with growth='flat' to prevent extreme extrapolation...")
 
-            # Retrain final model with growth='flat'
             fallback_model = Prophet(
                 seasonality_mode=best_params['seasonality_mode'],
                 yearly_seasonality=best_params['yearly_seasonality'],
@@ -880,7 +888,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 changepoint_prior_scale=best_params['changepoint_prior_scale'],
                 seasonality_prior_scale=best_params['seasonality_prior_scale'],
                 holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
-                growth='flat',  # Force flat growth for stability
+                growth='flat',
                 interval_width=0.95,
                 uncertainty_samples=1000,
                 holidays=custom_holidays_df
@@ -896,27 +904,119 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
 
             fallback_model.fit(history_df)
             forecast = fallback_model.predict(future)
-            final_model = fallback_model  # Use fallback model for wrapper
+            final_model = fallback_model
+            best_params['growth'] = 'flat'
 
-            # Verify the fallback is reasonable
-            new_forecast_mean = forecast[forecast['ds'] > history_df['ds'].max()]['yhat'].mean()
+            # Re-check if still unreasonable
+            new_future_forecast = forecast[forecast['ds'] > history_max_date]
+            new_forecast_mean = new_future_forecast['yhat'].mean() if len(new_future_forecast) > 0 else forecast['yhat'].mean()
             new_has_negative = (forecast['yhat'] < 0).any()
-            logger.info(f"   ✅ Fallback model forecast mean: {new_forecast_mean:,.0f} (was {forecast_mean:,.0f})")
-            logger.info(f"   ✅ Fallback model has negative: {new_has_negative} (was {has_negative})")
-            best_params['growth'] = 'flat'  # Update params for logging
+            new_is_unreasonable = new_has_negative or (new_forecast_mean < 0)
+
+            logger.info(f"   ✅ Level 1 fallback: forecast mean: {new_forecast_mean:,.0f} (was {forecast_mean:,.0f})")
+            logger.info(f"   ✅ Level 1 fallback: has negative: {new_has_negative} (was {has_negative})")
+
+            if new_is_unreasonable:
+                # Continue to Level 2
+                is_unreasonable = True
+                current_growth = 'flat'
+                forecast_mean = new_forecast_mean
+                has_negative = new_has_negative
+
+        if is_unreasonable and current_growth == 'flat':
+            # LEVEL 2: Try flat growth WITHOUT covariates (regressors are causing the problem)
+            logger.warning(f"🔄 FALLBACK LEVEL 2: Still unreasonable with flat growth!")
+            logger.warning(f"   The covariates/regressors are likely causing extreme predictions.")
+            logger.warning(f"   Retraining with growth='flat' and NO COVARIATES...")
+
+            # Create minimal future DataFrame without covariates
+            future_minimal = future[['ds']].copy()
+
+            fallback_model_no_cov = Prophet(
+                seasonality_mode=best_params['seasonality_mode'],
+                yearly_seasonality=best_params['yearly_seasonality'],
+                weekly_seasonality=best_params['weekly_seasonality'],
+                daily_seasonality=False,
+                changepoint_prior_scale=0.01,  # Very low to prevent changepoint overfitting
+                seasonality_prior_scale=best_params['seasonality_prior_scale'],
+                holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
+                growth='flat',
+                interval_width=0.95,
+                uncertainty_samples=1000,
+                holidays=custom_holidays_df
+            )
+            if custom_holidays_df is None:
+                try:
+                    fallback_model_no_cov.add_country_holidays(country_name=country)
+                except:
+                    pass
+            # NO regressors added - that's the point
+
+            # Fit with only ds and y
+            history_minimal = history_df[['ds', 'y']].copy()
+            fallback_model_no_cov.fit(history_minimal)
+            forecast = fallback_model_no_cov.predict(future_minimal)
+            final_model = fallback_model_no_cov
+            covariates = []  # Clear covariates for wrapper
+            best_params['covariates_dropped'] = True
+
+            # Re-check if still unreasonable
+            new_future_forecast = forecast[forecast['ds'] > history_max_date]
+            new_forecast_mean = new_future_forecast['yhat'].mean() if len(new_future_forecast) > 0 else forecast['yhat'].mean()
+            new_has_negative = (forecast['yhat'] < 0).any()
+            new_is_unreasonable = new_has_negative or (new_forecast_mean < 0)
+
+            logger.info(f"   ✅ Level 2 fallback: forecast mean: {new_forecast_mean:,.0f} (was {forecast_mean:,.0f})")
+            logger.info(f"   ✅ Level 2 fallback: has negative: {new_has_negative} (was {has_negative})")
+
+            if new_is_unreasonable:
+                # LEVEL 3: Absolute minimal model
+                logger.warning(f"🔄 FALLBACK LEVEL 3: Still unreasonable! Using minimal model...")
+
+                fallback_model_minimal = Prophet(
+                    seasonality_mode='additive',
+                    yearly_seasonality=True,
+                    weekly_seasonality=True,
+                    daily_seasonality=False,
+                    changepoint_prior_scale=0.001,  # Almost no changepoints
+                    seasonality_prior_scale=1.0,
+                    growth='flat',
+                    interval_width=0.95,
+                    uncertainty_samples=1000
+                )
+
+                fallback_model_minimal.fit(history_minimal)
+                forecast = fallback_model_minimal.predict(future_minimal)
+                final_model = fallback_model_minimal
+                best_params['minimal_model'] = True
+
+                final_forecast_mean = forecast[forecast['ds'] > history_max_date]['yhat'].mean()
+                final_has_negative = (forecast['yhat'] < 0).any()
+                logger.info(f"   ✅ Level 3 minimal: forecast mean: {final_forecast_mean:,.0f}")
+                logger.info(f"   ✅ Level 3 minimal: has negative: {final_has_negative}")
 
         # Log model - CRITICAL: Use final_model (trained on full data), NOT best_model (trained only on train split)
         # Using best_model was causing negative predictions during holdout evaluation because:
         # - best_model was trained on train split only
         # - When predicting future dates, it extrapolated beyond its training data
         # - final_model is trained on full history and makes better predictions
-        model_wrapper = ProphetModelWrapper(final_model, time_col, target_col, covariates, frequency)
-        
+
+        # If covariates were dropped during fallback, use empty list for wrapper
+        wrapper_covariates = covariates if not best_params.get('covariates_dropped', False) else []
+        model_wrapper = ProphetModelWrapper(final_model, time_col, target_col, wrapper_covariates, frequency)
+
+        # Create input example - only include covariates if they weren't dropped
         input_example_data = {'ds': [str(d.date()) for d in future['ds'].iloc[-3:]]}
-        if original_covariates:
-            for cov in original_covariates:
-                input_example_data[cov] = [0, 0, 0]
+        if not best_params.get('covariates_dropped', False) and not best_params.get('minimal_model', False):
+            if original_covariates:
+                for cov in original_covariates:
+                    input_example_data[cov] = [0, 0, 0]
         input_example = pd.DataFrame(input_example_data)
+
+        if best_params.get('covariates_dropped', False):
+            logger.warning(f"   ⚠️ Model was retrained WITHOUT covariates due to fallback")
+        if best_params.get('minimal_model', False):
+            logger.warning(f"   ⚠️ Using MINIMAL model configuration due to fallback")
 
         signature = infer_signature(input_example, model_wrapper.predict(None, input_example)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']])
 
