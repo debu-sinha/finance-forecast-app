@@ -850,12 +850,22 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # for financial data where negative values are impossible.
         # ==========================================================================
         historical_mean = history_df['y'].mean()
-        forecast_mean = forecast[forecast['ds'] > history_df['ds'].max()]['yhat'].mean()
+        history_max_date = history_df['ds'].max()
+        future_forecast = forecast[forecast['ds'] > history_max_date]
+        forecast_mean = future_forecast['yhat'].mean() if len(future_forecast) > 0 else forecast['yhat'].mean()
         has_negative = (forecast['yhat'] < 0).any()
         ratio = abs(forecast_mean / historical_mean) if historical_mean != 0 else 1.0
         is_unreasonable = has_negative or (forecast_mean < 0) or (ratio > 5.0) or (ratio < 0.2)
+        current_growth = best_params.get('growth', 'linear')
 
-        if is_unreasonable and best_params.get('growth', 'linear') != 'flat':
+        # Debug logging for fallback decision
+        logger.info(f"📊 Fallback decision check:")
+        logger.info(f"   History max date: {history_max_date}, Future forecast rows: {len(future_forecast)}")
+        logger.info(f"   Historical mean: {historical_mean:,.0f}, Forecast mean: {forecast_mean:,.0f}")
+        logger.info(f"   Has negative: {has_negative}, Ratio: {ratio:.2f}, Current growth: {current_growth}")
+        logger.info(f"   is_unreasonable: {is_unreasonable}")
+
+        if is_unreasonable and current_growth != 'flat':
             logger.warning(f"🔄 AUTOMATIC FALLBACK: Detected unreasonable Prophet forecast!")
             logger.warning(f"   Historical mean: {historical_mean:,.0f}, Forecast mean: {forecast_mean:,.0f}, Ratio: {ratio:.2f}")
             logger.warning(f"   Has negative values: {has_negative}")
