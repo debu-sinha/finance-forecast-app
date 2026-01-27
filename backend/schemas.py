@@ -19,6 +19,26 @@ class DataRow(BaseModel):
         extra = "allow"
 
 
+class AggregationConfig(BaseModel):
+    """Configuration for data aggregation before forecasting"""
+    enabled: bool = Field(default=False, description="Whether to aggregate multi-dimensional data")
+    group_by_cols: Optional[List[str]] = Field(default=None, description="Columns to group by. None = aggregate to total.")
+    agg_method: Literal['sum', 'mean', 'median', 'max', 'min'] = Field(default='sum', description="Aggregation method for target column")
+    filter_dimensions: Optional[Dict[str, Any]] = Field(default=None, description="Dimension filters, e.g., {'region': 'West', 'segment': ['A', 'B']}")
+    auto_detect_incomplete: bool = Field(default=True, description="Automatically detect and exclude incomplete trailing data")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "enabled": True,
+                "group_by_cols": None,
+                "agg_method": "sum",
+                "filter_dimensions": {"BUSINESS_SEGMENT": "Classic"},
+                "auto_detect_incomplete": True
+            }
+        }
+
+
 class TrainRequest(BaseModel):
     """Request model for training endpoint"""
     data: List[Dict[str, Any]] = Field(..., description="Time series data rows (minimum 52 points required)")
@@ -28,6 +48,8 @@ class TrainRequest(BaseModel):
     horizon: int = Field(default=12, description="Number of periods to forecast")
     frequency: Literal['daily', 'weekly', 'monthly'] = Field(default="monthly", description="Data frequency: 'daily', 'weekly', or 'monthly'")
     seasonality_mode: Literal['additive', 'multiplicative'] = Field(default="multiplicative", description="Seasonality mode: 'additive' or 'multiplicative'")
+    # Data aggregation options for multi-dimensional data
+    aggregation: Optional[AggregationConfig] = Field(default=None, description="Aggregation config for multi-dimensional data. If provided, data will be aggregated before forecasting.")
 
     @field_validator('data')
     @classmethod
@@ -79,6 +101,33 @@ class TrainRequest(BaseModel):
                 "seasonality_mode": "multiplicative"
             }
         }
+
+
+class DimensionInfo(BaseModel):
+    """Information about a detected dimension column"""
+    n_unique: int = Field(..., description="Number of unique values")
+    type: str = Field(..., description="Dimension type: categorical, flag/code, numeric_categorical")
+    sample_values: List[Any] = Field(..., description="Sample of unique values")
+    null_count: int = Field(default=0, description="Number of null values")
+
+
+class DetectDimensionsRequest(BaseModel):
+    """Request model for dimension detection"""
+    data: List[Dict[str, Any]] = Field(..., description="Data rows to analyze")
+    time_col: str = Field(..., description="Name of the date/time column")
+    target_col: str = Field(..., description="Name of the target column")
+
+
+class DetectDimensionsResponse(BaseModel):
+    """Response model for dimension detection"""
+    dimensions: Dict[str, DimensionInfo] = Field(..., description="Detected dimension columns")
+    numeric_measures: List[str] = Field(default=[], description="Numeric columns that could be aggregated")
+    date_col: str = Field(..., description="Date column name")
+    target_col: str = Field(..., description="Target column name")
+    row_count: int = Field(..., description="Total row count")
+    unique_dates: int = Field(..., description="Number of unique dates")
+    aggregation_recommended: bool = Field(..., description="Whether aggregation is recommended")
+    recommendation: str = Field(default="", description="Aggregation recommendation message")
 
 
 class ForecastMetrics(BaseModel):

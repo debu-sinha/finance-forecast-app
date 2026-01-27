@@ -799,6 +799,85 @@ async def analyze_data(request: DataAnalysisRequest):
         raise HTTPException(status_code=500, detail=f"Data analysis failed: {str(e)}")
 
 
+@app.post("/api/detect-dimensions")
+async def detect_dimensions(request: dict):
+    """
+    Detect dimension columns in multi-dimensional data.
+
+    This endpoint analyzes the data and identifies:
+    - Dimension columns (categorical columns suitable for grouping/filtering)
+    - Numeric measure columns (suitable for aggregation)
+    - Whether aggregation is recommended based on data structure
+
+    Call this before training to understand data structure and configure aggregation.
+    """
+    try:
+        import pandas as pd
+        from backend.preprocessing import detect_dimension_columns
+
+        data = request.get('data', [])
+        time_col = request.get('time_col', 'ds')
+        target_col = request.get('target_col', 'y')
+
+        if not data:
+            raise HTTPException(status_code=400, detail="No data provided")
+
+        df = pd.DataFrame(data)
+
+        logger.info(f"🔍 Detecting dimensions: {len(df)} rows, time_col={time_col}, target_col={target_col}")
+
+        if time_col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Time column '{time_col}' not found")
+        if target_col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Target column '{target_col}' not found")
+
+        # Detect dimensions
+        result = detect_dimension_columns(df, time_col, target_col)
+
+        # Convert to response format
+        dimensions_response = {}
+        for col, info in result['dimensions'].items():
+            dimensions_response[col] = {
+                'n_unique': info['n_unique'],
+                'type': info['type'],
+                'sample_values': [str(v) for v in info['sample_values']],
+                'null_count': info['null_count']
+            }
+
+        # Check if aggregation is recommended
+        unique_dates = df[time_col].nunique()
+        row_count = len(df)
+        aggregation_recommended = row_count > unique_dates
+
+        recommendation = ""
+        if aggregation_recommended:
+            ratio = row_count / unique_dates
+            recommendation = (
+                f"Data has {row_count:,} rows but only {unique_dates} unique dates "
+                f"(~{ratio:.0f} rows per date). Aggregation is recommended. "
+                f"Detected dimensions: {list(result['dimensions'].keys())}"
+            )
+
+        return {
+            'dimensions': dimensions_response,
+            'numeric_measures': result['numeric_measures'],
+            'date_col': time_col,
+            'target_col': target_col,
+            'row_count': row_count,
+            'unique_dates': unique_dates,
+            'aggregation_recommended': aggregation_recommended,
+            'recommendation': recommendation
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Dimension detection failed: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Dimension detection failed: {str(e)}")
+
+
 @app.post("/api/train", response_model=TrainResponse)
 async def train_model(request: TrainRequest):
     try:
@@ -831,6 +910,68 @@ async def train_model(request: TrainRequest):
         # ========================================
         raw_input_df = pd.DataFrame(request.data)
         log_dataframe_summary(raw_input_df, "RAW INPUT DATA (from frontend)")
+
+        # ========================================
+        # DATA AGGREGATION (for multi-dimensional data)
+        # ========================================
+        # If aggregation config is provided, aggregate the data before forecasting
+        # This handles datasets with multiple dimensions (e.g., region, segment, product)
+        aggregation_report = None
+        if request.aggregation and request.aggregation.enabled:
+            try:
+                from backend.preprocessing import (
+                    prepare_data_with_aggregation,
+                    detect_dimension_columns,
+                    aggregate_time_series
+                )
+
+                logger.info(f"")
+                logger.info(f"{'='*70}")
+                logger.info(f"🔄 AGGREGATION ENABLED")
+                logger.info(f"{'='*70}")
+                logger.info(f"   Group by: {request.aggregation.group_by_cols or 'None (total)'}")
+                logger.info(f"   Aggregation method: {request.aggregation.agg_method}")
+                logger.info(f"   Dimension filters: {request.aggregation.filter_dimensions or 'None'}")
+                logger.info(f"   Auto-detect incomplete: {request.aggregation.auto_detect_incomplete}")
+
+                # First, detect available dimensions
+                dim_info = detect_dimension_columns(
+                    raw_input_df,
+                    request.time_col,
+                    request.target_col
+                )
+                logger.info(f"   Detected dimensions: {list(dim_info['dimensions'].keys())}")
+
+                # Perform aggregation with data quality checks
+                raw_input_df, aggregation_report = prepare_data_with_aggregation(
+                    df=raw_input_df,
+                    date_col=request.time_col,
+                    target_col=request.target_col,
+                    group_by_cols=request.aggregation.group_by_cols,
+                    agg_method=request.aggregation.agg_method,
+                    filter_dimensions=request.aggregation.filter_dimensions,
+                    auto_detect_incomplete=request.aggregation.auto_detect_incomplete,
+                    frequency=request.frequency
+                )
+
+                # Update request.data with aggregated data for downstream processing
+                request.data = raw_input_df.to_dict(orient='records')
+
+                log_dataframe_summary(raw_input_df, "AGGREGATED DATA (after dimension aggregation)")
+
+                # Log incomplete data detection results
+                if aggregation_report.get('incomplete_detection', {}).get('n_dropped', 0) > 0:
+                    inc_report = aggregation_report['incomplete_detection']
+                    logger.warning(f"⚠️ INCOMPLETE DATA REMOVED:")
+                    logger.warning(f"   Dropped {inc_report['n_dropped']} incomplete period(s)")
+                    logger.warning(f"   Dropped dates: {inc_report['dropped_dates']}")
+                    logger.info(f"   This prevents models from detecting false 'crashes' in the data")
+
+            except Exception as e:
+                logger.error(f"❌ Aggregation failed: {e}")
+                logger.warning("   Continuing with raw data (no aggregation)")
+                import traceback
+                logger.error(traceback.format_exc())
 
         # ========================================
         # LOG RAW PROMOTIONS/EVENTS DATA (if covariates provided)

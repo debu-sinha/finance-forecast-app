@@ -270,6 +270,21 @@ def validate_data_quality(
     else:
         logger.info(f"      ✅ Sufficient seasonal cycles")
 
+    # 9. Check for incomplete trailing data (critical for accurate forecasting)
+    # This detects weeks/periods with anomalously low values at the end of the series
+    # which are likely incomplete data that would cause models to predict false declines
+    df, incomplete_report = detect_incomplete_trailing_data(
+        df, date_col, target_col, frequency, auto_fix=auto_fix
+    )
+
+    if incomplete_report['n_dropped'] > 0:
+        report.stats['incomplete_periods_dropped'] = incomplete_report['n_dropped']
+        report.stats['incomplete_dates'] = incomplete_report['dropped_dates']
+        report.warnings.append(incomplete_report['message'])
+        report.transformations_applied.append(
+            f"Dropped {incomplete_report['n_dropped']} incomplete trailing period(s)"
+        )
+
     # Summary
     logger.info(f"")
     logger.info(f"   📊 SUMMARY:")
@@ -280,6 +295,413 @@ def validate_data_quality(
     logger.info(f"{'='*60}")
 
     return df, report
+
+
+def detect_incomplete_trailing_data(
+    df: pd.DataFrame,
+    date_col: str = 'ds',
+    target_col: str = 'y',
+    frequency: str = 'weekly',
+    auto_fix: bool = True,
+    drop_threshold: float = 0.5,
+    lookback_periods: int = 4
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Detect and optionally remove incomplete trailing data points.
+
+    This is critical for accurate forecasting. Incomplete data at the end of a
+    time series (e.g., partial week data) causes models like Prophet to detect
+    a false "crash" and extrapolate severe declines.
+
+    Detection logic:
+    1. Compare the last N periods to the rolling median of prior periods
+    2. If any trailing period has < drop_threshold * median, flag as incomplete
+    3. Continue checking backwards until we find complete data
+
+    Example: If typical weekly value is ~1.3B and last week shows 76M (6% of normal),
+    that week is clearly incomplete and should be excluded.
+
+    Args:
+        df: Input DataFrame sorted by date
+        date_col: Date column name
+        target_col: Target column name
+        frequency: Data frequency ('daily', 'weekly', 'monthly')
+        auto_fix: Whether to automatically drop incomplete periods
+        drop_threshold: Drop if value < threshold * rolling_median (default 0.5 = 50%)
+        lookback_periods: Number of periods to use for rolling median (default 4)
+
+    Returns:
+        Tuple of (cleaned DataFrame, report dict)
+    """
+    report = {
+        'n_dropped': 0,
+        'dropped_dates': [],
+        'message': '',
+        'details': []
+    }
+
+    if len(df) < lookback_periods + 2:
+        logger.info(f"   9. Incomplete data check: Skipped (insufficient data)")
+        return df, report
+
+    df = df.copy()
+    df = df.sort_values(date_col).reset_index(drop=True)
+
+    # Calculate rolling median excluding the last few periods
+    # We use median instead of mean for robustness to outliers
+    values = np.array(df[target_col].values, dtype=float)
+    n = len(values)
+
+    # Get the median of the "stable" portion (excluding last lookback_periods)
+    stable_values = values[:-lookback_periods] if n > lookback_periods else values[:-1]
+    rolling_median = float(np.median(stable_values))
+    rolling_std = float(np.std(stable_values))
+
+    if rolling_median <= 0:
+        logger.info(f"   9. Incomplete data check: Skipped (median <= 0)")
+        return df, report
+
+    logger.info(f"   9. Incomplete trailing data check:")
+    logger.info(f"      Reference median (prior periods): {rolling_median:,.0f}")
+    logger.info(f"      Drop threshold: {drop_threshold*100:.0f}% of median = {rolling_median * drop_threshold:,.0f}")
+
+    # Check trailing periods from most recent backwards
+    incomplete_indices = []
+    for i in range(n - 1, max(n - lookback_periods - 1, lookback_periods), -1):
+        value = values[i]
+        ratio = value / rolling_median
+        date = df[date_col].iloc[i]
+
+        if ratio < drop_threshold:
+            incomplete_indices.append(i)
+            report['details'].append({
+                'date': str(date),
+                'value': value,
+                'ratio': ratio,
+                'threshold': drop_threshold
+            })
+            logger.warning(f"      ⚠️ {date}: {value:,.0f} = {ratio*100:.1f}% of median (INCOMPLETE)")
+        else:
+            # Found a complete period, stop checking
+            logger.info(f"      ✅ {date}: {value:,.0f} = {ratio*100:.1f}% of median (OK)")
+            break
+
+    if incomplete_indices:
+        n_incomplete = len(incomplete_indices)
+        dropped_dates = [str(df[date_col].iloc[i]) for i in incomplete_indices]
+
+        report['n_dropped'] = n_incomplete
+        report['dropped_dates'] = dropped_dates
+        report['message'] = (
+            f"Detected {n_incomplete} incomplete trailing period(s): {dropped_dates}. "
+            f"These periods have <{drop_threshold*100:.0f}% of normal values, "
+            f"indicating incomplete/partial data."
+        )
+
+        if auto_fix:
+            # Drop incomplete rows
+            df = df.drop(incomplete_indices).reset_index(drop=True)
+            logger.warning(f"      🔧 Auto-fixed: Dropped {n_incomplete} incomplete period(s)")
+            logger.info(f"         Dropped dates: {dropped_dates}")
+            logger.info(f"         New data range: {df[date_col].min()} to {df[date_col].max()}")
+        else:
+            logger.warning(f"      ❌ Found {n_incomplete} incomplete period(s) - set auto_fix=True to remove")
+    else:
+        logger.info(f"      ✅ No incomplete trailing data detected")
+
+    return df, report
+
+
+# =============================================================================
+# DATA AGGREGATION FOR MULTI-DIMENSIONAL TIME SERIES
+# =============================================================================
+
+def aggregate_time_series(
+    df: pd.DataFrame,
+    date_col: str,
+    target_col: str,
+    group_by_cols: Optional[List[str]] = None,
+    agg_method: str = 'sum',
+    additional_agg: Optional[Dict[str, str]] = None
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Aggregate multi-dimensional time series data by specified dimensions.
+
+    This function handles datasets with multiple dimensions (e.g., region, product,
+    segment) and aggregates them to produce a single time series suitable for
+    forecasting.
+
+    Example use cases:
+    - Aggregate sales across all stores: group_by_cols=None (total)
+    - Aggregate by region: group_by_cols=['region']
+    - Aggregate by region and product: group_by_cols=['region', 'product']
+
+    Args:
+        df: Input DataFrame with multi-dimensional data
+        date_col: Name of the date column
+        target_col: Name of the target column to aggregate
+        group_by_cols: List of columns to group by. If None, aggregates to total.
+        agg_method: Aggregation method for target ('sum', 'mean', 'median', 'max', 'min')
+        additional_agg: Dict mapping column names to aggregation methods for other columns
+                       e.g., {'volume': 'sum', 'price': 'mean'}
+
+    Returns:
+        Tuple of (aggregated DataFrame, aggregation report)
+    """
+    report = {
+        'original_rows': len(df),
+        'original_columns': list(df.columns),
+        'group_by_cols': group_by_cols,
+        'agg_method': agg_method,
+        'aggregated_rows': 0,
+        'dimension_values': {}
+    }
+
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"📊 DATA AGGREGATION")
+    logger.info(f"{'='*60}")
+    logger.info(f"   Original shape: {df.shape}")
+    logger.info(f"   Date column: {date_col}")
+    logger.info(f"   Target column: {target_col}")
+    logger.info(f"   Group by: {group_by_cols if group_by_cols else 'None (aggregate to total)'}")
+    logger.info(f"   Aggregation method: {agg_method}")
+
+    df = df.copy()
+
+    # Ensure date column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    # Clean numeric target column (handle comma-formatted numbers)
+    if df[target_col].dtype == 'object':
+        df[target_col] = df[target_col].astype(str).str.replace(',', '', regex=False)
+        df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
+        logger.info(f"   Cleaned target column: removed comma formatting")
+
+    # Record unique values for each dimension
+    if group_by_cols:
+        for col in group_by_cols:
+            if col in df.columns:
+                unique_vals = df[col].unique().tolist()
+                report['dimension_values'][col] = unique_vals
+                logger.info(f"   Dimension '{col}': {len(unique_vals)} unique values")
+
+    # Build aggregation dict
+    agg_dict = {target_col: agg_method}
+
+    # Add additional columns to aggregate
+    if additional_agg:
+        for col, method in additional_agg.items():
+            if col in df.columns and col != target_col:
+                agg_dict[col] = method
+
+    # Perform aggregation
+    if group_by_cols:
+        # Aggregate by date AND specified dimensions
+        grouping_cols = [date_col] + group_by_cols
+        df_agg = df.groupby(grouping_cols, as_index=False).agg(agg_dict)
+    else:
+        # Aggregate to total (just by date)
+        df_agg = df.groupby(date_col, as_index=False).agg(agg_dict)
+
+    # Sort by date
+    df_agg = df_agg.sort_values(date_col).reset_index(drop=True)
+
+    report['aggregated_rows'] = len(df_agg)
+    report['aggregated_columns'] = list(df_agg.columns)
+
+    logger.info(f"")
+    logger.info(f"   📈 AGGREGATION RESULTS:")
+    logger.info(f"      Original rows: {report['original_rows']:,}")
+    logger.info(f"      Aggregated rows: {report['aggregated_rows']:,}")
+    logger.info(f"      Compression ratio: {report['original_rows']/max(1, report['aggregated_rows']):.1f}x")
+    logger.info(f"      Date range: {df_agg[date_col].min()} to {df_agg[date_col].max()}")
+    logger.info(f"      Target range: {df_agg[target_col].min():,.0f} to {df_agg[target_col].max():,.0f}")
+    logger.info(f"{'='*60}")
+
+    return df_agg, report
+
+
+def detect_dimension_columns(
+    df: pd.DataFrame,
+    date_col: str,
+    target_col: str,
+    exclude_cols: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    Automatically detect dimension columns in a multi-dimensional dataset.
+
+    Dimension columns are categorical columns that:
+    - Are not the date or target column
+    - Have a limited number of unique values (< 100)
+    - Are likely to be used for grouping/filtering
+
+    This helps users understand their data structure and select appropriate
+    aggregation dimensions.
+
+    Args:
+        df: Input DataFrame
+        date_col: Name of the date column
+        target_col: Name of the target column
+        exclude_cols: Additional columns to exclude from detection
+
+    Returns:
+        Dict with detected dimensions and their characteristics
+    """
+    exclude = {date_col, target_col}
+    if exclude_cols:
+        exclude.update(exclude_cols)
+
+    dimensions = {}
+    numeric_cols = []
+
+    for col in df.columns:
+        if col in exclude:
+            continue
+
+        n_unique = df[col].nunique()
+
+        # Check if it's a likely dimension (categorical with reasonable cardinality)
+        if n_unique <= 100:
+            # Determine if categorical or numeric-looking categorical
+            if df[col].dtype in ['object', 'category', 'bool']:
+                dim_type = 'categorical'
+            elif df[col].dtype in ['int64', 'int32', 'float64', 'float32']:
+                # Numeric but few unique values - likely a flag or code
+                if n_unique <= 10:
+                    dim_type = 'flag/code'
+                else:
+                    dim_type = 'numeric_categorical'
+            else:
+                dim_type = 'other'
+
+            dimensions[col] = {
+                'n_unique': n_unique,
+                'type': dim_type,
+                'sample_values': df[col].unique()[:5].tolist(),
+                'null_count': df[col].isnull().sum()
+            }
+        elif df[col].dtype in ['int64', 'int32', 'float64', 'float32']:
+            # High cardinality numeric - likely a measure, not a dimension
+            numeric_cols.append(col)
+
+    # Log detection results
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"🔍 DIMENSION DETECTION")
+    logger.info(f"{'='*60}")
+    logger.info(f"   Found {len(dimensions)} potential dimension column(s):")
+    for col, info in dimensions.items():
+        logger.info(f"      • {col}: {info['n_unique']} unique values ({info['type']})")
+        logger.info(f"        Sample: {info['sample_values']}")
+    if numeric_cols:
+        logger.info(f"   Found {len(numeric_cols)} numeric measure column(s): {numeric_cols}")
+    logger.info(f"{'='*60}")
+
+    return {
+        'dimensions': dimensions,
+        'numeric_measures': numeric_cols,
+        'date_col': date_col,
+        'target_col': target_col
+    }
+
+
+def prepare_data_with_aggregation(
+    df: pd.DataFrame,
+    date_col: str,
+    target_col: str,
+    group_by_cols: Optional[List[str]] = None,
+    agg_method: str = 'sum',
+    filter_dimensions: Optional[Dict[str, Any]] = None,
+    auto_detect_incomplete: bool = True,
+    frequency: str = 'weekly'
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Complete data preparation pipeline with aggregation and quality checks.
+
+    This is the main entry point for preparing multi-dimensional data for
+    forecasting. It handles:
+    1. Dimension filtering (if specified)
+    2. Aggregation to specified granularity
+    3. Incomplete data detection
+    4. Data quality validation
+
+    Args:
+        df: Raw input DataFrame
+        date_col: Name of the date column
+        target_col: Name of the target column
+        group_by_cols: Columns to group by (None = aggregate to total)
+        agg_method: Aggregation method for target
+        filter_dimensions: Dict of dimension filters, e.g., {'region': 'West', 'segment': ['A', 'B']}
+        auto_detect_incomplete: Whether to detect and remove incomplete trailing data
+        frequency: Data frequency for validation
+
+    Returns:
+        Tuple of (prepared DataFrame, preparation report)
+    """
+    report = {
+        'filtering': {},
+        'aggregation': {},
+        'incomplete_detection': {},
+        'quality': {}
+    }
+
+    logger.info(f"\n{'='*70}")
+    logger.info(f"🚀 DATA PREPARATION PIPELINE")
+    logger.info(f"{'='*70}")
+
+    df = df.copy()
+
+    # Step 1: Apply dimension filters
+    if filter_dimensions:
+        original_rows = len(df)
+        for col, value in filter_dimensions.items():
+            if col in df.columns:
+                if isinstance(value, list):
+                    df = df[df[col].isin(value)]
+                else:
+                    df = df[df[col] == value]
+                logger.info(f"   Filtered {col} = {value}: {original_rows} → {len(df)} rows")
+        report['filtering'] = {
+            'filters_applied': filter_dimensions,
+            'rows_before': original_rows,
+            'rows_after': len(df)
+        }
+
+    # Step 2: Aggregate data
+    df_agg, agg_report = aggregate_time_series(
+        df, date_col, target_col, group_by_cols, agg_method
+    )
+    report['aggregation'] = agg_report
+
+    # Step 3: Detect and remove incomplete trailing data
+    if auto_detect_incomplete:
+        df_clean, incomplete_report = detect_incomplete_trailing_data(
+            df_agg, date_col, target_col, frequency
+        )
+        report['incomplete_detection'] = incomplete_report
+        df_agg = df_clean
+
+    # Step 4: Data quality validation
+    df_validated, quality_report = validate_data_quality(
+        df_agg, date_col, target_col, frequency
+    )
+    report['quality'] = {
+        'is_valid': quality_report.is_valid,
+        'issues': quality_report.issues,
+        'warnings': quality_report.warnings,
+        'stats': quality_report.stats
+    }
+
+    logger.info(f"\n{'='*70}")
+    logger.info(f"✅ DATA PREPARATION COMPLETE")
+    logger.info(f"   Final shape: {df_validated.shape}")
+    logger.info(f"   Ready for forecasting: {'Yes' if quality_report.is_valid else 'No - see issues'}")
+    logger.info(f"{'='*70}\n")
+
+    return df_validated, report
+
 
 # Major US holidays that significantly impact demand (especially for food delivery)
 MAJOR_HOLIDAYS = {
