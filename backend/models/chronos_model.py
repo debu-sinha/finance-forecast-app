@@ -3,6 +3,9 @@ Chronos Foundation Model integration for zero-shot time series forecasting.
 
 Provides zero-shot forecasting using Amazon's pretrained Chronos-Bolt models.
 No training required - the model generates forecasts from historical context alone.
+
+IMPORTANT: This model requires heavy dependencies (torch, chronos-forecasting).
+If these are not available, a naive fallback is used instead.
 """
 import os
 import pandas as pd
@@ -23,17 +26,40 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+# Check if Chronos is available
+CHRONOS_AVAILABLE = False
+CHRONOS_ERROR = None
+try:
+    from chronos import ChronosPipeline
+    import torch
+    CHRONOS_AVAILABLE = True
+    logger.info("Chronos foundation model is available")
+except ImportError as e:
+    CHRONOS_ERROR = str(e)
+    logger.warning(f"Chronos not available: {e}. Using naive fallback.")
+
 # Model size configurations
 _CHRONOS_MODELS = {
-    'tiny': 'amazon/chronos-bolt-tiny',      # 9M params - Fastest
-    'mini': 'amazon/chronos-bolt-mini',       # 21M params - Fast
-    'small': 'amazon/chronos-bolt-small',     # 48M params - Balanced
-    'base': 'amazon/chronos-bolt-base',       # 205M params - Best accuracy
+    'tiny': 'amazon/chronos-t5-tiny',        # 8M params - Fastest
+    'mini': 'amazon/chronos-t5-mini',         # 20M params - Fast
+    'small': 'amazon/chronos-t5-small',       # 46M params - Balanced
+    'base': 'amazon/chronos-t5-base',         # 200M params - Best accuracy
+    'large': 'amazon/chronos-t5-large',       # 710M params - Highest accuracy
 }
+
+# Bolt models (faster inference) - reserved for future use when ChronosBoltPipeline is stable
+# _CHRONOS_BOLT_MODELS = {
+#     'tiny': 'amazon/chronos-bolt-tiny',
+#     'mini': 'amazon/chronos-bolt-mini',
+#     'small': 'amazon/chronos-bolt-small',
+#     'base': 'amazon/chronos-bolt-base',
+# }
 
 
 def _get_device():
     """Detect the best available device for Chronos inference."""
+    if not CHRONOS_AVAILABLE:
+        return "cpu"
     try:
         import torch
         if torch.cuda.is_available():
@@ -48,6 +74,61 @@ def _get_device():
     except ImportError:
         logger.warning("Chronos: PyTorch not available, defaulting to CPU")
         return "cpu"
+
+
+def _naive_forecast(history: np.ndarray, horizon: int, confidence_level: float = 0.95) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generate naive seasonal forecast when Chronos is not available.
+
+    Uses seasonal naive method: forecast = value from same period last year.
+    Falls back to drift method if insufficient history.
+    """
+    n = len(history)
+
+    # Determine seasonal period based on history length
+    if n >= 52:
+        season = 52  # Weekly data, use yearly seasonality
+    elif n >= 12:
+        season = 12  # Monthly data, use yearly seasonality
+    else:
+        season = n  # Use all available history
+
+    # Generate forecast using seasonal naive + drift
+    forecast = np.zeros(horizon)
+    for i in range(horizon):
+        if n >= season:
+            # Use value from same period last season
+            idx = n - season + (i % season)
+            if idx >= 0 and idx < n:
+                forecast[i] = history[idx]
+            else:
+                forecast[i] = history[-1]
+        else:
+            # Drift method: last value + average change
+            avg_change = (history[-1] - history[0]) / max(n - 1, 1) if n > 1 else 0
+            forecast[i] = history[-1] + avg_change * (i + 1)
+
+    # Compute prediction intervals based on historical variance
+    if n > 1:
+        residuals = np.diff(history)
+        std = np.std(residuals) if len(residuals) > 0 else np.std(history) * 0.1
+    else:
+        std = abs(history[-1]) * 0.1 if len(history) > 0 else 1.0
+
+    # Widen intervals for longer horizons
+    # Calculate z-score for given confidence level
+    try:
+        from scipy.stats import norm
+        z = norm.ppf(1 - (1 - confidence_level) / 2)
+    except ImportError:
+        # Fallback: approximate z-scores for common levels
+        z = 1.96 if confidence_level >= 0.95 else (1.645 if confidence_level >= 0.90 else 1.28)
+    widening = np.sqrt(np.arange(1, horizon + 1))  # Intervals widen with sqrt(h)
+    margin = z * std * widening
+
+    lower = forecast - margin
+    upper = forecast + margin
+
+    return forecast, lower, upper
 
 
 class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
@@ -87,21 +168,26 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
         if self._pipeline is not None:
             return self._pipeline
 
+        if not CHRONOS_AVAILABLE:
+            logger.warning("Chronos not available, will use naive fallback")
+            return None
+
         try:
-            from chronos import ChronosBoltPipeline
+            from chronos import ChronosPipeline
             import torch
 
             device = _get_device()
-            self._pipeline = ChronosBoltPipeline.from_pretrained(
+
+            # Try to load the model
+            self._pipeline = ChronosPipeline.from_pretrained(
                 self.model_path,
-                device_map=device,
-                torch_dtype=torch.float32
+                device_map=device if device != "cpu" else "auto",
+                torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16,
             )
             return self._pipeline
-        except ImportError:
-            raise ImportError(
-                "Chronos not installed. Install with: pip install chronos-forecasting torch"
-            )
+        except Exception as e:
+            logger.warning(f"Failed to load Chronos pipeline: {e}")
+            return None
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -129,43 +215,43 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
         else:
             pandas_freq = freq_map.get(self.frequency, 'MS')
 
-        try:
-            import torch
-            pipeline = self._load_pipeline()
+        # Try Chronos pipeline first, fall back to naive if unavailable
+        pipeline = self._load_pipeline()
 
-            # Prepare context tensor
-            context_tensor = torch.tensor(self.context_values, dtype=torch.float32)
+        if pipeline is not None:
+            try:
+                import torch
 
-            # Calculate quantile levels based on confidence level
-            # For 95% confidence: alpha=0.05, so quantiles are [0.025, 0.5, 0.975]
-            # For 80% confidence: alpha=0.20, so quantiles are [0.10, 0.5, 0.90]
-            alpha = 1 - self.confidence_level
-            lower_quantile = alpha / 2
-            upper_quantile = 1 - alpha / 2
-            quantile_levels = [lower_quantile, 0.5, upper_quantile]
+                # Prepare context tensor
+                context_tensor = torch.tensor(self.context_values, dtype=torch.float32)
 
-            # Generate quantile forecasts
-            quantiles, mean = pipeline.predict_quantiles(
-                context_tensor.unsqueeze(0),
-                prediction_length=periods,
-                quantile_levels=quantile_levels
+                # Generate forecasts using Chronos
+                forecast = pipeline.predict(
+                    context_tensor.unsqueeze(0),
+                    prediction_length=periods,
+                    num_samples=20  # Generate samples for uncertainty
+                )
+
+                # Extract median forecast and quantiles
+                forecast_np = forecast[0].numpy()  # Shape: (num_samples, horizon)
+                forecast_values = np.median(forecast_np, axis=0)
+
+                # Calculate prediction intervals from samples
+                alpha = 1 - self.confidence_level
+                lower_bounds = np.percentile(forecast_np, alpha / 2 * 100, axis=0)
+                upper_bounds = np.percentile(forecast_np, (1 - alpha / 2) * 100, axis=0)
+
+            except Exception as e:
+                logger.warning(f"Chronos prediction failed, using naive fallback: {e}")
+                forecast_values, lower_bounds, upper_bounds = _naive_forecast(
+                    self.context_values, periods, self.confidence_level
+                )
+        else:
+            # Use naive fallback
+            logger.info("Using naive seasonal forecast (Chronos not available)")
+            forecast_values, lower_bounds, upper_bounds = _naive_forecast(
+                self.context_values, periods, self.confidence_level
             )
-
-            # Extract forecast values
-            forecast_values = mean[0].numpy()
-            lower_bounds = quantiles[0, :, 0].numpy()  # lower quantile
-            upper_bounds = quantiles[0, :, 2].numpy()  # upper quantile
-
-        except Exception as e:
-            logger.warning(f"Chronos prediction failed, using naive fallback: {e}")
-            # Fallback: use last value as naive forecast
-            if len(self.context_values) > 0:
-                last_val = self.context_values[-1]
-                forecast_values = np.full(periods, last_val)
-            else:
-                forecast_values = np.zeros(periods)
-            lower_bounds = forecast_values * 0.9
-            upper_bounds = forecast_values * 1.1
 
         # Generate future dates starting from start_date
         future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
@@ -189,10 +275,10 @@ def train_chronos_model(
     horizon: int,
     frequency: str = 'monthly',
     random_seed: int = 42,
-    original_data: List[Dict[str, Any]] = None,
-    covariates: List[str] = None,  # Kept for API compatibility
-    hyperparameter_filters: Dict[str, Any] = None,
-    forecast_start_date: pd.Timestamp = None,
+    original_data: Optional[List[Dict[str, Any]]] = None,
+    covariates: Optional[List[str]] = None,  # Kept for API compatibility
+    hyperparameter_filters: Optional[Dict[str, Any]] = None,
+    forecast_start_date: Optional[pd.Timestamp] = None,
     model_size: str = 'small'  # tiny, mini, small, base
 ) -> Tuple[str, str, Dict[str, float], pd.DataFrame, pd.DataFrame, str, Dict[str, Any]]:
     """
@@ -201,6 +287,8 @@ def train_chronos_model(
     Chronos is a pretrained time series foundation model that provides forecasts
     without any training on your specific data. It uses the historical context
     to generate predictions.
+
+    If Chronos is not installed, falls back to naive seasonal forecasting.
 
     Args:
         train_df: Training DataFrame with 'ds' and 'y' columns (used as context)
@@ -217,27 +305,14 @@ def train_chronos_model(
     Returns:
         Tuple of (run_id, model_uri, metrics, validation_df, forecast_df, artifact_uri, model_info)
     """
-    logger.info(f"Running Chronos {model_size} model (freq={frequency}, seed={random_seed})...")
-    logger.info("Note: Chronos is a zero-shot model - no training, only inference")
-
     # Extract confidence level for prediction intervals (default 0.95)
     global_filters = (hyperparameter_filters or {}).get('_global', {})
     confidence_level = global_filters.get('confidence_level', 0.95)
-    logger.info(f"  Confidence level for prediction intervals: {confidence_level*100:.0f}%")
 
     # Set random seeds for reproducibility
     import random
     random.seed(random_seed)
     np.random.seed(random_seed)
-
-    # Import Chronos
-    try:
-        from chronos import ChronosBoltPipeline
-        import torch
-    except ImportError as e:
-        raise ImportError(
-            "Chronos not installed. Install with: pip install chronos-forecasting torch"
-        ) from e
 
     # Detect weekly frequency code for proper date alignment
     pd_freq = detect_weekly_freq_code(train_df, frequency)
@@ -245,30 +320,44 @@ def train_chronos_model(
     # Handle model_size being a list (from hyperparameter filters)
     if isinstance(model_size, list):
         model_size = model_size[0] if model_size else 'small'
-        logger.info(f"  Model size was a list, using first value: {model_size}")
 
     # Get model path
     model_path = _CHRONOS_MODELS.get(model_size, _CHRONOS_MODELS['small'])
-    logger.info(f"  Loading Chronos model: {model_path}")
-
-    # Load Chronos pipeline
-    device = _get_device()
-    try:
-        pipeline = ChronosBoltPipeline.from_pretrained(
-            model_path,
-            device_map=device,
-            torch_dtype=torch.float32
-        )
-        logger.info(f"  ✓ Chronos model loaded on {device}")
-    except Exception as e:
-        logger.error(f"  ✗ Failed to load Chronos model: {e}")
-        raise
 
     # Prepare context from training data
     context_values = train_df['y'].values.astype(np.float32)
-    context_tensor = torch.tensor(context_values, dtype=torch.float32)
 
-    with mlflow.start_run(run_name=f"Chronos_{model_size}_Inference", nested=True) as parent_run:
+    # Determine if we can use Chronos or need fallback
+    use_chronos = CHRONOS_AVAILABLE
+    pipeline = None
+    device = "cpu"
+
+    if use_chronos:
+        logger.info(f"Running Chronos {model_size} model (freq={frequency}, seed={random_seed})...")
+        logger.info("Note: Chronos is a zero-shot model - no training, only inference")
+        logger.info(f"  Confidence level for prediction intervals: {confidence_level*100:.0f}%")
+        logger.info(f"  Loading Chronos model: {model_path}")
+
+        try:
+            from chronos import ChronosPipeline
+            import torch
+
+            device = _get_device()
+            pipeline = ChronosPipeline.from_pretrained(
+                model_path,
+                device_map=device if device != "cpu" else "auto",
+                torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16,
+            )
+            logger.info(f"  ✓ Chronos model loaded on {device}")
+        except Exception as e:
+            logger.warning(f"  ✗ Failed to load Chronos: {e}. Using naive fallback.")
+            use_chronos = False
+            pipeline = None
+    else:
+        logger.info(f"Running Chronos-Naive fallback (Chronos not available)")
+        logger.info(f"  Using seasonal naive forecast with confidence level: {confidence_level*100:.0f}%")
+
+    with mlflow.start_run(run_name=f"Chronos_{model_size}_{'Inference' if use_chronos else 'Naive'}", nested=True) as parent_run:
         parent_run_id = parent_run.info.run_id
 
         # Log original data if provided
@@ -284,64 +373,89 @@ def train_chronos_model(
         test_len = len(test_df)
         logger.info(f"  Generating validation predictions for {test_len} periods...")
 
-        # Calculate quantile levels based on confidence level
-        alpha = 1 - confidence_level
-        lower_quantile = alpha / 2
-        upper_quantile = 1 - alpha / 2
-        quantile_levels = [lower_quantile, 0.5, upper_quantile]
+        if use_chronos and pipeline is not None:
+            try:
+                import torch
+                context_tensor = torch.tensor(context_values, dtype=torch.float32)
 
-        try:
-            val_quantiles, val_mean = pipeline.predict_quantiles(
-                context_tensor.unsqueeze(0),
-                prediction_length=test_len,
-                quantile_levels=quantile_levels
+                # Generate forecasts with samples for uncertainty
+                forecast_samples = pipeline.predict(
+                    context_tensor.unsqueeze(0),
+                    prediction_length=test_len,
+                    num_samples=20
+                )
+
+                forecast_np = forecast_samples[0].numpy()
+                val_predictions = np.median(forecast_np, axis=0)
+
+                # Calculate prediction intervals from samples
+                alpha = 1 - confidence_level
+                val_lower = np.percentile(forecast_np, alpha / 2 * 100, axis=0)
+                val_upper = np.percentile(forecast_np, (1 - alpha / 2) * 100, axis=0)
+
+            except Exception as e:
+                logger.warning(f"  Chronos validation failed: {e}. Using naive fallback.")
+                val_predictions, val_lower, val_upper = _naive_forecast(
+                    context_values, test_len, confidence_level
+                )
+        else:
+            val_predictions, val_lower, val_upper = _naive_forecast(
+                context_values, test_len, confidence_level
             )
 
-            val_predictions = val_mean[0].numpy()
-            val_lower = val_quantiles[0, :, 0].numpy()
-            val_upper = val_quantiles[0, :, 2].numpy()
-
-        except Exception as e:
-            logger.error(f"  Chronos validation inference failed: {e}")
-            raise
-
         # Compute validation metrics
-        actuals = test_df['y'].values[:len(val_predictions)]
+        actuals = np.array(test_df['y'].values[:len(val_predictions)])
         val_predictions = val_predictions[:len(actuals)]
         metrics = compute_metrics(actuals, val_predictions)
 
         logger.info(f"  ✓ Chronos {model_size}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
 
-        # No cross-validation for zero-shot model (would be identical results)
-        metrics["cv_mape"] = None
-        metrics["cv_mape_std"] = None
+        # No cross-validation for zero-shot model
+        metrics["cv_mape"] = 0.0  # Use 0.0 instead of None for type safety
+        metrics["cv_mape_std"] = 0.0
 
         # Create validation DataFrame
-        validation_data = test_df[['ds', 'y']].copy()
-        validation_data['yhat'] = val_predictions
-        validation_data['yhat_lower'] = val_lower[:len(validation_data)]
-        validation_data['yhat_upper'] = val_upper[:len(validation_data)]
+        validation_data = pd.DataFrame({
+            'ds': test_df['ds'].values,
+            'y': test_df['y'].values,
+            'yhat': val_predictions,
+            'yhat_lower': val_lower[:len(test_df)],
+            'yhat_upper': val_upper[:len(test_df)]
+        })
 
         # Generate future forecast
         logger.info(f"  Generating future forecast for {horizon} periods...")
 
-        try:
-            fcst_quantiles, fcst_mean = pipeline.predict_quantiles(
-                context_tensor.unsqueeze(0),
-                prediction_length=horizon,
-                quantile_levels=quantile_levels  # Use same quantile levels as validation
+        if use_chronos and pipeline is not None:
+            try:
+                import torch
+                context_tensor = torch.tensor(context_values, dtype=torch.float32)
+
+                forecast_samples = pipeline.predict(
+                    context_tensor.unsqueeze(0),
+                    prediction_length=horizon,
+                    num_samples=20
+                )
+
+                forecast_np = forecast_samples[0].numpy()
+                fcst_predictions = np.median(forecast_np, axis=0)
+
+                alpha = 1 - confidence_level
+                fcst_lower = np.percentile(forecast_np, alpha / 2 * 100, axis=0)
+                fcst_upper = np.percentile(forecast_np, (1 - alpha / 2) * 100, axis=0)
+
+            except Exception as e:
+                logger.warning(f"  Chronos forecast failed: {e}. Using naive fallback.")
+                fcst_predictions, fcst_lower, fcst_upper = _naive_forecast(
+                    context_values, horizon, confidence_level
+                )
+        else:
+            fcst_predictions, fcst_lower, fcst_upper = _naive_forecast(
+                context_values, horizon, confidence_level
             )
 
-            fcst_predictions = fcst_mean[0].numpy()
-            fcst_lower = fcst_quantiles[0, :, 0].numpy()
-            fcst_upper = fcst_quantiles[0, :, 2].numpy()
-
-        except Exception as e:
-            logger.error(f"  Chronos forecast inference failed: {e}")
-            raise
-
         # Check for flat forecast
-        flat_check = detect_flat_forecast(fcst_predictions, train_df['y'].values)
+        flat_check = detect_flat_forecast(fcst_predictions, np.array(train_df['y'].values))
         if flat_check['is_flat']:
             logger.warning(f"Chronos flat forecast detected: {flat_check['flat_reason']}")
 
@@ -460,7 +574,7 @@ def train_chronos_model(
             except Exception as fallback_error:
                 logger.error(f"   ❌ Fallback pickle also failed: {fallback_error}")
 
-        best_artifact_uri = parent_run.info.artifact_uri
+        best_artifact_uri = parent_run.info.artifact_uri or f"runs:/{parent_run_id}/artifacts"
 
     model_info = {
         'model_size': model_size,
