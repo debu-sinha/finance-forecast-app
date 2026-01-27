@@ -4,11 +4,17 @@ Preprocessing module for time series forecasting.
 This module adds generic features that improve forecasting accuracy across
 all covariate-supporting algorithms (Prophet, SARIMAX, XGBoost).
 
+Implements best practices from:
+- Greykite: Data quality checks, outlier detection, anomaly handling
+- Nixtla MLForecast: Automatic lag feature engineering
+- AutoGluon: Data validation and automatic transformations
+
 Design philosophy:
 - Add features that are universally useful regardless of promo structure
 - Conditionally add features based on data availability (e.g., YoY lags need 1+ year)
 - Don't modify user's promo columns - they're already well-structured
 - Keep it simple and avoid over-engineering
+- Validate data quality before training
 
 Applied to: Prophet, SARIMAX, XGBoost (models that support covariates)
 NOT applied to: ARIMA, ETS (univariate models that can't use features)
@@ -21,7 +27,8 @@ Holiday Week Detection:
 
 import pandas as pd
 import numpy as np
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple, Any
+from dataclasses import dataclass, field
 import logging
 
 try:
@@ -31,6 +38,247 @@ except ImportError:
     HOLIDAYS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# DATA QUALITY CHECKS (Greykite, AutoTS patterns)
+# =============================================================================
+
+@dataclass
+class DataQualityReport:
+    """Report from data quality validation."""
+    is_valid: bool = True
+    issues: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+    stats: Dict[str, Any] = field(default_factory=dict)
+    transformations_applied: List[str] = field(default_factory=list)
+
+
+# Minimum data requirements by frequency
+MIN_DATA_REQUIREMENTS = {
+    'daily': {'min_rows': 90, 'recommended_rows': 365, 'seasonal_period': 7},
+    'weekly': {'min_rows': 26, 'recommended_rows': 104, 'seasonal_period': 52},
+    'monthly': {'min_rows': 12, 'recommended_rows': 36, 'seasonal_period': 12},
+}
+
+
+def validate_data_quality(
+    df: pd.DataFrame,
+    date_col: str = 'ds',
+    target_col: str = 'y',
+    frequency: str = 'weekly',
+    auto_fix: bool = True
+) -> Tuple[pd.DataFrame, DataQualityReport]:
+    """
+    Comprehensive data quality validation (Greykite/AutoTS patterns).
+
+    Checks performed:
+    1. Minimum data requirement by frequency
+    2. Missing values detection and handling
+    3. Duplicate dates detection
+    4. Irregular time intervals (gaps)
+    5. Outlier detection using IQR method
+    6. Negative value detection
+    7. Variance check (too low = near constant)
+    8. Seasonal cycle sufficiency
+
+    Args:
+        df: Input DataFrame
+        date_col: Date column name
+        target_col: Target column name
+        frequency: Data frequency ('daily', 'weekly', 'monthly')
+        auto_fix: Whether to automatically fix issues where possible
+
+    Returns:
+        Tuple of (cleaned DataFrame, DataQualityReport)
+    """
+    report = DataQualityReport()
+    df = df.copy()
+
+    logger.info(f"")
+    logger.info(f"{'='*60}")
+    logger.info(f"📋 DATA QUALITY VALIDATION (Greykite/AutoTS patterns)")
+    logger.info(f"{'='*60}")
+
+    # Ensure date column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        df[date_col] = pd.to_datetime(df[date_col])
+        report.transformations_applied.append("Converted date column to datetime")
+
+    # Sort by date
+    df = df.sort_values(date_col).reset_index(drop=True)
+
+    # Get requirements for frequency
+    freq_req = MIN_DATA_REQUIREMENTS.get(frequency, MIN_DATA_REQUIREMENTS['weekly'])
+    n_rows = len(df)
+    report.stats['n_rows'] = n_rows
+    report.stats['frequency'] = frequency
+
+    # 1. Check minimum data requirement
+    logger.info(f"   1. Data size: {n_rows} rows")
+    if n_rows < freq_req['min_rows']:
+        msg = f"Insufficient data: {n_rows} rows, need at least {freq_req['min_rows']} for {frequency}"
+        report.issues.append(msg)
+        report.is_valid = False
+        logger.warning(f"      ❌ {msg}")
+    elif n_rows < freq_req['recommended_rows']:
+        msg = f"Limited data ({n_rows} rows). Recommend {freq_req['recommended_rows']}+ for {frequency}"
+        report.warnings.append(msg)
+        report.recommendations.append("Consider using simpler models (ARIMA, ETS)")
+        logger.warning(f"      ⚠️ {msg}")
+    else:
+        logger.info(f"      ✅ Sufficient data ({n_rows} >= {freq_req['recommended_rows']} recommended)")
+
+    # 2. Check for missing values
+    null_count = df[target_col].isnull().sum()
+    null_pct = null_count / n_rows * 100 if n_rows > 0 else 0
+    report.stats['null_count'] = null_count
+    report.stats['null_pct'] = null_pct
+
+    logger.info(f"   2. Missing values: {null_count} ({null_pct:.1f}%)")
+    if null_count > 0:
+        if null_pct > 20:
+            msg = f"High missing rate: {null_pct:.1f}% of target values are null"
+            report.issues.append(msg)
+            report.is_valid = False
+            logger.warning(f"      ❌ {msg}")
+        elif null_pct > 5:
+            msg = f"Moderate missing rate: {null_pct:.1f}%"
+            report.warnings.append(msg)
+            logger.warning(f"      ⚠️ {msg}")
+
+        if auto_fix and null_pct <= 20:
+            df[target_col] = df[target_col].fillna(method='ffill').fillna(method='bfill')
+            report.transformations_applied.append(f"Filled {null_count} missing values with forward/backward fill")
+            logger.info(f"      🔧 Auto-fixed: filled {null_count} missing values")
+    else:
+        logger.info(f"      ✅ No missing values")
+
+    # 3. Check for duplicates
+    duplicate_dates = df[date_col].duplicated().sum()
+    report.stats['duplicate_dates'] = duplicate_dates
+
+    logger.info(f"   3. Duplicate dates: {duplicate_dates}")
+    if duplicate_dates > 0:
+        msg = f"Found {duplicate_dates} duplicate dates"
+        report.issues.append(msg)
+        logger.warning(f"      ⚠️ {msg}")
+        if auto_fix:
+            df = df.drop_duplicates(subset=[date_col], keep='last')
+            report.transformations_applied.append(f"Removed {duplicate_dates} duplicate dates")
+            logger.info(f"      🔧 Auto-fixed: removed duplicates")
+    else:
+        logger.info(f"      ✅ No duplicate dates")
+
+    # 4. Check for gaps in time series
+    date_diff = df[date_col].diff().dropna()
+    expected_freq = {'daily': 1, 'weekly': 7, 'monthly': 30}
+    expected_days = expected_freq.get(frequency, 7)
+
+    if frequency == 'daily':
+        gaps = (date_diff > pd.Timedelta(days=expected_days * 2)).sum()
+    else:
+        gaps = (date_diff > pd.Timedelta(days=expected_days * 1.5)).sum()
+
+    report.stats['gaps_detected'] = gaps
+    logger.info(f"   4. Time gaps detected: {gaps}")
+    if gaps > 0:
+        msg = f"Found {gaps} gaps in time series"
+        report.warnings.append(msg)
+        report.recommendations.append("Consider interpolating missing periods")
+        logger.warning(f"      ⚠️ {msg}")
+    else:
+        logger.info(f"      ✅ No significant gaps")
+
+    # 5. Check for outliers using IQR
+    Q1 = df[target_col].quantile(0.25)
+    Q3 = df[target_col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 3 * IQR
+    upper_bound = Q3 + 3 * IQR
+
+    outlier_mask = (df[target_col] < lower_bound) | (df[target_col] > upper_bound)
+    n_outliers = outlier_mask.sum()
+    outlier_pct = n_outliers / n_rows * 100 if n_rows > 0 else 0
+    report.stats['n_outliers'] = n_outliers
+    report.stats['outlier_pct'] = outlier_pct
+
+    logger.info(f"   5. Outliers (3x IQR): {n_outliers} ({outlier_pct:.1f}%)")
+    if n_outliers > 0:
+        if outlier_pct > 10:
+            msg = f"High outlier rate: {outlier_pct:.1f}%"
+            report.warnings.append(msg)
+            report.recommendations.append("Consider outlier treatment or robust models")
+            logger.warning(f"      ⚠️ {msg}")
+        else:
+            logger.info(f"      ✅ Outlier rate acceptable")
+
+        if auto_fix and outlier_pct <= 10:
+            df.loc[df[target_col] < lower_bound, target_col] = lower_bound
+            df.loc[df[target_col] > upper_bound, target_col] = upper_bound
+            report.transformations_applied.append(f"Winsorized {n_outliers} outliers")
+            logger.info(f"      🔧 Auto-fixed: winsorized {n_outliers} outliers")
+    else:
+        logger.info(f"      ✅ No outliers detected")
+
+    # 6. Check for negative values
+    n_negative = (df[target_col] < 0).sum()
+    report.stats['n_negative'] = n_negative
+
+    logger.info(f"   6. Negative values: {n_negative}")
+    if n_negative > 0:
+        report.warnings.append(f"Found {n_negative} negative values")
+        logger.warning(f"      ⚠️ Found {n_negative} negative values - verify if valid")
+    else:
+        logger.info(f"      ✅ No negative values")
+
+    # 7. Check variance
+    mean_val = df[target_col].mean()
+    std_val = df[target_col].std()
+    cv = std_val / mean_val if mean_val != 0 else 0
+    report.stats['mean'] = mean_val
+    report.stats['std'] = std_val
+    report.stats['cv'] = cv
+
+    logger.info(f"   7. Coefficient of variation: {cv:.3f}")
+    if cv < 0.01:
+        msg = f"Very low variance (CV={cv:.4f}) - near-constant data"
+        report.warnings.append(msg)
+        report.recommendations.append("Consider if forecasting is needed for constant data")
+        logger.warning(f"      ⚠️ {msg}")
+    elif cv > 2.0:
+        msg = f"Very high variance (CV={cv:.2f})"
+        report.warnings.append(msg)
+        report.recommendations.append("Consider log transformation")
+        logger.warning(f"      ⚠️ {msg}")
+    else:
+        logger.info(f"      ✅ Variance is reasonable")
+
+    # 8. Check seasonal cycles
+    seasonal_period = freq_req['seasonal_period']
+    n_cycles = n_rows / seasonal_period
+    report.stats['seasonal_cycles'] = n_cycles
+
+    logger.info(f"   8. Seasonal cycles: {n_cycles:.1f}")
+    if n_cycles < 2:
+        msg = f"Less than 2 seasonal cycles ({n_cycles:.1f})"
+        report.warnings.append(msg)
+        report.recommendations.append("Disable yearly_seasonality, use non-seasonal models")
+        logger.warning(f"      ⚠️ {msg}")
+    else:
+        logger.info(f"      ✅ Sufficient seasonal cycles")
+
+    # Summary
+    logger.info(f"")
+    logger.info(f"   📊 SUMMARY:")
+    logger.info(f"      Valid: {'✅ YES' if report.is_valid else '❌ NO'}")
+    logger.info(f"      Issues: {len(report.issues)}")
+    logger.info(f"      Warnings: {len(report.warnings)}")
+    logger.info(f"      Auto-fixes applied: {len(report.transformations_applied)}")
+    logger.info(f"{'='*60}")
+
+    return df, report
 
 # Major US holidays that significantly impact demand (especially for food delivery)
 MAJOR_HOLIDAYS = {

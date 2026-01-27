@@ -1,5 +1,5 @@
 name: finance-forecast-app
-description: Finance Forecasting Platform with MLflow and Model Serving
+description: Finance Forecasting Platform with MLflow, Model Serving, and Multi-User Support
 
 # Command to run the application (Python backend serves React frontend)
 command:
@@ -11,9 +11,9 @@ command:
 
 # Environment variables
 # NOTE: Databricks Apps has a hard limit of 4 vCPU / 12GB RAM
-# Tune these values based on your workload - see DEVELOPER_GUIDE.md for details
+# Heavy training is delegated to dedicated cluster via Databricks Jobs
 env:
-
+  # MLflow Configuration
   - name: MLFLOW_TRACKING_URI
     value: "databricks"
   - name: MLFLOW_EXPERIMENT_NAME
@@ -21,28 +21,25 @@ env:
   - name: PYTHONUNBUFFERED
     value: "1"
 
-  # Performance tuning for 4 vCPU / 12GB RAM constraint
-  # Increase these values for local development with more resources
+  # MLflow Optimization (prevent tracker overload with 30 concurrent users)
   - name: MLFLOW_MAX_WORKERS
-    value: "2"  # Parallel threads for hyperparameter search (local: 4-8)
+    value: "1"  # Single writer per job
+  - name: MLFLOW_SKIP_CHILD_RUNS
+    value: "true"  # Skip HP tuning child runs
+
+  # Hyperparameter Grid Limits (reduces MLflow writes)
   - name: PROPHET_MAX_COMBINATIONS
-    value: "3"  # Prophet grid search combinations (local: 9-12)
+    value: "3"
   - name: ARIMA_MAX_COMBINATIONS
-    value: "6"  # ARIMA grid search combinations (local: 12-18)
+    value: "4"
   - name: ETS_MAX_COMBINATIONS
-    value: "4"  # ETS grid search combinations (local: 8-12)
+    value: "4"
   - name: SARIMAX_MAX_COMBINATIONS
-    value: "8"  # SARIMAX grid search combinations (local: 16-24)
+    value: "6"
   - name: XGBOOST_MAX_COMBINATIONS
-    value: "4"  # XGBoost grid search combinations (local: 8-16)
+    value: "3"
 
-  # Cluster delegation for heavy compute
-  - name: DEDICATED_CLUSTER_ID
-    value: "0120-201807-wrsojhmy"
-  - name: ENABLE_CLUSTER_DELEGATION
-    value: "true"  # Delegates heavy training to DEDICATED_CLUSTER_ID
-
-  # Unity Catalog configuration
+  # Unity Catalog Configuration
   - name: UC_CATALOG_NAME
     value: "main"
   - name: UC_SCHEMA_NAME
@@ -52,8 +49,37 @@ env:
   - name: UC_MODEL_NAME
     value: "main.default.finance_forecast_model"
 
+  # ==========================================================================
+  # MULTI-USER ARCHITECTURE CONFIGURATION
+  # ==========================================================================
 
-  
+  # Lakebase PostgreSQL Configuration
+  # These will be set by the deployment script or overridden per environment
+  - name: LAKEBASE_HOST
+    value: ""  # Set during deployment
+  - name: LAKEBASE_DATABASE
+    value: "forecast"
+  - name: LAKEBASE_USER
+    value: "forecast_app"
+  - name: LAKEBASE_SSL_MODE
+    value: "require"
+
+  # Job Delegation Configuration
+  - name: ENABLE_CLUSTER_DELEGATION
+    value: "true"
+  - name: DEDICATED_CLUSTER_ID
+    value: ""  # Set during deployment - 64 vCPU cluster for heavy training
+  - name: TRAINING_NOTEBOOK_PATH
+    value: "/Workspace/finance-forecasting/notebooks/train_models"
+
+  # Job Configuration
+  - name: JOB_TIMEOUT_SECONDS
+    value: "7200"  # 2 hours max per job
+  - name: JOB_MAX_CONCURRENT_RUNS
+    value: "10"  # Support 10 concurrent training jobs
+  - name: JOB_MAX_RETRIES
+    value: "1"
+
 # Permissions required
 permissions:
   - workspace_access

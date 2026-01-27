@@ -44,6 +44,9 @@ class ForecastConfig:
     # Reproducibility settings
     random_seed: int = 42
 
+    # Prediction interval settings
+    confidence_level: float = 0.95  # Confidence level for prediction intervals (0.50-0.99)
+
     # Metadata
     config_version: str = "1.0"
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -100,6 +103,7 @@ class ForecastConfig:
                 for k, v in self.model_configs.items()
             },
             'random_seed': int(self.random_seed),
+            'confidence_level': float(self.confidence_level),
             'config_version': self.config_version,
             'generated_at': self.generated_at,
             'generation_mode': self.generation_mode,
@@ -324,7 +328,7 @@ def generate_reproducibility_token(
     return f"{data_hash}:{config_hash}:{model_version}"
 
 
-def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str, Any]]:
+def generate_hyperparameter_filters(profile: DataProfile, confidence_level: float = 0.95) -> Dict[str, Dict[str, Any]]:
     """
     Generate intelligent hyperparameter filters based on data profile.
 
@@ -333,6 +337,7 @@ def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str,
 
     Args:
         profile: DataProfile from DataProfiler with detected data characteristics
+        confidence_level: Confidence level for prediction intervals (default 0.95)
 
     Returns:
         Dictionary of model name -> hyperparameter constraints
@@ -493,14 +498,23 @@ def generate_hyperparameter_filters(profile: DataProfile) -> Dict[str, Dict[str,
 
     filters['XGBoost'] = xgb_hp
 
+    # ============================================================
+    # GLOBAL SETTINGS (applies to all models)
+    # ============================================================
+    filters['_global'] = {
+        'confidence_level': confidence_level
+    }
+
     logger.info("=" * 70)
     logger.info("🎛️ HYPERPARAMETER FILTERS - FINAL OUTPUT")
     logger.info("=" * 70)
     logger.info(f"[OUTPUT] Generated filters for models: {list(filters.keys())}")
+    logger.info(f"[OUTPUT] Global settings: confidence_level={confidence_level}")
     for model, params in filters.items():
-        logger.info(f"[OUTPUT] {model}:")
-        for param_name, param_values in params.items():
-            logger.info(f"[OUTPUT]   {param_name}: {param_values}")
+        if model != '_global':
+            logger.info(f"[OUTPUT] {model}:")
+            for param_name, param_values in params.items():
+                logger.info(f"[OUTPUT]   {param_name}: {param_values}")
     logger.info("=" * 70)
 
     return filters

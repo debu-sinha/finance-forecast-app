@@ -1489,7 +1489,10 @@ const App = () => {
       'ARIMA': 'arima',
       'SARIMAX': 'sarimax',
       'ETS': 'exponential_smoothing',
-      'XGBoost': 'xgboost'
+      'XGBoost': 'xgboost',
+      'StatsForecast': 'statsforecast',
+      'Chronos': 'chronos',
+      'Ensemble': 'ensemble'
     };
 
     const recommendedModelTypes = dataAnalysis.recommendedModels
@@ -1552,7 +1555,10 @@ const App = () => {
         'arima': 'ARIMA',
         'exponential_smoothing': 'ETS',
         'sarimax': 'SARIMAX',
-        'xgboost': 'XGBoost'
+        'xgboost': 'XGBoost',
+        'statsforecast': 'StatsForecast',
+        'chronos': 'Chronos',
+        'ensemble': 'Ensemble'
       };
 
       // Initialize model progress tracking - all models shown as training since backend trains sequentially
@@ -2383,6 +2389,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                             { id: 'exponential_smoothing', name: 'Exponential Smoothing', backendName: 'ETS', badge: 'Univariate Only', badgeColor: 'orange' },
                             { id: 'sarimax', name: 'SARIMAX', backendName: 'SARIMAX', badge: '✓ Supports Covariates', badgeColor: 'green' },
                             { id: 'xgboost', name: 'XGBoost', backendName: 'XGBoost', badge: '✓ Best for Holidays', badgeColor: 'blue' },
+                            { id: 'statsforecast', name: 'StatsForecast', backendName: 'StatsForecast', badge: '⚡ 10-100x Faster', badgeColor: 'purple' },
+                            { id: 'chronos', name: 'Chronos', backendName: 'Chronos', badge: '🤖 Zero-Shot AI', badgeColor: 'purple' },
                           ];
 
                           return modelConfigs.map(model => {
@@ -2404,6 +2412,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                   <span className={`text-[10px] font-semibold px-1 py-0.5 rounded ${
                                     model.badgeColor === 'green' ? 'text-green-600 bg-green-50' :
                                     model.badgeColor === 'blue' ? 'text-blue-600 bg-blue-50' :
+                                    model.badgeColor === 'purple' ? 'text-purple-600 bg-purple-50' :
                                     'text-orange-600 bg-orange-50'
                                   }`}>{model.badge}</span>
                                   {rec && (

@@ -547,6 +547,14 @@ def _generate_model_recommendations(chars: DataCharacteristics) -> List[ModelRec
     xgb_rec = _recommend_xgboost(chars)
     recommendations.append(xgb_rec)
 
+    # StatsForecast recommendation (AutoARIMA, AutoETS, AutoTheta)
+    statsforecast_rec = _recommend_statsforecast(chars)
+    recommendations.append(statsforecast_rec)
+
+    # Chronos recommendation (Zero-shot foundation model)
+    chronos_rec = _recommend_chronos(chars)
+    recommendations.append(chronos_rec)
+
     return recommendations
 
 
@@ -765,6 +773,116 @@ def _recommend_xgboost(chars: DataCharacteristics) -> ModelRecommendation:
     )
 
 
+def _recommend_statsforecast(chars: DataCharacteristics) -> ModelRecommendation:
+    """Generate StatsForecast (AutoARIMA, AutoETS, AutoTheta) recommendation."""
+    confidence = 0.75  # Base confidence - StatsForecast is generally reliable
+    reasons = []
+    hp_filter = {}
+
+    # StatsForecast is 10-100x faster than traditional implementations
+    reasons.append("StatsForecast provides 10-100x faster statistical models")
+
+    # Works well with autocorrelated data (like ARIMA)
+    if chars.has_autocorrelation:
+        confidence += 0.1
+        reasons.append("AutoARIMA will capture autocorrelation patterns effectively")
+
+    # Handles seasonality well
+    if chars.seasonality_type in [SeasonalityType.STRONG, SeasonalityType.MODERATE]:
+        confidence += 0.1
+        reasons.append("AutoETS and AutoTheta handle seasonal patterns well")
+
+    # Needs reasonable data volume
+    if chars.n_observations < 24:
+        confidence -= 0.2
+        reasons.append("Limited observations - simpler models will be selected")
+        hp_filter['model_type'] = ['auto']  # Let it auto-select
+    elif chars.n_observations < 52:
+        confidence -= 0.1
+        reasons.append("Moderate data - seasonal models may be limited")
+        hp_filter['model_type'] = ['auto', 'autoarima']
+
+    # Set season length based on frequency
+    if chars.frequency == 'daily':
+        hp_filter['season_length'] = 7
+    elif chars.frequency == 'weekly':
+        hp_filter['season_length'] = 52
+    elif chars.frequency == 'monthly':
+        hp_filter['season_length'] = 12
+    elif chars.frequency == 'quarterly':
+        hp_filter['season_length'] = 4
+
+    # StatsForecast handles trends automatically
+    if chars.trend_type != TrendType.FLAT:
+        reasons.append("Automatic differencing for non-stationary trends")
+
+    recommended = confidence >= 0.5
+
+    return ModelRecommendation(
+        model_name="StatsForecast",
+        recommended=recommended,
+        confidence=min(1.0, max(0.0, confidence)),
+        reason="; ".join(reasons) if reasons else "Fast statistical forecasting with AutoARIMA, AutoETS, AutoTheta",
+        hyperparameter_filter=hp_filter
+    )
+
+
+def _recommend_chronos(chars: DataCharacteristics) -> ModelRecommendation:
+    """Generate Chronos (Amazon's zero-shot foundation model) recommendation."""
+    confidence = 0.70  # Base confidence - Chronos is a solid baseline
+    reasons = []
+    hp_filter = {}
+
+    # Chronos is zero-shot - no training required
+    reasons.append("Zero-shot foundation model - no training needed, instant forecasts")
+
+    # Works well as a baseline for any data
+    reasons.append("Pre-trained on diverse time series - generalizes well")
+
+    # Small datasets are fine - Chronos doesn't need training
+    if chars.n_observations < 52:
+        confidence += 0.1
+        reasons.append("Excellent for limited data - leverages pre-training")
+        hp_filter['model_size'] = 'small'  # Use smaller model for speed
+    elif chars.n_observations >= 104:
+        # With more data, trained models may outperform zero-shot
+        confidence -= 0.1
+        reasons.append("Sufficient data for trained models - use Chronos as baseline")
+        hp_filter['model_size'] = 'base'  # Use larger model for accuracy
+
+    # Handles various patterns without explicit configuration
+    if chars.seasonality_type in [SeasonalityType.STRONG, SeasonalityType.MODERATE]:
+        reasons.append("Captures seasonal patterns from pre-training")
+
+    if chars.trend_type != TrendType.FLAT:
+        reasons.append("Handles trends without explicit differencing")
+
+    # Chronos struggles less with outliers due to robust pre-training
+    if chars.has_outliers:
+        confidence += 0.05
+        reasons.append("Robust to outliers due to diverse pre-training data")
+
+    # Model size recommendation based on compute needs
+    if chars.n_observations > 500:
+        hp_filter['model_size'] = 'base'
+        reasons.append("Larger model recommended for complex patterns")
+    elif chars.n_observations < 100:
+        hp_filter['model_size'] = 'small'
+        reasons.append("Smaller model sufficient and faster")
+    else:
+        hp_filter['model_size'] = 'small'  # Default to small for balance
+
+    recommended = confidence >= 0.5
+
+    return ModelRecommendation(
+        model_name="Chronos",
+        recommended=recommended,
+        confidence=min(1.0, max(0.0, confidence)),
+        reason="; ".join(reasons) if reasons else "Amazon's pre-trained foundation model for zero-shot forecasting",
+        hyperparameter_filter=hp_filter
+    )
+
+
 def _generate_hyperparameter_filters(chars: DataCharacteristics) -> Dict[str, Dict[str, Any]]:
     """Generate hyperparameter filters for all models."""
     filters = {}
@@ -849,6 +967,57 @@ def _generate_hyperparameter_filters(chars: DataCharacteristics) -> Dict[str, Di
         xgb_hp['learning_rate'] = [0.01, 0.05]
 
     filters['XGBoost'] = xgb_hp
+
+    # StatsForecast hyperparameters
+    statsforecast_hp = {}
+
+    # Set season length based on frequency
+    if chars.frequency == 'daily':
+        statsforecast_hp['season_length'] = 7
+    elif chars.frequency == 'weekly':
+        statsforecast_hp['season_length'] = 52
+    elif chars.frequency == 'monthly':
+        statsforecast_hp['season_length'] = 12
+    elif chars.frequency == 'quarterly':
+        statsforecast_hp['season_length'] = 4
+    else:
+        statsforecast_hp['season_length'] = 12  # Default
+
+    # Model type selection based on data characteristics
+    if chars.n_observations < 24:
+        # Limited data - use simpler auto selection
+        statsforecast_hp['model_type'] = ['auto']
+    elif chars.n_observations < 52:
+        # Moderate data - focus on faster models
+        statsforecast_hp['model_type'] = ['auto', 'autoarima']
+    else:
+        # Sufficient data - allow all model types
+        statsforecast_hp['model_type'] = ['auto', 'autoarima', 'autoets', 'autotheta']
+
+    filters['StatsForecast'] = statsforecast_hp
+
+    # Chronos hyperparameters
+    chronos_hp = {}
+
+    # Model size selection based on data and compute needs
+    if chars.n_observations < 100:
+        # Smaller model for faster inference on smaller datasets
+        chronos_hp['model_size'] = ['tiny', 'small']
+    elif chars.n_observations < 500:
+        # Medium-sized model for balanced speed/accuracy
+        chronos_hp['model_size'] = ['small', 'base']
+    else:
+        # Larger model for complex patterns
+        chronos_hp['model_size'] = ['base']
+
+    # Chronos doesn't need much tuning - it's zero-shot
+    # But we can suggest number of samples for prediction intervals
+    if chars.has_outliers or chars.cv > 0.5:
+        chronos_hp['num_samples'] = 200  # More samples for uncertain data
+    else:
+        chronos_hp['num_samples'] = 100  # Standard samples
+
+    filters['Chronos'] = chronos_hp
 
     return filters
 

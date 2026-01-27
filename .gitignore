@@ -80,3 +80,13 @@ tests/results/
 
 # Puppeteer E2E tests (local only)
 tests/*.cjs
+
+# Deployment generated files
+.cluster_id
+.job_id
+.databricks/
+*.bak
+
+# SQLite databases (local development)
+*.db
+mlflow.db

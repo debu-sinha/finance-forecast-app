@@ -293,6 +293,10 @@ def train_exponential_smoothing_model(
     # Apply hyperparameter filters from data analysis if provided
     ets_filters = (hyperparameter_filters or {}).get('ETS', {})
 
+    # Extract confidence level for prediction intervals (default 0.95)
+    global_filters = (hyperparameter_filters or {}).get('_global', {})
+    confidence_level = global_filters.get('confidence_level', 0.95)
+
     # Use filtered values if provided, otherwise use defaults
     trend_options = ets_filters.get('trend', ['add', None])
     seasonal_options = ets_filters.get('seasonal', ['add', None])
@@ -397,7 +401,7 @@ def train_exponential_smoothing_model(
                 y_train=train_df['y'].values,
                 y_pred_train=train_predictions[-len(train_df):] if len(train_predictions) >= len(train_df) else train_predictions,
                 forecast_values=test_predictions,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             yhat_lower = test_predictions * 0.9
@@ -480,7 +484,7 @@ def train_exponential_smoothing_model(
                 y_train=train_df['y'].values,  # TRAIN ONLY
                 y_pred_train=final_train_predictions,
                 forecast_values=forecast_values,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             forecast_lower = forecast_values * 0.9
@@ -539,6 +543,7 @@ def train_exponential_smoothing_model(
         mlflow.log_param("seasonal", str(best_params.get('seasonal', 'None')))
         mlflow.log_param("seasonal_periods", seasonal_periods)
         mlflow.log_param("random_seed", random_seed)
+        mlflow.log_param("confidence_level", confidence_level)
         mlflow.log_metrics(best_metrics)
         
         # Log reproducible code

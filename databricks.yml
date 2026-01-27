@@ -1,35 +1,67 @@
 # Databricks bundle configuration
+# Multi-user architecture with Lakebase PostgreSQL state management
 bundle:
   name: finance-forecast-app
 
-# Application resource definition
+# Variables for environment-specific configuration
+variables:
+  # Lakebase PostgreSQL connection (set per environment)
+  lakebase_host:
+    description: "Lakebase PostgreSQL host"
+    default: ""
+  lakebase_database:
+    description: "Lakebase database name"
+    default: "forecast"
+  lakebase_user:
+    description: "Lakebase database user"
+    default: "forecast_app"
+  # Dedicated cluster for heavy training workloads
+  dedicated_cluster_id:
+    description: "Cluster ID for training jobs (64 vCPU, 256GB RAM recommended)"
+    default: ""
+
+# Resource definitions
 resources:
+  # =========================================================================
+  # DATABRICKS APP - Lightweight orchestrator (4 vCPU / 12GB RAM)
+  # =========================================================================
   apps:
     finance-forecast-app:
       name: finance-forecast-app
-      description: "Finance Forecasting Platform with MLflow and Model Serving"
-      command: 
+      description: "Finance Forecasting Platform with MLflow, Model Serving, and Multi-User Support"
+      command:
         - /bin/bash
         - -c
         - |
           pip install -r requirements.txt && \
           python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
-      
+
       env:
+        # MLflow Configuration
         - name: MLFLOW_TRACKING_URI
           value: "databricks"
         - name: MLFLOW_EXPERIMENT_NAME
           value: "/Users/${bundle.deployer.user_name}/finance-forecasting"
         - name: PYTHONUNBUFFERED
           value: "1"
+
+        # MLflow Optimization (prevent tracker overload)
         - name: MLFLOW_MAX_WORKERS
-          value: "2"
+          value: "1"  # Single writer per job
+        - name: MLFLOW_SKIP_CHILD_RUNS
+          value: "true"  # Skip HP tuning child runs
+
+        # Hyperparameter Grid Limits (reduces MLflow writes)
         - name: PROPHET_MAX_COMBINATIONS
           value: "3"
         - name: ARIMA_MAX_COMBINATIONS
-          value: "6"
+          value: "4"
         - name: ETS_MAX_COMBINATIONS
           value: "4"
+        - name: XGBOOST_MAX_COMBINATIONS
+          value: "3"
+
+        # Unity Catalog Configuration
         - name: UC_CATALOG_NAME
           value: "main"
         - name: UC_SCHEMA_NAME
@@ -39,9 +71,122 @@ resources:
         - name: UC_MODEL_NAME
           value: "main.default.finance_forecast_model"
 
+        # Lakebase PostgreSQL Configuration
+        - name: LAKEBASE_HOST
+          value: ${var.lakebase_host}
+        - name: LAKEBASE_DATABASE
+          value: ${var.lakebase_database}
+        - name: LAKEBASE_USER
+          value: ${var.lakebase_user}
+        - name: LAKEBASE_SSL_MODE
+          value: "require"
+
+        # Job Delegation Configuration
+        - name: ENABLE_CLUSTER_DELEGATION
+          value: "true"
+        - name: DEDICATED_CLUSTER_ID
+          value: ${var.dedicated_cluster_id}
+        - name: TRAINING_NOTEBOOK_PATH
+          value: "/Workspace/finance-forecasting/notebooks/train_models"
+
+        # Job Configuration
+        - name: JOB_TIMEOUT_SECONDS
+          value: "7200"  # 2 hours
+        - name: JOB_MAX_CONCURRENT_RUNS
+          value: "10"
+        - name: JOB_MAX_RETRIES
+          value: "1"
+
       permissions:
         - level: CAN_MANAGE
           user_name: ${bundle.deployer.user_name}
+
+  # =========================================================================
+  # DEDICATED CLUSTER - Heavy ML training workloads (64 vCPU / 256GB RAM)
+  # =========================================================================
+  # Note: For production, create cluster via Terraform/CLI and set dedicated_cluster_id
+  # This cluster definition is for reference/development
+  clusters:
+    forecast-training-cluster:
+      cluster_name: "forecast-training-${bundle.target}"
+      spark_version: "15.4.x-scala2.12"
+
+      # Single-node configuration for parallel model training
+      # 64 vCPU allows 10-20 concurrent model fits via ThreadPoolExecutor
+      node_type_id: "Standard_E64ds_v4"  # Azure: 64 vCPU, 256 GB RAM
+      # AWS alternative: "r6i.16xlarge"
+      # GCP alternative: "n2-highmem-64"
+
+      num_workers: 0  # Single node mode
+
+      spark_conf:
+        "spark.databricks.cluster.profile": "singleNode"
+        "spark.master": "local[*]"
+        "spark.executor.memory": "200g"
+        "spark.driver.memory": "200g"
+        "spark.sql.shuffle.partitions": "64"
+
+      custom_tags:
+        project: "finance-forecasting"
+        cost_center: "analytics"
+        team: "fp-and-a"
+
+      autotermination_minutes: 30
+
+      # Libraries to install on cluster
+      libraries:
+        - pypi:
+            package: "prophet"
+        - pypi:
+            package: "statsforecast>=1.7.0"
+        - pypi:
+            package: "chronos-forecasting>=1.4.0"
+        - pypi:
+            package: "torch>=2.0.0"
+        - pypi:
+            package: "mapie>=0.8.0"
+        - pypi:
+            package: "asyncpg>=0.29.0"
+        - pypi:
+            package: "psycopg2-binary>=2.9.9"
+
+  # =========================================================================
+  # TRAINING JOB - Runs on dedicated cluster
+  # =========================================================================
+  jobs:
+    forecast-training-job:
+      name: "forecast-training-job-${bundle.target}"
+      description: "Training job for finance forecasting models"
+
+      tasks:
+        - task_key: "train_all_models"
+          existing_cluster_id: ${var.dedicated_cluster_id}
+
+          notebook_task:
+            notebook_path: "/Workspace/finance-forecasting/notebooks/train_models"
+            # Parameters passed at runtime via Jobs API
+
+          timeout_seconds: 7200  # 2 hours
+
+          # Retry on timeout (transient failures)
+          retry_on_timeout: true
+          max_retries: 1
+
+      # Queue settings for high concurrency
+      queue:
+        enabled: true  # Queue up to 48 hours
+
+      # Allow multiple concurrent runs (different users)
+      max_concurrent_runs: 10
+
+      # Email notifications (optional)
+      # email_notifications:
+      #   on_failure:
+      #     - alerts@company.com
+
+      tags:
+        project: "finance-forecasting"
+        type: "ml-training"
 
 targets:
   dev:

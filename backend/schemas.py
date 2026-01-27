@@ -51,6 +51,7 @@ class TrainRequest(BaseModel):
     from_date: Optional[str] = Field(default=None, description="Start date for filtering training data (YYYY-MM-DD format). If provided, only data from this date onwards will be used.")
     to_date: Optional[str] = Field(default=None, description="End date for filtering training data (YYYY-MM-DD format). If provided, only data up to this date will be used.")
     random_seed: Optional[int] = Field(default=42, description="Random seed for reproducibility. Set to ensure consistent results across runs.")
+    confidence_level: Optional[float] = Field(default=0.95, ge=0.50, le=0.99, description="Confidence level for prediction intervals (0.50-0.99). Lower values = narrower intervals. Default 0.95 (95%). Use 0.80 for ~35% narrower intervals.")
     future_features: Optional[List[Dict[str, Any]]] = Field(default=None, description="Optional future feature data for prediction horizon. If provided, actual feature values will be used instead of imputation.")
     # Batch training context - enables grouped MLflow tracking
     batch_id: Optional[str] = Field(default=None, description="Unique batch training session ID. When provided, all segments use the same MLflow experiment.")
@@ -429,3 +430,185 @@ class DataAnalysisResponse(BaseModel):
     notes: List[str] = Field(..., description="Additional notes")
     overallRecommendation: str = Field(..., description="Overall recommendation summary")
     hyperparameterFilters: Dict[str, Dict[str, Any]] = Field(..., description="Hyperparameter filters per model")
+
+
+# =============================================================================
+# MULTI-USER ARCHITECTURE SCHEMAS (Lakebase PostgreSQL)
+# =============================================================================
+
+class SessionCreateRequest(BaseModel):
+    """Request model for creating a new user session"""
+    user_id: str = Field(..., description="Unique user identifier")
+    user_email: Optional[str] = Field(None, description="User's email address")
+    session_config: Optional[Dict[str, Any]] = Field(default={}, description="Session configuration/preferences")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": "user@example.com",
+                "user_email": "user@example.com",
+                "session_config": {"theme": "dark", "default_horizon": 12}
+            }
+        }
+
+
+class SessionResponse(BaseModel):
+    """Response model for session operations"""
+    session_id: str = Field(..., description="Unique session identifier")
+    user_id: str = Field(..., description="User identifier")
+    user_email: Optional[str] = Field(None, description="User's email address")
+    created_at: str = Field(..., description="Session creation timestamp (ISO format)")
+    last_active_at: str = Field(..., description="Last activity timestamp (ISO format)")
+    expires_at: str = Field(..., description="Session expiration timestamp (ISO format)")
+    is_active: bool = Field(..., description="Whether the session is active")
+    session_config: Dict[str, Any] = Field(default={}, description="Session configuration")
+
+
+class TrainAsyncRequest(BaseModel):
+    """Request model for async training endpoint (delegates to Databricks Jobs)"""
+    data: List[Dict[str, Any]] = Field(..., description="Time series data rows")
+    time_col: str = Field(..., description="Name of the time/date column")
+    target_col: str = Field(..., description="Name of the target column to forecast")
+    covariates: List[str] = Field(default=[], description="List of covariate column names")
+    horizon: int = Field(default=12, description="Number of periods to forecast")
+    frequency: Literal['daily', 'weekly', 'monthly'] = Field(default="monthly", description="Data frequency")
+    seasonality_mode: Literal['additive', 'multiplicative'] = Field(default="multiplicative", description="Seasonality mode")
+    models: List[str] = Field(default=["prophet"], description="Models to train")
+    random_seed: int = Field(default=42, description="Random seed for reproducibility")
+    confidence_level: float = Field(default=0.95, ge=0.50, le=0.99, description="Confidence level for intervals")
+    hyperparameter_filters: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, description="Hyperparameter filters per model")
+    session_id: str = Field(..., description="Session ID from /api/session/create")
+    user_id: str = Field(..., description="User identifier")
+    priority: Literal['LOW', 'NORMAL', 'HIGH'] = Field(default="NORMAL", description="Job priority")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "data": [{"ds": "2023-01-01", "y": 1000}],
+                "time_col": "ds",
+                "target_col": "y",
+                "horizon": 12,
+                "models": ["prophet", "statsforecast"],
+                "session_id": "abc-123-def",
+                "user_id": "user@example.com"
+            }
+        }
+
+
+class TrainAsyncResponse(BaseModel):
+    """Response model for async training submission"""
+    job_id: str = Field(..., description="Unique job identifier for tracking")
+    databricks_run_id: Optional[int] = Field(None, description="Databricks Jobs run ID")
+    status: str = Field(..., description="Initial job status (SUBMITTED, QUEUED)")
+    message: str = Field(..., description="Status message")
+    poll_url: str = Field(..., description="URL to poll for job status")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "job_id": "abc-123-def-456",
+                "databricks_run_id": 12345678,
+                "status": "SUBMITTED",
+                "message": "Training job submitted to dedicated cluster",
+                "poll_url": "/api/job/abc-123-def-456/status"
+            }
+        }
+
+
+class JobStatusResponse(BaseModel):
+    """Response model for job status polling"""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(..., description="Job status: PENDING, QUEUED, RUNNING, COMPLETED, FAILED")
+    databricks_run_id: Optional[int] = Field(None, description="Databricks Jobs run ID")
+    submitted_at: str = Field(..., description="Submission timestamp (ISO format)")
+    started_at: Optional[str] = Field(None, description="Job start timestamp (ISO format)")
+    completed_at: Optional[str] = Field(None, description="Job completion timestamp (ISO format)")
+    duration_seconds: Optional[int] = Field(None, description="Job duration in seconds")
+    progress_message: Optional[str] = Field(None, description="Current progress message")
+    error_message: Optional[str] = Field(None, description="Error message if failed")
+    # Results summary (available when COMPLETED)
+    best_model: Optional[str] = Field(None, description="Best performing model")
+    best_mape: Optional[float] = Field(None, description="Best model MAPE")
+    mlflow_run_id: Optional[str] = Field(None, description="MLflow run ID for results")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "job_id": "abc-123-def-456",
+                "status": "RUNNING",
+                "databricks_run_id": 12345678,
+                "submitted_at": "2025-01-27T10:30:00Z",
+                "started_at": "2025-01-27T10:31:00Z",
+                "completed_at": None,
+                "progress_message": "Training Prophet model (2/5)"
+            }
+        }
+
+
+class JobResultsResponse(BaseModel):
+    """Response model for completed job results"""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(..., description="Job status (should be COMPLETED)")
+    models: List[Dict[str, Any]] = Field(..., description="Results for each trained model")
+    best_model: str = Field(..., description="Best performing model name")
+    forecast: List[Dict[str, Any]] = Field(..., description="Best model's forecast")
+    validation: List[Dict[str, Any]] = Field(..., description="Best model's validation results")
+    mlflow_run_id: str = Field(..., description="MLflow run ID")
+    mlflow_experiment_url: Optional[str] = Field(None, description="URL to MLflow experiment")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "job_id": "abc-123-def-456",
+                "status": "COMPLETED",
+                "best_model": "prophet",
+                "models": [{"model_name": "prophet", "mape": 5.2}],
+                "forecast": [{"ds": "2025-02-01", "yhat": 1100}],
+                "validation": [{"ds": "2024-12-01", "y": 1000, "yhat": 1010}],
+                "mlflow_run_id": "run-abc-123"
+            }
+        }
+
+
+class UserHistoryItem(BaseModel):
+    """Single item in user's execution history"""
+    job_id: str = Field(..., description="Job identifier")
+    submitted_at: str = Field(..., description="Submission timestamp")
+    status: str = Field(..., description="Job status")
+    best_model: Optional[str] = Field(None, description="Best model (if completed)")
+    best_mape: Optional[float] = Field(None, description="Best MAPE (if completed)")
+    duration_seconds: Optional[int] = Field(None, description="Job duration")
+    horizon: int = Field(..., description="Forecast horizon")
+    frequency: str = Field(..., description="Data frequency")
+    models: List[str] = Field(..., description="Models trained")
+
+
+class UserHistoryResponse(BaseModel):
+    """Response model for user execution history"""
+    user_id: str = Field(..., description="User identifier")
+    total_executions: int = Field(..., description="Total number of executions")
+    executions: List[UserHistoryItem] = Field(..., description="Execution history items")
+
+
+class ReproduceJobRequest(BaseModel):
+    """Request model for reproducing a previous job"""
+    session_id: str = Field(..., description="Current session ID")
+    user_id: str = Field(..., description="User identifier")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "session_id": "new-session-id",
+                "user_id": "user@example.com"
+            }
+        }
+
+
+class ReproduceJobResponse(BaseModel):
+    """Response model for job reproduction"""
+    new_job_id: str = Field(..., description="New job identifier")
+    reproduced_from: str = Field(..., description="Original job identifier")
+    original_params: Dict[str, Any] = Field(..., description="Original request parameters")
+    data_hash_match: bool = Field(..., description="Whether data hash matches original")
+    status: str = Field(..., description="New job status")
+    poll_url: str = Field(..., description="URL to poll for new job status")

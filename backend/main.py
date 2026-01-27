@@ -4,9 +4,13 @@ FastAPI backend for Databricks Finance Forecasting Platform
 import os
 import gc
 import logging
+import uuid
 import numpy as np
 import tempfile
 import glob as glob_module
+import hashlib
+import json
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -18,13 +22,73 @@ from backend.schemas import (
     BatchTrainRequest, BatchTrainResponse, BatchResultItem,
     AggregateRequest, AggregateResponse, TestModelRequest, TestModelResponse,
     ModelTestResult, BatchDeployRequest, BatchDeployResponse, BatchSegmentInfo,
-    DataAnalysisRequest, DataAnalysisResponse
+    DataAnalysisRequest, DataAnalysisResponse,
+    # Multi-user architecture schemas
+    SessionCreateRequest, SessionResponse, TrainAsyncRequest, TrainAsyncResponse,
+    JobStatusResponse, JobResultsResponse, UserHistoryResponse, UserHistoryItem,
+    ReproduceJobRequest, ReproduceJobResponse
 )
 from backend.models.prophet import train_prophet_model, prepare_prophet_data
 from backend.models.arima import train_arima_model, train_sarimax_model
 from backend.models.ets import train_exponential_smoothing_model
 from backend.models.xgboost import train_xgboost_model
 from backend.models.utils import register_model_to_unity_catalog, validate_mlflow_run_artifacts
+
+# Advanced forecasting models
+try:
+    from backend.models.statsforecast_models import train_statsforecast_model
+    STATSFORECAST_AVAILABLE = True
+except ImportError:
+    STATSFORECAST_AVAILABLE = False
+    train_statsforecast_model = None
+
+try:
+    from backend.models.chronos_model import train_chronos_model
+    CHRONOS_AVAILABLE = True
+except ImportError:
+    CHRONOS_AVAILABLE = False
+    train_chronos_model = None
+
+try:
+    from backend.models.ensemble import train_ensemble_model, create_ensemble_forecast
+    ENSEMBLE_AVAILABLE = True
+except ImportError:
+    ENSEMBLE_AVAILABLE = False
+    train_ensemble_model = None
+    create_ensemble_forecast = None
+
+# AutoML Best Practices (AutoGluon, Nixtla, Greykite patterns)
+try:
+    from backend.models.automl_utils import (
+        check_data_quality,
+        validate_forecast,
+        detect_overfitting,
+        DataQualityReport,
+        ForecastValidationResult,
+        OverfittingReport,
+        log_automl_summary,
+    )
+    from backend.models.presets import (
+        get_preset,
+        get_preset_models,
+        recommend_preset,
+        log_preset_info,
+        PresetConfig,
+    )
+    from backend.preprocessing import validate_data_quality
+    AUTOML_UTILS_AVAILABLE = True
+except ImportError as e:
+    AUTOML_UTILS_AVAILABLE = False
+    # Note: logger not yet defined at import time, will log after setup
+    _automl_import_error = str(e)
+
+try:
+    from backend.models.conformal import ConformalPredictor, add_conformal_intervals
+    CONFORMAL_AVAILABLE = True
+except ImportError:
+    CONFORMAL_AVAILABLE = False
+    ConformalPredictor = None
+    add_conformal_intervals = None
 from backend.deploy_service import (
     deploy_model_to_serving, get_endpoint_status, delete_endpoint,
     list_endpoints, get_databricks_client, test_model_inference
@@ -49,6 +113,22 @@ except ImportError:
     JOB_DELEGATION_AVAILABLE = False
     job_api_router = None
     is_delegation_enabled = lambda: False
+
+# Multi-User Architecture Services (Lakebase PostgreSQL)
+try:
+    from backend.services.lakebase_client import (
+        LakebaseClient,
+        get_lakebase_client,
+        close_lakebase_client,
+        compute_data_hash,
+    )
+    from backend.services.session_manager import SessionManager, get_session_manager
+    from backend.services.job_service import JobService, get_job_service
+    from backend.services.history_service import HistoryService, get_history_service
+    MULTIUSER_AVAILABLE = True
+except ImportError as e:
+    MULTIUSER_AVAILABLE = False
+    # Note: logger not yet defined, will log after logger setup
 
 # Configure logging with both console and file handlers
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
@@ -78,6 +158,10 @@ root_logger.addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 logger.info(f"📝 Logging to file: {LOG_FILE}")
+
+# Log deferred import warnings
+if not AUTOML_UTILS_AVAILABLE:
+    logger.warning(f"AutoML utilities not available: {_automl_import_error if '_automl_import_error' in dir() else 'unknown error'}")
 
 
 def truncate_log_file():
@@ -218,6 +302,12 @@ if JOB_DELEGATION_AVAILABLE and job_api_router:
     delegation_status = "enabled" if is_delegation_enabled() else "disabled (set ENABLE_CLUSTER_DELEGATION=true)"
     logger.info(f"✅ Job Delegation API routes registered at /api/v2/jobs/* - Delegation: {delegation_status}")
 
+# Log Multi-User Architecture availability
+if MULTIUSER_AVAILABLE:
+    logger.info("✅ Multi-User Architecture services available (Lakebase PostgreSQL)")
+else:
+    logger.info("⚠️ Multi-User Architecture services not available (optional - requires Lakebase)")
+
 @app.get("/")
 async def root():
     return FileResponse(f"{static_dir}/index.html") if os.path.exists(f"{static_dir}/index.html") else {"message": "API Running"}
@@ -254,6 +344,412 @@ async def health_check():
     except Exception as e:
         logger.debug(f"MLflow setup failed (expected in dev): {type(e).__name__}")
     return HealthResponse(**status_data)
+
+
+# =============================================================================
+# MULTI-USER ARCHITECTURE ENDPOINTS (Lakebase PostgreSQL)
+# =============================================================================
+
+@app.post("/api/session/create", response_model=SessionResponse)
+async def create_session(request: SessionCreateRequest):
+    """
+    Create a new user session.
+
+    Sessions provide isolated state management for concurrent users.
+    Each session tracks execution history and enables reproducibility.
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Multi-user architecture not available. Ensure Lakebase PostgreSQL is configured."
+        )
+
+    try:
+        session_manager = get_session_manager()
+        session_id = await session_manager.create_session(
+            user_id=request.user_id,
+            user_email=request.user_email,
+            session_config=request.session_config or {}
+        )
+
+        session = await session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=500, detail="Failed to retrieve created session")
+
+        logger.info(f"Created session {session_id} for user {request.user_id}")
+        return SessionResponse(**session)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Session creation failed: {str(e)}")
+
+
+@app.get("/api/session/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str):
+    """Get session details by ID."""
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        session_manager = get_session_manager()
+        session = await session_manager.get_session(session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+        return SessionResponse(**session)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session retrieval failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Session retrieval failed: {str(e)}")
+
+
+@app.post("/api/train-async", response_model=TrainAsyncResponse)
+async def train_async(request: TrainAsyncRequest):
+    """
+    Submit an async training job to the dedicated cluster.
+
+    This endpoint returns immediately with a job_id for status polling.
+    The actual training runs on a dedicated beefy cluster (64 vCPU, 256GB RAM)
+    via Databricks Jobs, allowing heavy workloads without blocking the App.
+
+    Flow:
+    1. Validates session and stores upload data
+    2. Creates execution history record in Lakebase
+    3. Submits job to Databricks Jobs API
+    4. Returns job_id for polling via /api/job/{job_id}/status
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        import pandas as pd
+
+        # Validate session
+        session_manager = get_session_manager()
+        session = await session_manager.validate_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=401, detail=f"Invalid or expired session: {request.session_id}")
+
+        # Generate job ID
+        job_id = str(uuid.uuid4())
+
+        # Compute data hash for reproducibility
+        data_json = json.dumps(request.data, sort_keys=True, default=str)
+        data_hash = hashlib.md5(data_json.encode()).hexdigest()
+
+        # Store uploaded data and create upload record
+        lakebase_client = get_lakebase_client()
+        upload_id = str(uuid.uuid4())
+
+        await lakebase_client.create_upload(
+            upload_id=upload_id,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            file_name=f"training_data_{job_id[:8]}.json",
+            columns=[col for col in request.data[0].keys()] if request.data else [],
+            row_count=len(request.data),
+            data_hash=data_hash
+        )
+
+        # Prepare request parameters for history
+        request_params = {
+            "time_col": request.time_col,
+            "target_col": request.target_col,
+            "covariates": request.covariates,
+            "horizon": request.horizon,
+            "frequency": request.frequency,
+            "seasonality_mode": request.seasonality_mode,
+            "models": request.models,
+            "random_seed": request.random_seed,
+            "confidence_level": request.confidence_level,
+            "hyperparameter_filters": request.hyperparameter_filters,
+        }
+
+        # Create execution history record
+        history_service = get_history_service()
+        await history_service.create_execution(
+            job_id=job_id,
+            session_id=request.session_id,
+            user_id=request.user_id,
+            request_params=request_params,
+            data_upload_id=upload_id,
+            data_row_count=len(request.data),
+            data_hash=data_hash
+        )
+
+        # Submit to Databricks Jobs
+        job_service = get_job_service()
+        run_id = await job_service.submit_training_job(
+            job_id=job_id,
+            session_id=request.session_id,
+            user_id=request.user_id,
+            data_upload_id=upload_id,
+            train_request=request_params,
+            priority=request.priority
+        )
+
+        # Update execution record with Databricks run ID
+        await history_service.update_status(
+            job_id=job_id,
+            status="RUNNING",
+            databricks_run_id=run_id
+        )
+
+        # Update session activity
+        await session_manager.update_activity(request.session_id)
+
+        logger.info(f"Submitted async training job {job_id} (Databricks run: {run_id}) for user {request.user_id}")
+
+        return TrainAsyncResponse(
+            job_id=job_id,
+            databricks_run_id=run_id,
+            status="SUBMITTED",
+            message="Training job submitted to dedicated cluster",
+            poll_url=f"/api/job/{job_id}/status"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Async training submission failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Training submission failed: {str(e)}")
+
+
+@app.get("/api/job/{job_id}/status", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Poll for job completion status.
+
+    Returns current job state and progress information.
+    When status is COMPLETED, use /api/job/{job_id}/results to get forecast data.
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        history_service = get_history_service()
+        job_service = get_job_service()
+
+        # Get execution record from Lakebase
+        execution = await history_service.get_execution(job_id)
+        if not execution:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        # If still running, sync status with Databricks
+        if execution.get("status") == "RUNNING" and execution.get("databricks_run_id"):
+            await job_service.sync_job_status(job_id)
+            # Re-fetch updated status
+            execution = await history_service.get_execution(job_id)
+
+        return JobStatusResponse(
+            job_id=job_id,
+            status=execution.get("status", "UNKNOWN"),
+            databricks_run_id=execution.get("databricks_run_id"),
+            submitted_at=execution.get("submitted_at", ""),
+            started_at=execution.get("started_at"),
+            completed_at=execution.get("completed_at"),
+            duration_seconds=execution.get("duration_seconds"),
+            progress_message=execution.get("progress_message"),
+            error_message=execution.get("error_message"),
+            best_model=execution.get("best_model"),
+            best_mape=execution.get("best_mape"),
+            mlflow_run_id=execution.get("mlflow_run_id")
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job status retrieval failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Status retrieval failed: {str(e)}")
+
+
+@app.get("/api/job/{job_id}/results", response_model=JobResultsResponse)
+async def get_job_results(job_id: str):
+    """
+    Get forecast results for a completed job.
+
+    Returns full model results, forecasts, and validation data.
+    Only available when job status is COMPLETED.
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        history_service = get_history_service()
+        lakebase_client = get_lakebase_client()
+
+        # Get execution record
+        execution = await history_service.get_execution(job_id)
+        if not execution:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        if execution.get("status") != "COMPLETED":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job {job_id} is not completed (status: {execution.get('status')})"
+            )
+
+        # Get forecast results from Lakebase
+        results = await lakebase_client.get_forecast_results(job_id)
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No results found for job {job_id}")
+
+        # Find best model result
+        best_model = execution.get("best_model", "")
+        best_result = next((r for r in results if r.get("model_name") == best_model), results[0] if results else None)
+
+        return JobResultsResponse(
+            job_id=job_id,
+            status="COMPLETED",
+            models=[{
+                "model_name": r.get("model_name"),
+                "mape": r.get("mape"),
+                "rmse": r.get("rmse"),
+                "mae": r.get("mae"),
+                "r2": r.get("r2"),
+                "mlflow_run_id": r.get("mlflow_run_id")
+            } for r in results],
+            best_model=best_model,
+            forecast=json.loads(best_result.get("forecast_json", "[]")) if best_result else [],
+            validation=json.loads(best_result.get("validation_json", "[]")) if best_result else [],
+            mlflow_run_id=execution.get("mlflow_run_id", ""),
+            mlflow_experiment_url=execution.get("mlflow_experiment_url")
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job results retrieval failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Results retrieval failed: {str(e)}")
+
+
+@app.get("/api/history/{user_id}", response_model=UserHistoryResponse)
+async def get_user_history(user_id: str, limit: int = 50):
+    """
+    Get execution history for a user.
+
+    Returns a list of past training jobs with their status and results summary.
+    Useful for reproducibility and tracking past forecasts.
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        session_manager = get_session_manager()
+        history = await session_manager.get_user_history(user_id, limit=limit)
+
+        return UserHistoryResponse(
+            user_id=user_id,
+            total_executions=len(history),
+            executions=[
+                UserHistoryItem(
+                    job_id=item.get("job_id", ""),
+                    submitted_at=item.get("submitted_at", ""),
+                    status=item.get("status", "UNKNOWN"),
+                    best_model=item.get("best_model"),
+                    best_mape=item.get("best_mape"),
+                    duration_seconds=item.get("duration_seconds"),
+                    horizon=item.get("horizon", 0),
+                    frequency=item.get("frequency", ""),
+                    models=item.get("models", [])
+                )
+                for item in history
+            ]
+        )
+
+    except Exception as e:
+        logger.error(f"User history retrieval failed: {e}")
+        raise HTTPException(status_code=500, detail=f"History retrieval failed: {str(e)}")
+
+
+@app.post("/api/job/{job_id}/reproduce", response_model=ReproduceJobResponse)
+async def reproduce_job(job_id: str, request: ReproduceJobRequest):
+    """
+    Reproduce a previous execution with exact same parameters.
+
+    Creates a new job with identical configuration to the original.
+    Useful for validating reproducibility or re-running with updated data.
+    """
+    if not MULTIUSER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Multi-user architecture not available")
+
+    try:
+        history_service = get_history_service()
+        job_service = get_job_service()
+        session_manager = get_session_manager()
+
+        # Validate session
+        session = await session_manager.validate_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=401, detail=f"Invalid or expired session: {request.session_id}")
+
+        # Get reproduction parameters
+        repro_params = await history_service.get_reproduction_params(job_id)
+        if not repro_params:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found or cannot be reproduced")
+
+        original_params = repro_params.get("original_request", {})
+        original_data_hash = repro_params.get("data_hash", "")
+        data_upload_id = repro_params.get("data_upload_id", "")
+
+        # Generate new job ID
+        new_job_id = str(uuid.uuid4())
+
+        # Create execution history record for new job
+        await history_service.create_execution(
+            job_id=new_job_id,
+            session_id=request.session_id,
+            user_id=request.user_id,
+            request_params=original_params,
+            data_upload_id=data_upload_id,
+            data_row_count=repro_params.get("data_row_count", 0),
+            data_hash=original_data_hash,
+            reproduced_from=job_id
+        )
+
+        # Submit to Databricks Jobs
+        run_id = await job_service.submit_training_job(
+            job_id=new_job_id,
+            session_id=request.session_id,
+            user_id=request.user_id,
+            data_upload_id=data_upload_id,
+            train_request=original_params,
+            priority="NORMAL"
+        )
+
+        # Update execution record with Databricks run ID
+        await history_service.update_status(
+            job_id=new_job_id,
+            status="RUNNING",
+            databricks_run_id=run_id
+        )
+
+        logger.info(f"Reproduced job {job_id} as {new_job_id} for user {request.user_id}")
+
+        return ReproduceJobResponse(
+            new_job_id=new_job_id,
+            reproduced_from=job_id,
+            original_params=original_params,
+            data_hash_match=True,  # Will be verified during training
+            status="SUBMITTED",
+            poll_url=f"/api/job/{new_job_id}/status"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job reproduction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Reproduction failed: {str(e)}")
+
+
+# =============================================================================
+# END MULTI-USER ARCHITECTURE ENDPOINTS
+# =============================================================================
 
 
 @app.post("/api/analyze-data", response_model=DataAnalysisResponse)
@@ -387,6 +883,17 @@ async def train_model(request: TrainRequest):
         np.random.seed(seed)
         logger.info(f"🌱 Set random seed: {seed} for reproducibility")
 
+        # Confidence level for prediction intervals (default 0.95 = 95%)
+        # Lower values (e.g., 0.80) give narrower uncertainty ranges
+        confidence_level = getattr(request, 'confidence_level', None) or 0.95
+        logger.info(f"📊 Confidence level for prediction intervals: {confidence_level*100:.0f}%")
+
+        # Inject confidence_level into hyperparameter_filters so all models can access it
+        hp_filters = dict(request.hyperparameter_filters or {})
+        hp_filters['_global'] = hp_filters.get('_global', {})
+        hp_filters['_global']['confidence_level'] = confidence_level
+        request_hp_filters = hp_filters
+
         # CRITICAL: Filter out target column from covariates to prevent data leakage
         # The target column should NEVER be used as a covariate/feature
         safe_covariates = [c for c in (request.covariates or []) if c != request.target_col]
@@ -442,6 +949,48 @@ async def train_model(request: TrainRequest):
         # LOG DATE-FILTERED DATASET
         # ========================================
         log_dataframe_summary(df, f"DATE-FILTERED DATASET (from_date={request.from_date or 'N/A'}, to_date={effective_to_date})")
+
+        # ========================================
+        # DATA QUALITY VALIDATION (AutoML Best Practices)
+        # ========================================
+        # Implements Greykite/AutoTS-style data quality checks:
+        # - Minimum data requirements
+        # - Missing value detection/handling
+        # - Outlier detection (IQR method)
+        # - Duplicate date detection
+        # - Time gap detection
+        # - Variance checks
+        if AUTOML_UTILS_AVAILABLE:
+            try:
+                df, data_quality_report = validate_data_quality(
+                    df=df,
+                    date_col='ds',
+                    target_col='y',
+                    frequency=request.frequency,
+                    auto_fix=True  # Automatically fix minor issues
+                )
+
+                # Store for later use in ensemble creation
+                historical_mean = data_quality_report.stats.get('mean', df['y'].mean())
+                historical_std = data_quality_report.stats.get('std', df['y'].std())
+
+                # Log any critical issues
+                if not data_quality_report.is_valid:
+                    logger.warning(f"⚠️ Data quality issues detected: {data_quality_report.issues}")
+                    # Continue anyway but warn user
+                if data_quality_report.recommendations:
+                    for rec in data_quality_report.recommendations:
+                        logger.info(f"   💡 Recommendation: {rec}")
+            except Exception as e:
+                logger.warning(f"Data quality validation failed: {e}. Continuing with original data.")
+                historical_mean = df['y'].mean()
+                historical_std = df['y'].std()
+                data_quality_report = None
+        else:
+            # Fallback if automl_utils not available
+            historical_mean = df['y'].mean()
+            historical_std = df['y'].std()
+            data_quality_report = None
 
         # ========================================
         # CRITICAL: VALIDATE DATA IS SORTED BY DATE
@@ -637,7 +1186,8 @@ async def train_model(request: TrainRequest):
             mlflow.log_param("eval_data_points", len(eval_df))
             mlflow.log_param("holdout_data_points", len(holdout_df) if holdout_size > 0 else 0)
             mlflow.log_param("random_seed", seed)
-            logger.info(f"🌱 Logged random seed: {seed} to MLflow")
+            mlflow.log_param("confidence_level", confidence_level)
+            logger.info(f"🌱 Logged random seed: {seed} and confidence_level: {confidence_level} to MLflow")
 
             # Log batch training context for easier tracking and filtering
             if request.batch_id:
@@ -696,7 +1246,7 @@ async def train_model(request: TrainRequest):
                             request.data, request.time_col, request.target_col, safe_covariates,
                             request.horizon, request.frequency, request.seasonality_mode, test_size,
                             request.regressor_method, request.country, seed, request.future_features,
-                            request.hyperparameter_filters,
+                            request_hp_filters,
                             train_df_override=train_df,  # Pass pre-split data
                             test_df_override=test_df,    # Pass pre-split data
                             forecast_start_date=to_date  # Forecast starts from user's to_date
@@ -715,7 +1265,7 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_arima_model(
                             train_df, test_df, request.horizon, request.frequency, None, seed,
                             original_data=request.data, covariates=safe_covariates,
-                            hyperparameter_filters=request.hyperparameter_filters,
+                            hyperparameter_filters=request_hp_filters,
                             forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -739,7 +1289,7 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_exponential_smoothing_model(
                             train_df, test_df, request.horizon, request.frequency, seasonal_periods, seed,
                             original_data=request.data, covariates=safe_covariates,
-                            hyperparameter_filters=request.hyperparameter_filters,
+                            hyperparameter_filters=request_hp_filters,
                             forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -758,7 +1308,7 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_sarimax_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            country=request.country, hyperparameter_filters=request_hp_filters,
                             forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -779,7 +1329,7 @@ async def train_model(request: TrainRequest):
                         run_id, _, metrics, val, fcst, uri, params = train_xgboost_model(
                             train_df, test_df, request.horizon, request.frequency,
                             covariates=safe_covariates, random_seed=seed, original_data=request.data,
-                            country=request.country, hyperparameter_filters=request.hyperparameter_filters,
+                            country=request.country, hyperparameter_filters=request_hp_filters,
                             forecast_start_date=to_date  # Forecast starts from user's to_date
                         )
                         val = val.rename(columns={'ds': request.time_col})
@@ -788,6 +1338,55 @@ async def train_model(request: TrainRequest):
                         n_est = params.get('n_estimators', '?') if params else '?'
                         result = ModelResult(
                             model_type='xgboost', model_name=f"XGBoost(depth={depth}, n={n_est})", run_id=run_id,
+                            metrics=ForecastMetrics(
+                                rmse=str(metrics['rmse']), mape=str(metrics['mape']), r2=str(metrics['r2']),
+                                cv_mape=str(metrics['cv_mape']) if metrics.get('cv_mape') else None,
+                                cv_mape_std=str(metrics['cv_mape_std']) if metrics.get('cv_mape_std') else None
+                            ),
+                            validation=val.to_dict('records'), forecast=fcst.to_dict('records'), covariate_impacts=[], is_best=False
+                        )
+                    elif model_type == 'statsforecast':
+                        # StatsForecast - Fast statistical models (AutoARIMA, AutoETS, AutoTheta)
+                        if not STATSFORECAST_AVAILABLE:
+                            logger.warning("StatsForecast not available. Install with: pip install statsforecast>=1.7.0")
+                            continue
+                        run_id, _, metrics, val, fcst, uri, params = train_statsforecast_model(
+                            train_df, test_df, request.horizon, request.frequency,
+                            random_seed=seed, original_data=request.data,
+                            hyperparameter_filters=request_hp_filters,
+                            forecast_start_date=to_date,
+                            model_type='auto'  # Uses AutoARIMA by default
+                        )
+                        val = val.rename(columns={'ds': request.time_col})
+                        fcst = fcst.rename(columns={'ds': request.time_col})
+                        model_name_str = params.get('model_name', 'AutoARIMA') if params else 'StatsForecast'
+                        result = ModelResult(
+                            model_type='statsforecast', model_name=f"StatsForecast ({model_name_str})", run_id=run_id,
+                            metrics=ForecastMetrics(
+                                rmse=str(metrics['rmse']), mape=str(metrics['mape']), r2=str(metrics['r2']),
+                                cv_mape=str(metrics['cv_mape']) if metrics.get('cv_mape') else None,
+                                cv_mape_std=str(metrics['cv_mape_std']) if metrics.get('cv_mape_std') else None
+                            ),
+                            validation=val.to_dict('records'), forecast=fcst.to_dict('records'), covariate_impacts=[], is_best=False
+                        )
+                    elif model_type == 'chronos':
+                        # Chronos - Zero-shot foundation model
+                        if not CHRONOS_AVAILABLE:
+                            logger.warning("Chronos not available. Install with: pip install chronos-forecasting torch")
+                            continue
+                        # Get model size from hyperparameter filters or use default
+                        chronos_filters = request_hp_filters.get('Chronos', {})
+                        model_size = chronos_filters.get('model_size', 'small')
+                        run_id, _, metrics, val, fcst, uri, params = train_chronos_model(
+                            train_df, test_df, request.horizon, request.frequency,
+                            random_seed=seed, original_data=request.data,
+                            forecast_start_date=to_date,
+                            model_size=model_size
+                        )
+                        val = val.rename(columns={'ds': request.time_col})
+                        fcst = fcst.rename(columns={'ds': request.time_col})
+                        result = ModelResult(
+                            model_type='chronos', model_name=f"Chronos-Bolt ({model_size})", run_id=run_id,
                             metrics=ForecastMetrics(
                                 rmse=str(metrics['rmse']), mape=str(metrics['mape']), r2=str(metrics['r2']),
                                 cv_mape=str(metrics['cv_mape']) if metrics.get('cv_mape') else None,
@@ -838,6 +1437,102 @@ async def train_model(request: TrainRequest):
                     logger.warning(f"Model {model_type} failed: {error_msg}")
 
         if not model_results: raise Exception("All models failed")
+
+        # ========================================
+        # ENSEMBLE MODEL CREATION (Optional)
+        # ========================================
+        # Create ensemble forecast by combining successful models
+        if ENSEMBLE_AVAILABLE and len([r for r in model_results if r.run_id and r.metrics.mape != "N/A"]) >= 2:
+            try:
+                logger.info(f"")
+                logger.info(f"{'='*60}")
+                logger.info(f"🔀 CREATING ENSEMBLE MODEL")
+                logger.info(f"{'='*60}")
+
+                # Prepare model results for ensemble
+                ensemble_inputs = []
+                for res in model_results:
+                    if res.run_id and res.metrics.mape != "N/A":
+                        try:
+                            mape_val = float(res.metrics.mape)
+                            # Convert validation and forecast back to DataFrames
+                            val_df_for_ensemble = pd.DataFrame(res.validation)
+                            fcst_df_for_ensemble = pd.DataFrame(res.forecast)
+
+                            # Rename columns back to standard names
+                            if request.time_col != 'ds':
+                                val_df_for_ensemble = val_df_for_ensemble.rename(columns={request.time_col: 'ds'})
+                                fcst_df_for_ensemble = fcst_df_for_ensemble.rename(columns={request.time_col: 'ds'})
+
+                            ensemble_inputs.append({
+                                'model_name': res.model_name,
+                                'metrics': {'mape': mape_val, 'rmse': float(res.metrics.rmse), 'r2': float(res.metrics.r2)},
+                                'val_df': val_df_for_ensemble,
+                                'fcst_df': fcst_df_for_ensemble
+                            })
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"   Skipping {res.model_name} for ensemble: {e}")
+                            continue
+
+                if len(ensemble_inputs) >= 2:
+                    # Create ensemble with AutoML best practices filtering
+                    # - Validates model predictions (NaN, inf, extreme values, all-zeros)
+                    # - Filters overfitting models (train vs eval MAPE ratio)
+                    # - Uses MAPE-weighted ensemble from AutoGluon patterns
+                    ensemble_run_id, _, ensemble_metrics, ensemble_val, ensemble_fcst, ensemble_uri, ensemble_info = train_ensemble_model(
+                        model_results=ensemble_inputs,
+                        train_df=train_df,
+                        test_df=test_df,
+                        horizon=request.horizon,
+                        frequency=request.frequency,
+                        random_seed=seed,
+                        weighting_method='inverse_mape',
+                        forecast_start_date=to_date,
+                        # AutoML best practices parameters
+                        historical_mean=historical_mean,
+                        historical_std=historical_std,
+                        max_mape_ratio=3.0,  # Only include models with MAPE <= 3x best
+                        filter_overfitting=True,  # Filter models with train/eval ratio > threshold
+                        max_overfitting_severity='high'  # Threshold: low=1.5, medium=2.0, high=3.0
+                    )
+
+                    # Rename columns for consistency
+                    ensemble_val = ensemble_val.rename(columns={'ds': request.time_col})
+                    ensemble_fcst = ensemble_fcst.rename(columns={'ds': request.time_col})
+
+                    # Create ensemble result
+                    weights_str = ", ".join([f"{k[:10]}:{v:.2f}" for k, v in ensemble_info.get('weights', {}).items()])
+                    ensemble_result = ModelResult(
+                        model_type='ensemble',
+                        model_name=f"Ensemble ({len(ensemble_inputs)} models)",
+                        run_id=ensemble_run_id,
+                        metrics=ForecastMetrics(
+                            rmse=str(ensemble_metrics['rmse']),
+                            mape=str(ensemble_metrics['mape']),
+                            r2=str(ensemble_metrics['r2']),
+                            cv_mape=None,
+                            cv_mape_std=None
+                        ),
+                        validation=ensemble_val.to_dict('records'),
+                        forecast=ensemble_fcst.to_dict('records'),
+                        covariate_impacts=[],
+                        is_best=False
+                    )
+
+                    # Check if ensemble is best
+                    if ensemble_metrics['mape'] < best_mape:
+                        best_mape = ensemble_metrics['mape']
+                        best_model_name = ensemble_result.model_name
+                        best_run_id = ensemble_run_id
+                        artifact_uri_ref = ensemble_uri
+                        logger.info(f"🏆 Ensemble is new best model: MAPE={best_mape:.2f}%")
+
+                    model_results.append(ensemble_result)
+                    logger.info(f"✅ Ensemble created with weights: {weights_str}")
+
+            except Exception as e:
+                logger.warning(f"Ensemble creation failed: {e}")
+                # Continue without ensemble - not a critical failure
 
         # ========================================
         # HOLDOUT EVALUATION - Final Model Selection
@@ -1184,6 +1879,37 @@ async def train_model(request: TrainRequest):
             history_df[request.time_col] = history_df[request.time_col].astype(str)
         history_data = history_df.to_dict('records')
         logger.info(f"📊 Returning {len(history_data)} history records for chart visualization")
+
+        # ========================================
+        # AUTOML TRAINING SUMMARY
+        # ========================================
+        # Log summary of AutoML best practices applied during training
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📋 AUTOML TRAINING SUMMARY")
+        logger.info(f"{'='*60}")
+        logger.info(f"   Total models requested: {len(request.models)}")
+        logger.info(f"   Models completed: {len([r for r in model_results if r.run_id and r.metrics.mape != 'N/A'])}")
+        logger.info(f"   Models failed: {len([r for r in model_results if r.metrics.mape == 'N/A'])}")
+
+        # Log data quality info
+        if AUTOML_UTILS_AVAILABLE and data_quality_report:
+            logger.info(f"   Data quality: {'✅ Valid' if data_quality_report.is_valid else '⚠️ Issues detected'}")
+            if data_quality_report.issues:
+                for issue in data_quality_report.issues[:3]:  # Show first 3 issues
+                    logger.info(f"      - {issue}")
+
+        # Log ensemble info
+        ensemble_model = next((r for r in model_results if r.model_type == 'ensemble'), None)
+        if ensemble_model:
+            logger.info(f"   Ensemble created: ✅ Yes")
+            logger.info(f"   Ensemble MAPE: {ensemble_model.metrics.mape}%")
+        else:
+            logger.info(f"   Ensemble created: ❌ No (insufficient valid models)")
+
+        logger.info(f"   Best model: {best_model_name}")
+        logger.info(f"   Best MAPE: {best_mape:.2f}%")
+        logger.info(f"{'='*60}")
 
         # Ensure we have a valid best model before returning
         if best_model_name is None:

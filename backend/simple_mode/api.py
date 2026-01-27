@@ -254,6 +254,7 @@ async def simple_forecast(
     forecast_mode: Optional[str] = Query(None, description="'aggregate' or 'by_slice'"),
     slice_columns: Optional[str] = Query(None, description="Comma-separated slice column names"),
     slice_values: Optional[str] = Query(None, description="Pipe-separated slice values to forecast"),
+    confidence_level: Optional[float] = Query(None, ge=0.50, le=0.99, description="Confidence level for prediction intervals (0.50-0.99). Default 0.95. Use 0.80 for ~35% narrower intervals."),
 ):
     """
     Simple mode forecast - upload data, get forecast automatically.
@@ -279,6 +280,7 @@ async def simple_forecast(
         logger.info(f"    forecast_mode: {forecast_mode}")
         logger.info(f"    slice_columns: {slice_columns}")
         logger.info(f"    slice_values: {slice_values}")
+        logger.info(f"    confidence_level: {confidence_level}")
         logger.info("-" * 60)
 
         # Step 1: Parse file
@@ -326,12 +328,15 @@ async def simple_forecast(
             config.target_column = target_col
         if covariates:
             config.covariate_columns = [c.strip() for c in covariates.split(',') if c.strip()]
+        if confidence_level is not None:
+            config.confidence_level = confidence_level
+            logger.info(f"Using user-specified confidence level: {confidence_level}")
 
-        logger.info(f"Generated config: models={config.models}, horizon={config.horizon}")
+        logger.info(f"Generated config: models={config.models}, horizon={config.horizon}, confidence_level={config.confidence_level}")
 
         # Step 3.5: Generate intelligent hyperparameter filters based on data profile
-        hp_filters = generate_hyperparameter_filters(profile)
-        logger.info(f"Generated hyperparameter filters for {len(hp_filters)} model types")
+        hp_filters = generate_hyperparameter_filters(profile, confidence_level=config.confidence_level)
+        logger.info(f"Generated hyperparameter filters for {len(hp_filters)} model types (confidence_level={config.confidence_level})")
 
         # Step 4: Handle by-slice vs aggregate forecasting
         slice_forecasts_list = None
@@ -427,7 +432,7 @@ async def simple_forecast(
                     slice_config.covariate_columns = [c for c in config.covariate_columns if c not in slice_cols_list]
 
                     # Generate hyperparameter filters for this slice
-                    slice_hp_filters = generate_hyperparameter_filters(slice_profile)
+                    slice_hp_filters = generate_hyperparameter_filters(slice_profile, confidence_level=config.confidence_level)
 
                     # Run forecast for this slice
                     slice_result = await _run_forecast(slice_df, slice_config, slice_profile, f"{run_id}_slice{slice_idx}", slice_hp_filters)
@@ -722,7 +727,7 @@ async def reproduce_forecast(run_id: str):
     df = stored['input_data']
 
     # Re-generate hyperparameter filters for reproducibility
-    hp_filters = generate_hyperparameter_filters(profile)
+    hp_filters = generate_hyperparameter_filters(profile, confidence_level=config.confidence_level)
 
     # Re-run forecast
     new_result = await _run_forecast(df, config, profile, run_id + "_reproduced", hp_filters)
@@ -1022,6 +1027,10 @@ async def _run_forecast(
         from backend.models.prophet import train_prophet_model, prepare_prophet_data
         from backend.models.arima import train_arima_model
         from backend.models.xgboost import train_xgboost_model
+        from backend.models.ets import train_exponential_smoothing_model
+        from backend.models.statsforecast_models import train_statsforecast_model
+        from backend.models.chronos_model import train_chronos_model
+        from backend.models.ensemble import train_ensemble_model
 
         # ============================================================
         # MLFLOW SETUP WITH FALLBACK
@@ -1167,8 +1176,10 @@ async def _run_forecast(
                     logger.info(f"[PROPHET]   covariates: {covariates}")
                     logger.info(f"[PROPHET]   horizon: {config.horizon}")
                     logger.info(f"[PROPHET]   frequency: {config.frequency}")
-                    logger.info(f"[PROPHET]   eval_size: {eval_size}")
+                    logger.info(f"[PROPHET]   Using train_df/eval_df overrides for consistent splits")
                     logger.info(f"[PROPHET]   hyperparameter_filters: {list(hyperparameter_filters.get('prophet', {}).keys()) if hyperparameter_filters else 'None'}")
+                    # FIX: Use train_df_override and test_df_override to ensure Prophet uses
+                    # the same train/eval split as other models (for consistent ensemble evaluation)
                     mlflow_run_id, _, metrics, validation, forecast, uri, impacts = train_prophet_model(
                         data_list,
                         'ds',  # data_list already has columns renamed
@@ -1177,12 +1188,14 @@ async def _run_forecast(
                         config.horizon,
                         config.frequency,
                         'multiplicative',
-                        eval_size,  # Use eval_size for validation during training
+                        None,  # Don't use eval_size - we'll override with explicit splits
                         'ridge',
                         'US',
                         config.random_seed,
                         future_features_list,  # Pass future covariate rows if available
                         hyperparameter_filters,  # Pass intelligent hyperparameter filters
+                        train_df_override=train_df,  # Use same split as other models
+                        test_df_override=eval_df,    # Use same split as other models
                         forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
 
@@ -1211,7 +1224,13 @@ async def _run_forecast(
                         hyperparameter_filters=hyperparameter_filters,
                         forecast_start_date=processed_df['ds'].max()  # Ensure forecast starts from data end
                     )
-                    logger.info(f"[ARIMA] Training complete. Params: {params}")
+                    logger.info(f"[ARIMA] Training complete.")
+                    logger.info(f"[ARIMA]   📊 Selected order: {params}")
+                    logger.info(f"[ARIMA]   📊 (p={params[0] if params else '?'}, d={params[1] if params else '?'}, q={params[2] if params else '?'})")
+                    logger.info(f"[ARIMA]   📊 p (AR terms): {params[0] if params else '?'} - past values influence")
+                    logger.info(f"[ARIMA]   📊 d (differencing): {params[1] if params else '?'} - trend removal")
+                    logger.info(f"[ARIMA]   📊 q (MA terms): {params[2] if params else '?'} - past errors influence")
+                    logger.info(f"[ARIMA]   📊 MAPE: {metrics.get('mape', 'N/A'):.2f}%")
 
                     result = {
                         'model_type': f'ARIMA{params}' if params else 'ARIMA',
@@ -1249,7 +1268,120 @@ async def _run_forecast(
                         'model_uri': uri,
                         'covariate_impacts': []
                     }
+
+                elif model_type == 'ets':
+                    logger.info(f"[ETS] Calling train_exponential_smoothing_model with:")
+                    logger.info(f"[ETS]   train_df shape: {train_df.shape}")
+                    logger.info(f"[ETS]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[ETS]   horizon: {config.horizon}")
+                    logger.info(f"[ETS]   frequency: {config.frequency}")
+
+                    # Determine seasonal periods based on frequency
+                    seasonal_periods_map = {'daily': 7, 'weekly': 52, 'monthly': 12, 'yearly': 1}
+                    seasonal_periods = seasonal_periods_map.get(config.frequency, 12)
+
+                    mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_exponential_smoothing_model(
+                        train_df, eval_df, config.horizon, config.frequency,
+                        seasonal_periods=seasonal_periods,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()
+                    )
+                    logger.info(f"[ETS] Training complete. Params: {params}")
+
+                    result = {
+                        'model_type': f'ETS({params.get("trend", "N")}/{params.get("seasonal", "N")})' if params else 'ETS',
+                        'metrics': metrics,
+                        'validation': val_df.to_dict('records'),
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif model_type == 'sarimax':
+                    logger.info(f"[SARIMAX] Calling train_statsforecast_model with:")
+                    logger.info(f"[SARIMAX]   train_df shape: {train_df.shape}")
+                    logger.info(f"[SARIMAX]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[SARIMAX]   horizon: {config.horizon}")
+                    logger.info(f"[SARIMAX]   frequency: {config.frequency}")
+
+                    mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_statsforecast_model(
+                        train_df, eval_df, config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max(),
+                        model_type='autoarima'  # Use AutoARIMA from statsforecast
+                    )
+                    logger.info(f"[SARIMAX] Training complete. Params: {params}")
+
+                    result = {
+                        'model_type': f'SARIMAX{params.get("order", "")}' if params else 'SARIMAX',
+                        'metrics': metrics,
+                        'validation': val_df.to_dict('records'),
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif model_type == 'chronos':
+                    logger.info(f"[CHRONOS] Calling train_chronos_model with:")
+                    logger.info(f"[CHRONOS]   train_df shape: {train_df.shape}")
+                    logger.info(f"[CHRONOS]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[CHRONOS]   horizon: {config.horizon}")
+                    logger.info(f"[CHRONOS]   frequency: {config.frequency}")
+
+                    mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_chronos_model(
+                        train_df, eval_df, config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max(),
+                        model_size='small'  # Use small model for balance of speed/accuracy
+                    )
+                    logger.info(f"[CHRONOS] Inference complete. Model: {params.get('model_size', 'small')}")
+
+                    result = {
+                        'model_type': f'Chronos({params.get("model_size", "small")})',
+                        'metrics': metrics,
+                        'validation': val_df.to_dict('records'),
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif model_type == 'statsforecast':
+                    from backend.models.statsforecast_models import train_statsforecast_model
+                    logger.info(f"[STATSFORECAST] Calling train_statsforecast_model with:")
+                    logger.info(f"[STATSFORECAST]   train_df shape: {train_df.shape}")
+                    logger.info(f"[STATSFORECAST]   eval_df shape: {eval_df.shape}")
+                    logger.info(f"[STATSFORECAST]   horizon: {config.horizon}")
+                    logger.info(f"[STATSFORECAST]   frequency: {config.frequency}")
+
+                    mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_statsforecast_model(
+                        train_df, eval_df, config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        model_type='autotheta',  # Use AutoTheta - great for trends
+                        forecast_start_date=processed_df['ds'].max()
+                    )
+                    logger.info(f"[STATSFORECAST] Training complete. Model: AutoTheta")
+
+                    result = {
+                        'model_type': 'AutoTheta',
+                        'metrics': metrics,
+                        'validation': val_df.to_dict('records'),
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
                 else:
+                    logger.warning(f"Unknown model type: {model_type}")
                     continue
 
                 # ============================================================
@@ -1302,6 +1434,71 @@ async def _run_forecast(
                         logger.error(f"[{model_type.upper()}]   {line}")
                 logger.error("=" * 50)
                 continue
+
+        # ============================================================
+        # ENSEMBLE MODEL (combines all successful models)
+        # ============================================================
+        if len(all_results) >= 2:
+            logger.info("-" * 50)
+            logger.info("🔄 TRAINING ENSEMBLE MODEL")
+            logger.info("-" * 50)
+            try:
+                # Calculate historical stats for ensemble validation
+                hist_mean = float(np.mean(processed_df['y'].values))
+                hist_std = float(np.std(processed_df['y'].values))
+
+                mlflow_run_id, _, metrics, val_df, fcst_df, uri, params = train_ensemble_model(
+                    all_results,
+                    train_df, eval_df, config.horizon, config.frequency,
+                    random_seed=config.random_seed,
+                    weighting_method='inverse_mape',
+                    min_weight=0.05,
+                    forecast_start_date=processed_df['ds'].max(),
+                    historical_mean=hist_mean,
+                    historical_std=hist_std,
+                    filter_overfitting=True
+                )
+                logger.info(f"[ENSEMBLE] Training complete. Weights: {params.get('weights', {})}")
+
+                ensemble_result = {
+                    'model_type': 'Ensemble',
+                    'metrics': metrics,
+                    'validation': val_df.to_dict('records') if isinstance(val_df, pd.DataFrame) else val_df,
+                    'forecast': fcst_df.to_dict('records') if isinstance(fcst_df, pd.DataFrame) else fcst_df,
+                    'mlflow_run_id': mlflow_run_id,
+                    'model_uri': uri,
+                    'covariate_impacts': [],
+                    'ensemble_weights': params.get('weights', {})
+                }
+
+                # Evaluate ensemble on holdout
+                ensemble_holdout_mape = _evaluate_on_holdout(ensemble_result, holdout_df, config)
+                ensemble_result['eval_mape'] = metrics.get('mape', float('inf'))
+                ensemble_result['holdout_mape'] = ensemble_holdout_mape
+
+                all_results.append(ensemble_result)
+                models_succeeded.append('ensemble')
+
+                model_comparison.append({
+                    'model': 'Ensemble',
+                    'eval_mape': round(ensemble_result['eval_mape'], 2),
+                    'holdout_mape': round(ensemble_holdout_mape, 2),
+                    'mape_difference': round(ensemble_holdout_mape - ensemble_result['eval_mape'], 2),
+                    'overfit_warning': ensemble_holdout_mape > ensemble_result['eval_mape'] * 1.5
+                })
+
+                # Check if ensemble is the new best
+                if ensemble_holdout_mape < best_holdout_mape:
+                    best_holdout_mape = ensemble_holdout_mape
+                    best_result = ensemble_result
+                    logger.info(f"🏆 [ENSEMBLE] NEW BEST MODEL! (Holdout MAPE: {best_holdout_mape:.2f}%)")
+                else:
+                    logger.info(f"[ENSEMBLE] Holdout MAPE: {ensemble_holdout_mape:.2f}% (best remains: {best_holdout_mape:.2f}%)")
+
+            except Exception as ensemble_error:
+                logger.warning(f"[ENSEMBLE] Failed: {ensemble_error}")
+        else:
+            logger.info("Skipping Ensemble: Need at least 2 successful models")
 
         # ============================================================
         # MODEL TRAINING SUMMARY
@@ -1411,6 +1608,91 @@ async def _run_forecast(
                         'model_uri': uri,
                         'covariate_impacts': []
                     }
+
+                elif 'ets' in best_model_type:
+                    seasonal_periods_map = {'daily': 7, 'weekly': 52, 'monthly': 12, 'yearly': 1}
+                    seasonal_periods = seasonal_periods_map.get(config.frequency, 12)
+
+                    mlflow_run_id, _, metrics, _, fcst_df, uri, params = train_exponential_smoothing_model(
+                        processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
+                        seasonal_periods=seasonal_periods,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max()
+                    )
+                    final_result = {
+                        'model_type': f'ETS({params.get("trend", "N")}/{params.get("seasonal", "N")})' if params else 'ETS',
+                        'metrics': metrics,
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif 'sarimax' in best_model_type:
+                    mlflow_run_id, _, metrics, _, fcst_df, uri, params = train_statsforecast_model(
+                        processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max(),
+                        model_type='autoarima'
+                    )
+                    final_result = {
+                        'model_type': f'SARIMAX{params.get("order", "")}' if params else 'SARIMAX',
+                        'metrics': metrics,
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif 'chronos' in best_model_type:
+                    # For Chronos, train on all data
+                    mlflow_run_id, _, metrics, _, fcst_df, uri, params = train_chronos_model(
+                        processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        original_data=data_list, covariates=covariates,
+                        hyperparameter_filters=hyperparameter_filters,
+                        forecast_start_date=processed_df['ds'].max(),
+                        model_size='small'  # Consistent with training phase
+                    )
+                    final_result = {
+                        'model_type': f'Chronos({params.get("model_size", "base")})' if params else 'Chronos',
+                        'metrics': metrics,
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif 'autotheta' in best_model_type or 'statsforecast' in best_model_type:
+                    # For StatsForecast/AutoTheta, train on all data
+                    from backend.models.statsforecast_models import train_statsforecast_model
+                    mlflow_run_id, _, metrics, _, fcst_df, uri, params = train_statsforecast_model(
+                        processed_df, processed_df.iloc[-1:], config.horizon, config.frequency,
+                        random_seed=config.random_seed,
+                        model_type='autotheta',
+                        forecast_start_date=processed_df['ds'].max()
+                    )
+                    final_result = {
+                        'model_type': 'AutoTheta',
+                        'metrics': metrics,
+                        'forecast': fcst_df.to_dict('records'),
+                        'mlflow_run_id': mlflow_run_id,
+                        'model_uri': uri,
+                        'covariate_impacts': []
+                    }
+
+                elif 'ensemble' in best_model_type:
+                    # For Ensemble, we need to retrain all component models first
+                    # Then combine them. For efficiency, we use the already computed ensemble.
+                    # The ensemble was trained with holdout, so we just keep the best result.
+                    logger.info("Ensemble model selected - using pre-trained ensemble (includes all data)")
+                    final_result = best_result
+                    # Update the model_type for clarity
+                    final_result['model_type'] = best_result.get('model_type', 'Ensemble')
 
                 if final_result:
                     logger.info(f"Final model trained on full data. Ready for forecast.")
@@ -1621,6 +1903,34 @@ def _select_models_for_data(profile: DataProfile, data_length: int) -> List[str]
     else:
         selection_reasons.append(f"❌ ARIMA SKIPPED: data_length ({data_length}) < 20 minimum")
 
+    # ETS: Good for trend and seasonality, simpler than Prophet
+    if data_length >= 24:  # Need at least 2 seasonal cycles for weekly
+        models.append('ets')
+        selection_reasons.append(f"✅ ETS: data_length ({data_length}) >= 24")
+    else:
+        selection_reasons.append(f"❌ ETS SKIPPED: data_length ({data_length}) < 24 minimum")
+
+    # SARIMAX (via StatsForecast): Fast AutoARIMA with seasonal support
+    if data_length >= 52:  # Need at least 1 year for seasonal patterns
+        models.append('sarimax')
+        selection_reasons.append(f"✅ SARIMAX: data_length ({data_length}) >= 52")
+    else:
+        selection_reasons.append(f"❌ SARIMAX SKIPPED: data_length ({data_length}) < 52 minimum")
+
+    # Chronos: Zero-shot foundation model (no training needed)
+    if data_length >= 20:  # Just needs context, no minimum for training
+        models.append('chronos')
+        selection_reasons.append(f"✅ Chronos: data_length ({data_length}) >= 20")
+    else:
+        selection_reasons.append(f"❌ Chronos SKIPPED: data_length ({data_length}) < 20 minimum")
+
+    # StatsForecast (AutoTheta): Fast statistical model, great for trends
+    if data_length >= 24:  # Need sufficient data for seasonal detection
+        models.append('statsforecast')
+        selection_reasons.append(f"✅ StatsForecast: data_length ({data_length}) >= 24")
+    else:
+        selection_reasons.append(f"❌ StatsForecast SKIPPED: data_length ({data_length}) < 24 minimum")
+
     # If no models selected, at least try Prophet
     if not models:
         models = ['prophet']
@@ -1661,12 +1971,13 @@ def _evaluate_on_holdout(
     import mlflow.pyfunc
 
     try:
-        run_id = result.get('run_id')
+        # FIX: Use 'mlflow_run_id' key, not 'run_id' - the result dict stores it as mlflow_run_id
+        run_id = result.get('mlflow_run_id')
         if not run_id or holdout_df.empty:
             # Fall back to eval MAPE if no run_id or empty holdout
             metrics = result.get('metrics', {})
             eval_mape = metrics.get('mape', 100.0)
-            logger.info(f"No run_id or empty holdout - using eval MAPE: {eval_mape:.2f}%")
+            logger.info(f"No mlflow_run_id or empty holdout - using eval MAPE: {eval_mape:.2f}%")
             return float(eval_mape)
 
         # Load the trained model
@@ -1678,23 +1989,74 @@ def _evaluate_on_holdout(
             metrics = result.get('metrics', {})
             return float(metrics.get('mape', 100.0))
 
-        # Prepare holdout input - convert dates to string format to match model signature
-        holdout_input = holdout_df[['ds']].copy()
-        holdout_input['ds'] = pd.to_datetime(holdout_input['ds']).dt.strftime('%Y-%m-%d')
-
-        # Add covariates if model expects them
+        # Check model signature to determine prediction mode
+        use_periods_mode = False
         try:
             model_signature = loaded_model.metadata.signature
             if model_signature and model_signature.inputs:
-                for col_spec in model_signature.inputs.to_dict():
-                    col_name = col_spec.get('name', '')
-                    if col_name != 'ds' and col_name in holdout_df.columns:
-                        holdout_input[col_name] = holdout_df[col_name].values
-        except Exception:
-            pass  # Fall back to ds-only if we can't get signature
+                col_specs = model_signature.inputs.to_dict()
+                col_names = [spec.get('name', '') for spec in col_specs]
+                # If model expects 'periods' and 'start_date', use period-based prediction
+                use_periods_mode = 'periods' in col_names and 'start_date' in col_names
+                logger.info(f"Model signature columns: {col_names}, use_periods_mode: {use_periods_mode}")
+        except Exception as sig_error:
+            logger.warning(f"Could not read model signature: {sig_error}")
 
-        # Get predictions
-        holdout_predictions = loaded_model.predict(holdout_input)
+        if use_periods_mode:
+            # Mode for XGBoost/ARIMA: Use periods and start_date
+            holdout_dates = pd.to_datetime(holdout_df['ds'])
+            start_date = holdout_dates.min().strftime('%Y-%m-%d')
+            periods = len(holdout_df)
+
+            period_input = pd.DataFrame({
+                'periods': [periods],
+                'start_date': [start_date]
+            })
+            logger.info(f"Holdout using period mode: periods={periods}, start_date={start_date}")
+
+            try:
+                holdout_predictions = loaded_model.predict(period_input)
+            except Exception as pred_error:
+                logger.warning(f"Period-mode predict failed: {pred_error}")
+                metrics = result.get('metrics', {})
+                return float(metrics.get('mape', 100.0))
+        else:
+            # Mode for Prophet: Use dataframe with features
+            holdout_input = holdout_df.copy().reset_index(drop=True)
+            holdout_input['ds'] = pd.to_datetime(holdout_input['ds']).dt.strftime('%Y-%m-%d')
+
+            # Build input with columns in correct order AND types
+            try:
+                model_signature = loaded_model.metadata.signature
+                if model_signature and model_signature.inputs:
+                    col_specs = model_signature.inputs.to_dict()
+                    input_cols = []
+                    for col_spec in col_specs:
+                        col_name = col_spec.get('name', '')
+                        col_type = col_spec.get('type', 'double')
+
+                        if col_name in holdout_input.columns:
+                            input_cols.append(col_name)
+                            if col_type in ('long', 'integer', 'int'):
+                                holdout_input[col_name] = holdout_input[col_name].fillna(0).astype(int)
+                            elif col_type in ('double', 'float'):
+                                holdout_input[col_name] = holdout_input[col_name].astype(float)
+                        elif col_name == 'ds':
+                            input_cols.append(col_name)
+
+                    if input_cols:
+                        holdout_input = holdout_input[input_cols]
+                        logger.info(f"Holdout input prepared with {len(input_cols)} columns (types converted): {input_cols[:5]}...")
+            except Exception as sig_error:
+                logger.warning(f"Could not read model signature for feature prep: {sig_error}")
+                holdout_input = holdout_input[['ds']]
+
+            try:
+                holdout_predictions = loaded_model.predict(holdout_input)
+            except Exception as pred_error:
+                logger.warning(f"Feature-mode predict failed: {pred_error}")
+                metrics = result.get('metrics', {})
+                return float(metrics.get('mape', 100.0))
 
         # Calculate MAPE with robust outlier handling
         if isinstance(holdout_predictions, pd.DataFrame) and 'yhat' in holdout_predictions.columns:

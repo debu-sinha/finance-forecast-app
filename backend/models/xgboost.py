@@ -37,7 +37,8 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
     }
     """
 
-    def __init__(self, model, feature_columns, frequency, last_known_values, covariate_means, yoy_lag_values=None, weekly_freq_code=None):
+    def __init__(self, model, feature_columns, frequency, last_known_values, covariate_means,
+                 yoy_lag_values=None, weekly_freq_code=None, training_data_length=None, training_start_date=None):
         self.model = model
         self.feature_columns = feature_columns
         self.last_known_values = last_known_values  # For short-term lag features
@@ -50,6 +51,9 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         self.yoy_lag = yoy_lag_map.get(self.frequency, 364)
         # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
         self.weekly_freq_code = weekly_freq_code or 'W-MON'
+        # CRITICAL: Store training data info for trend feature extrapolation
+        self.training_data_length = training_data_length or len(last_known_values)
+        self.training_start_date = training_start_date
 
     def _create_calendar_features(self, df):
         """Create enhanced calendar features from date column"""
@@ -83,6 +87,17 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         if 'periods' in model_input.columns:
             periods = int(model_input['periods'].iloc[0])
             start_date = pd.to_datetime(model_input['start_date'].iloc[0])
+
+            # FIX: Align start_date to the frequency anchor to avoid skipping periods
+            if self.frequency == 'weekly' and '-' in pandas_freq:
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = pandas_freq.split('-')[1]
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                days_since_anchor = (start_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    start_date = start_date - pd.Timedelta(days=days_since_anchor)
+
             future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
             future_df = pd.DataFrame({'ds': future_dates})
         else:
@@ -93,6 +108,29 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
 
         # Create calendar features
         future_df = self._create_calendar_features(future_df)
+
+        # CRITICAL: Add trend features for extrapolation capability
+        # These must continue from where training data ended
+        future_df = future_df.sort_values('ds').reset_index(drop=True)
+        n_train = self.training_data_length
+        future_df['time_index'] = np.arange(n_train, n_train + len(future_df))
+
+        if self.training_start_date is not None:
+            start_date = pd.to_datetime(self.training_start_date)
+            future_df['days_since_start'] = (future_df['ds'] - start_date).dt.days
+        else:
+            # Fallback: estimate days_since_start based on time_index and frequency
+            days_per_period = {'daily': 1, 'weekly': 7, 'monthly': 30, 'yearly': 365}
+            dpf = days_per_period.get(self.frequency, 7)
+            future_df['days_since_start'] = future_df['time_index'] * dpf
+
+        total_len = n_train + len(future_df)
+        future_df['time_normalized'] = future_df['time_index'] / (total_len - 1) if total_len > 1 else 0.0
+
+        if self.frequency == 'weekly':
+            future_df['weeks_since_start'] = future_df['days_since_start'] / 7
+        elif self.frequency == 'monthly':
+            future_df['months_since_start'] = future_df['days_since_start'] / 30.44
 
         # Add lag features (use last known values, then predictions recursively)
         # VALIDATION: Ensure we have sufficient historical values for lag features
@@ -171,9 +209,41 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
 def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates: List[str] = None, include_lags: bool = True, frequency: str = 'daily') -> pd.DataFrame:
     """
     Create all features for XGBoost time series model including YoY lag features
-    for better holiday forecasting.
+    for better holiday forecasting, and TREND features to enable extrapolation.
     """
     df = df.copy()
+
+    # ==========================================================================
+    # CRITICAL: TREND FEATURES - Enable XGBoost to extrapolate linear trends
+    # ==========================================================================
+    # Tree models cannot extrapolate beyond training data range by default.
+    # By adding explicit trend features (time_index, days_since_start), we give
+    # XGBoost the ability to learn linear growth patterns.
+    # ==========================================================================
+
+    # Sort by date to ensure correct time indexing
+    df = df.sort_values('ds').reset_index(drop=True)
+
+    # Time index (0, 1, 2, ...) - simple linear counter
+    df['time_index'] = np.arange(len(df))
+
+    # Days/weeks/months since start - for different frequencies
+    start_date = df['ds'].min()
+    df['days_since_start'] = (df['ds'] - start_date).dt.days
+
+    # Normalized time (0 to 1) - helps with gradient descent
+    if len(df) > 1:
+        df['time_normalized'] = df['time_index'] / (len(df) - 1)
+    else:
+        df['time_normalized'] = 0.0
+
+    # Frequency-specific trend features
+    if frequency == 'weekly':
+        df['weeks_since_start'] = df['days_since_start'] / 7
+    elif frequency == 'monthly':
+        df['months_since_start'] = df['days_since_start'] / 30.44  # Average days per month
+
+    logger.info(f"XGBoost: Added trend features (time_index, days_since_start) for extrapolation capability")
 
     # Calendar features (always available since we have ds)
     df['day_of_week'] = df['ds'].dt.dayofweek
@@ -443,6 +513,21 @@ def train_xgboost_model(
     test_featured['is_quarter_end'] = test_featured['ds'].dt.is_quarter_end.astype(int)
     test_featured['week_of_month'] = (test_featured['ds'].dt.day - 1) // 7 + 1
 
+    # CRITICAL: Add trend features for test set (continuation from train)
+    # These must continue from where train ended for proper extrapolation
+    train_start_date = train_df['ds'].min()
+    n_train = len(train_df)
+    test_featured = test_featured.sort_values('ds').reset_index(drop=True)
+    test_featured['time_index'] = np.arange(n_train, n_train + len(test_featured))
+    test_featured['days_since_start'] = (test_featured['ds'] - train_start_date).dt.days
+    # Normalize using combined train+test length
+    total_len = n_train + len(test_featured)
+    test_featured['time_normalized'] = test_featured['time_index'] / (total_len - 1) if total_len > 1 else 0.0
+    if frequency == 'weekly':
+        test_featured['weeks_since_start'] = test_featured['days_since_start'] / 7
+    elif frequency == 'monthly':
+        test_featured['months_since_start'] = test_featured['days_since_start'] / 30.44
+
     # ==========================================================================
     # CRITICAL FIX: Compute lag features for test set WITHOUT data leakage
     # ==========================================================================
@@ -458,6 +543,14 @@ def train_xgboost_model(
         'day_of_week', 'day_of_month', 'month', 'week_of_year', 'is_weekend', 'quarter',
         'is_month_start', 'is_month_end', 'is_quarter_start', 'is_quarter_end', 'week_of_month'
     ]
+
+    # CRITICAL: Trend features for extrapolation capability
+    # These allow XGBoost to learn and extrapolate linear growth patterns
+    trend_features = ['time_index', 'days_since_start', 'time_normalized']
+    if frequency == 'weekly':
+        trend_features.append('weeks_since_start')
+    elif frequency == 'monthly':
+        trend_features.append('months_since_start')
 
     # First, train a preliminary model to get predictions for recursive lags
     # Use same features but without the test-dependent lag values
@@ -566,8 +659,9 @@ def train_xgboost_model(
     promo_derived = ['any_promo_active', 'promo_count', 'promo_window', 'is_promo_weekend', 'is_regular_weekend']
     promo_derived = [c for c in promo_derived if c in train_featured.columns]
 
-    feature_columns = calendar_features + lag_features + valid_covariates + promo_derived
-    logger.info(f"XGBoost using {len(feature_columns)} features including YoY lags and promo-derived features")
+    # CRITICAL: Include trend features for extrapolation capability
+    feature_columns = calendar_features + trend_features + lag_features + valid_covariates + promo_derived
+    logger.info(f"XGBoost using {len(feature_columns)} features including TREND features for extrapolation, YoY lags, and promo-derived features")
 
     # Ensure all feature columns exist
     for col in feature_columns:
@@ -591,6 +685,10 @@ def train_xgboost_model(
 
     # Hyperparameter grid - apply filters from data analysis if provided
     xgb_filters = (hyperparameter_filters or {}).get('XGBoost', {})
+
+    # Extract confidence level for prediction intervals (default 0.95)
+    global_filters = (hyperparameter_filters or {}).get('_global', {})
+    confidence_level = global_filters.get('confidence_level', 0.95)
 
     # Default param_grid values
     default_param_grid = [
@@ -762,7 +860,7 @@ def train_xgboost_model(
                 y_train=y_train.values,
                 y_pred_train=train_predictions,
                 forecast_values=test_predictions,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             yhat_lower = test_predictions * 0.9
@@ -802,6 +900,18 @@ def train_xgboost_model(
         if forecast_start_date is not None:
             last_date = pd.to_datetime(forecast_start_date).normalize()
             logger.info(f"📅 Using user-specified forecast start: {last_date}")
+
+            # FIX: Align last_date to the frequency anchor to avoid skipping periods
+            if frequency == 'weekly':
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = pd_freq.split('-')[1] if '-' in pd_freq else 'MON'
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                days_since_anchor = (last_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    aligned_date = last_date - pd.Timedelta(days=days_since_anchor)
+                    logger.info(f"📅 Aligned forecast start from {last_date.date()} ({last_date.day_name()}) to {aligned_date.date()} ({aligned_date.day_name()})")
+                    last_date = aligned_date
         else:
             last_date = full_df['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
@@ -809,6 +919,20 @@ def train_xgboost_model(
         future_df = pd.DataFrame({'ds': future_dates})
         # Create features without lag columns (we'll fill them recursively during prediction)
         future_df = create_xgboost_features(future_df, 'y', valid_covariates, include_lags=False)
+
+        # CRITICAL: Fix trend features for forecast - they must continue from full data, not reset to 0
+        # This is essential for XGBoost to extrapolate linear trends correctly
+        full_data_start = full_df['ds'].min()
+        n_full = len(full_df)
+        future_df['time_index'] = np.arange(n_full, n_full + len(future_df))
+        future_df['days_since_start'] = (future_df['ds'] - full_data_start).dt.days
+        total_len = n_full + len(future_df)
+        future_df['time_normalized'] = future_df['time_index'] / (total_len - 1) if total_len > 1 else 0.0
+        if frequency == 'weekly':
+            future_df['weeks_since_start'] = future_df['days_since_start'] / 7
+        elif frequency == 'monthly':
+            future_df['months_since_start'] = future_df['days_since_start'] / 30.44
+        logger.info(f"📈 XGBoost: Trend features for forecast continue from time_index={n_full} to {n_full + len(future_df) - 1}")
 
         # For lag features in forecast, use recursive prediction
         predictions = []
@@ -864,7 +988,7 @@ def train_xgboost_model(
                 y_train=y_full.values,
                 y_pred_train=full_train_predictions,
                 forecast_values=forecast_values,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             forecast_lower = forecast_values * 0.9
@@ -920,6 +1044,7 @@ def train_xgboost_model(
         mlflow.log_param("feature_columns", str(feature_columns))
         mlflow.log_param("covariates", str(valid_covariates))
         mlflow.log_param("random_seed", random_seed)
+        mlflow.log_param("confidence_level", confidence_level)
         mlflow.log_metrics(best_metrics)
         
         # Log reproducible code
@@ -957,7 +1082,9 @@ def train_xgboost_model(
             weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
             model_wrapper = XGBoostModelWrapper(
                 final_model, feature_columns, frequency,
-                last_known_values, covariate_means, yoy_lag_values, weekly_freq_code
+                last_known_values, covariate_means, yoy_lag_values, weekly_freq_code,
+                training_data_length=len(full_df),
+                training_start_date=str(full_df['ds'].min())
             )
 
             mlflow.pyfunc.log_model(
@@ -986,7 +1113,7 @@ def train_xgboost_model(
             model_backup_path = "/tmp/xgboost_model_backup.pkl"
             with open(model_backup_path, 'wb') as f:
                 pickle.dump({
-                    'model': best_xgb_model,
+                    'model': final_model,
                     'wrapper': model_wrapper,
                     'params': best_params,
                     'feature_columns': feature_columns,
@@ -1004,7 +1131,7 @@ def train_xgboost_model(
                 model_path = "/tmp/xgboost_model.pkl"
                 with open(model_path, 'wb') as f:
                     pickle.dump({
-                        'model': best_xgb_model,
+                        'model': final_model,
                         'params': best_params,
                         'feature_columns': feature_columns,
                         'frequency': frequency

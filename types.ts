@@ -83,7 +83,7 @@ export interface CovariateImpact {
   direction: 'positive' | 'negative'; // Correlation direction
 }
 
-export type ModelType = 'prophet' | 'arima' | 'exponential_smoothing' | 'sarimax' | 'xgboost';
+export type ModelType = 'prophet' | 'arima' | 'exponential_smoothing' | 'sarimax' | 'xgboost' | 'statsforecast' | 'chronos' | 'ensemble';
 
 export type FutureRegressorMethod = 'mean' | 'last_value' | 'linear_trend';
 
@@ -242,4 +242,71 @@ export interface BatchComparisonResult {
     significant_deviation: number;
   };
   comparisonDate: string;
+}
+
+// ==========================================
+// DISTRIBUTED TRAINING JOB TYPES
+// ==========================================
+
+export type TrainingMode = 'autogluon' | 'statsforecast' | 'neuralforecast' | 'mmf' | 'legacy';
+
+export type JobStatus = 'pending' | 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'cancelling';
+
+export interface TrainingModeInfo {
+  value: TrainingMode;
+  name: string;
+  description: string;
+  speed: 'fast' | 'medium' | 'slow' | 'variable';
+  recommended: boolean;
+}
+
+export interface JobConfig {
+  data: DataRow[];
+  time_col: string;
+  target_col: string;
+  id_col?: string;
+  covariates: string[];
+  horizon: number;
+  frequency: string;
+  training_mode: TrainingMode;
+  models: string[];
+  seasonality_mode: string;
+  time_limit: number;
+  presets: string;
+  season_length?: number;
+}
+
+export interface TrainingJob {
+  job_id: string;
+  status: JobStatus;
+  progress: number;
+  current_step: string;
+  run_id?: string;
+  mlflow_run_id?: string;
+  created_at?: string;
+  submitted_at?: string;
+  completed_at?: string;
+  results?: JobResults;
+  error?: string;
+}
+
+export interface JobResults {
+  framework: string;
+  best_model: string;
+  mape: number;
+  mlflow_run_id?: string;
+  leaderboard?: Array<{
+    model: string;
+    score_val: number;
+    fit_time_marginal: number;
+  }>;
+  forecast?: DataRow[];
+  model_metrics?: Record<string, number>;
+}
+
+export interface DelegationStatus {
+  enabled: boolean;
+  cluster_id?: string;
+  message: string;
+  training_modes?: TrainingMode[];
 }

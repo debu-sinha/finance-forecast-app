@@ -76,6 +76,16 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
         # Generate forecast
         forecast_values = self.fitted_model.forecast(steps=periods)
 
+        # FIX: Align start_date to the frequency anchor to avoid skipping periods
+        if self.frequency == 'weekly' and '-' in pandas_freq:
+            anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+            anchor_day_name = pandas_freq.split('-')[1]
+            anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+            days_since_anchor = (start_date.dayofweek - anchor_day) % 7
+            if days_since_anchor != 0:
+                start_date = start_date - pd.Timedelta(days=days_since_anchor)
+
         # Generate future dates starting from start_date
         future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
 
@@ -138,6 +148,17 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
         if 'periods' in model_input.columns:
             periods = int(model_input['periods'].iloc[0])
             start_date = pd.to_datetime(model_input['start_date'].iloc[0])
+
+            # FIX: Align start_date to the frequency anchor to avoid skipping periods
+            if self.frequency == 'weekly' and '-' in pandas_freq:
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = pandas_freq.split('-')[1]
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                days_since_anchor = (start_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    start_date = start_date - pd.Timedelta(days=days_since_anchor)
+
             future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
 
             # If model has covariates, use historical means
@@ -536,6 +557,10 @@ def train_arima_model(
     # Apply hyperparameter filters from data analysis if provided
     arima_filters = (hyperparameter_filters or {}).get('ARIMA', {})
 
+    # Extract confidence level for prediction intervals (default 0.95)
+    global_filters = (hyperparameter_filters or {}).get('_global', {})
+    confidence_level = global_filters.get('confidence_level', 0.95)
+
     if order is None:
         max_arima_combinations = int(os.environ.get('ARIMA_MAX_COMBINATIONS', '6'))
 
@@ -646,7 +671,7 @@ def train_arima_model(
                 y_train=train_df['y'].values,
                 y_pred_train=train_predictions[-len(train_df):] if len(train_predictions) >= len(train_df) else train_predictions,
                 forecast_values=test_predictions,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             yhat_lower = test_predictions * 0.9
@@ -704,7 +729,7 @@ def train_arima_model(
                 y_train=full_data['y'].values,
                 y_pred_train=final_train_predictions,
                 forecast_values=forecast_values,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             forecast_lower = forecast_values * 0.9
@@ -714,6 +739,20 @@ def train_arima_model(
         if forecast_start_date is not None:
             last_date = pd.to_datetime(forecast_start_date).normalize()
             logger.info(f"📅 Using user-specified forecast start: {last_date}")
+
+            # FIX: Align last_date to the frequency anchor to avoid skipping periods
+            # When last_date is not on the anchor day (e.g., Sunday for W-MON),
+            # pd.date_range aligns to the NEXT anchor, then [1:] skips it, causing a gap.
+            if frequency == 'weekly':
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = pd_freq.split('-')[1] if '-' in pd_freq else 'MON'
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                days_since_anchor = (last_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    aligned_date = last_date - pd.Timedelta(days=days_since_anchor)
+                    logger.info(f"📅 Aligned forecast start from {last_date.date()} ({last_date.day_name()}) to {aligned_date.date()} ({aligned_date.day_name()})")
+                    last_date = aligned_date
         else:
             last_date = full_data['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
@@ -762,6 +801,7 @@ def train_arima_model(
         mlflow.log_param("d", best_order[1])
         mlflow.log_param("q", best_order[2])
         mlflow.log_param("random_seed", random_seed)
+        mlflow.log_param("confidence_level", confidence_level)
         mlflow.log_metrics(best_metrics)
         
         training_code = generate_arima_training_code(
@@ -934,6 +974,10 @@ def train_sarimax_model(
     sarimax_filters = (hyperparameter_filters or {}).get('SARIMAX', {})
     max_combinations = int(os.environ.get('SARIMAX_MAX_COMBINATIONS', '8'))
 
+    # Extract confidence level for prediction intervals (default 0.95)
+    global_filters = (hyperparameter_filters or {}).get('_global', {})
+    confidence_level = global_filters.get('confidence_level', 0.95)
+
     # Use filtered values if provided, otherwise use defaults
     p_values = sarimax_filters.get('p_values', [0, 1, 2])
     d_values = sarimax_filters.get('d_values', [0, 1])
@@ -1071,7 +1115,7 @@ def train_sarimax_model(
                 y_train=train_df['y'].values,
                 y_pred_train=train_predictions[-len(train_df):] if len(train_predictions) >= len(train_df) else train_predictions,
                 forecast_values=test_predictions,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             yhat_lower = test_predictions * 0.9
@@ -1155,7 +1199,7 @@ def train_sarimax_model(
                 y_train=full_data['y'].values,
                 y_pred_train=final_train_predictions,
                 forecast_values=forecast_values,
-                confidence_level=0.95
+                confidence_level=confidence_level
             )
         else:
             forecast_lower = forecast_values * 0.9
@@ -1165,6 +1209,18 @@ def train_sarimax_model(
         if forecast_start_date is not None:
             last_date = pd.to_datetime(forecast_start_date).normalize()
             logger.info(f"📅 Using user-specified forecast start: {last_date}")
+
+            # FIX: Align last_date to the frequency anchor to avoid skipping periods
+            if frequency == 'weekly':
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = pd_freq.split('-')[1] if '-' in pd_freq else 'MON'
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                days_since_anchor = (last_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    aligned_date = last_date - pd.Timedelta(days=days_since_anchor)
+                    logger.info(f"📅 Aligned forecast start from {last_date.date()} ({last_date.day_name()}) to {aligned_date.date()} ({aligned_date.day_name()})")
+                    last_date = aligned_date
         else:
             last_date = full_data['ds'].max()
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
@@ -1207,6 +1263,7 @@ def train_sarimax_model(
         mlflow.log_param("seasonal_order", str(best_seasonal_order))
         mlflow.log_param("covariates", str(valid_covariates))
         mlflow.log_param("random_seed", random_seed)
+        mlflow.log_param("confidence_level", confidence_level)
         mlflow.log_metrics(best_metrics)
 
         # Log reproducible code

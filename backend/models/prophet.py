@@ -277,13 +277,14 @@ random.seed({random_seed})
 SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
 
 
-def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False, custom_holidays_df=None):
+def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False, custom_holidays_df=None, confidence_level=0.95):
     """
     Evaluate a single hyperparameter combination.
 
     Args:
         skip_mlflow_logging: If True, skip creating MLflow child runs (reduces overhead)
         custom_holidays_df: Optional DataFrame with holiday definitions including lower_window/upper_window
+        confidence_level: Confidence level for prediction intervals (default 0.95)
     """
     client = MlflowClient() if not skip_mlflow_logging else None
     run_id = None
@@ -306,7 +307,7 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
             seasonality_prior_scale=params['seasonality_prior_scale'],
             holidays_prior_scale=params.get('holidays_prior_scale', 10.0),
             growth=params.get('growth', 'linear'),
-            interval_width=0.95,
+            interval_width=confidence_level,
             uncertainty_samples=1000,
             holidays=custom_holidays_df  # Multi-day holiday effects with windows
         )
@@ -418,6 +419,11 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
     import copy
     random.seed(random_seed)
     logger.info(f"Set random seed to {random_seed} for reproducibility")
+
+    # Extract confidence level for prediction intervals (default 0.95)
+    global_filters = (hyperparameter_filters or {}).get('_global', {})
+    confidence_level = global_filters.get('confidence_level', 0.95)
+    logger.info(f"  Confidence level for prediction intervals: {confidence_level*100:.0f}%")
     
     # Default frequency codes - will be refined for weekly data based on actual day-of-week
     freq_code = {"weekly": "W-MON", "monthly": "MS", "daily": "D"}.get(frequency, "MS")
@@ -582,6 +588,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         mlflow.log_param("test_size", test_size)
         mlflow.log_param("covariates", str(covariates))
         mlflow.log_param("random_seed", random_seed)
+        mlflow.log_param("confidence_level", confidence_level)
         
         # Log datasets
         try:
@@ -687,7 +694,8 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                     evaluate_param_set,
                     params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id,
                     skip_mlflow_logging=SKIP_CHILD_RUNS,
-                    custom_holidays_df=custom_holidays_df  # Pass multi-day holiday windows
+                    custom_holidays_df=custom_holidays_df,  # Pass multi-day holiday windows
+                    confidence_level=confidence_level  # Pass confidence level for prediction intervals
                 )
                 for params in param_combinations
             ]
@@ -733,7 +741,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             seasonality_prior_scale=best_params['seasonality_prior_scale'],
             holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
             growth=best_params.get('growth', 'linear'),
-            interval_width=0.95,
+            interval_width=confidence_level,
             uncertainty_samples=1000,
             holidays=custom_holidays_df  # Use multi-day holiday windows
         )
@@ -755,6 +763,24 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         if forecast_start_date is not None:
             # Use user-specified forecast start date
             start_date = pd.to_datetime(forecast_start_date).normalize()
+
+            # FIX: Align start_date to the frequency anchor to avoid skipping periods
+            # When start_date is not on the anchor day (e.g., Sunday for W-MON),
+            # pd.date_range aligns to the NEXT anchor, then [1:] skips it, causing a gap.
+            # Solution: Align to the PREVIOUS anchor first.
+            if frequency == 'weekly':
+                # Extract anchor day from freq_code (e.g., 'W-MON' -> Monday = 0)
+                anchor_day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                anchor_day_name = freq_code.split('-')[1] if '-' in freq_code else 'MON'
+                anchor_day = anchor_day_map.get(anchor_day_name, 0)
+
+                # If start_date is not on the anchor day, align to previous anchor
+                days_since_anchor = (start_date.dayofweek - anchor_day) % 7
+                if days_since_anchor != 0:
+                    aligned_start = start_date - pd.Timedelta(days=days_since_anchor)
+                    logger.info(f"📅 Aligned forecast start from {start_date.date()} ({start_date.day_name()}) to {aligned_start.date()} ({aligned_start.day_name()})")
+                    start_date = aligned_start
+
             future_dates = pd.date_range(start=start_date, periods=horizon + 1, freq=freq_code)[1:]
             future = pd.DataFrame({'ds': future_dates})
             logger.info(f"📅 Forecast dates: {start_date} + {horizon} periods -> {future['ds'].min()} to {future['ds'].max()}")
@@ -889,7 +915,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 seasonality_prior_scale=best_params['seasonality_prior_scale'],
                 holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
                 growth='flat',
-                interval_width=0.95,
+                interval_width=confidence_level,
                 uncertainty_samples=1000,
                 holidays=custom_holidays_df
             )
@@ -941,7 +967,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 seasonality_prior_scale=best_params['seasonality_prior_scale'],
                 holidays_prior_scale=best_params.get('holidays_prior_scale', 10.0),
                 growth='flat',
-                interval_width=0.95,
+                interval_width=confidence_level,
                 uncertainty_samples=1000,
                 holidays=custom_holidays_df
             )
@@ -981,7 +1007,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                     changepoint_prior_scale=0.001,  # Almost no changepoints
                     seasonality_prior_scale=1.0,
                     growth='flat',
-                    interval_width=0.95,
+                    interval_width=confidence_level,
                     uncertainty_samples=1000
                 )
 

@@ -84,6 +84,10 @@ class DataProfile:
     correlation_details: List[Dict[str, Any]] = field(default_factory=list)
     safe_covariates: List[str] = field(default_factory=list)  # Covariates after removing leaky ones
 
+    # Incomplete final period detection
+    has_incomplete_final_period: bool = False
+    incomplete_period_details: Dict[str, Any] = field(default_factory=dict)
+
 
 class DataProfiler:
     """
@@ -263,6 +267,28 @@ class DataProfiler:
             ))
             logger.warning(f"[STEP 10 OUTPUT] Added DATA LEAKAGE warning for: {leaky_covariates}")
 
+        # Step 10b: Detect incomplete final period
+        logger.info("[STEP 10b] Detecting incomplete final period...")
+        has_incomplete_final, incomplete_details = self._detect_incomplete_final_period(
+            df, date_column, target_column, frequency, has_multiple_slices
+        )
+        logger.info(f"[STEP 10b OUTPUT] has_incomplete_final_period = {has_incomplete_final}")
+        if has_incomplete_final:
+            logger.info(f"[STEP 10b OUTPUT] incomplete_details = {incomplete_details}")
+
+        # Add HIGH PRIORITY warning for incomplete final period
+        if has_incomplete_final:
+            warnings.insert(0, Warning(  # Insert at beginning for high visibility
+                level="high",
+                message=f"🚨 INCOMPLETE FINAL PERIOD DETECTED: Last period ({incomplete_details.get('last_date', 'N/A')}) "
+                        f"has value {incomplete_details.get('last_value', 0):,.0f} which is "
+                        f"{incomplete_details.get('drop_pct', 0):.0f}% lower than the median ({incomplete_details.get('median_value', 0):,.0f}). "
+                        f"This appears to be partial/incomplete data.",
+                recommendation="EXCLUDE this final period from training data, or wait until the period is complete. "
+                              "Training on incomplete data will cause models to learn incorrect patterns."
+            ))
+            logger.warning(f"[STEP 10b OUTPUT] Added INCOMPLETE FINAL PERIOD warning")
+
         # Step 11: Generate recommendations
         logger.info("[STEP 11] Generating recommendations...")
         recommended_horizon = self._recommend_horizon(frequency)
@@ -390,6 +416,10 @@ class DataProfiler:
             leaky_covariates=leaky_covariates,
             correlation_details=correlation_details,
             safe_covariates=safe_covariates,
+
+            # Incomplete final period detection
+            has_incomplete_final_period=has_incomplete_final,
+            incomplete_period_details=incomplete_details,
         )
 
     def _detect_date_column(self, df: pd.DataFrame) -> str:
@@ -1140,3 +1170,136 @@ class DataProfiler:
             logger.info(f"Future covariate validation issues: {issues}")
 
         return count, date_range, True, is_valid, issues
+
+    def _detect_incomplete_final_period(
+        self,
+        df: pd.DataFrame,
+        date_column: str,
+        target_column: str,
+        frequency: str,
+        has_multiple_slices: bool
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Detect if the final period in the data appears incomplete.
+
+        This is critical for forecasting accuracy - incomplete final periods
+        (e.g., partial week data) can severely skew model training and cause
+        negative or unrealistic forecasts.
+
+        Detection criteria:
+        1. Final period target value is >50% below median (aggregated data)
+        2. Final period has significantly fewer rows than median (multi-slice data)
+        3. Sudden drop from previous period
+
+        Args:
+            df: DataFrame with data
+            date_column: Name of date column
+            target_column: Name of target column
+            frequency: Data frequency (daily, weekly, monthly)
+            has_multiple_slices: Whether data has multiple slices per period
+
+        Returns:
+            Tuple of (is_incomplete, details_dict)
+        """
+        details = {}
+
+        try:
+            # Get unique dates sorted
+            df_dates = pd.to_datetime(df[date_column])
+            unique_dates = df_dates.drop_duplicates().sort_values()
+
+            if len(unique_dates) < 5:
+                return False, {}
+
+            last_date = unique_dates.iloc[-1]
+            second_last_date = unique_dates.iloc[-2]
+
+            details['last_date'] = str(last_date.date())
+            details['second_last_date'] = str(second_last_date.date())
+
+            # For multi-slice data, aggregate by date first
+            if has_multiple_slices:
+                agg_df = df.groupby(df_dates.dt.normalize())[target_column].agg(['sum', 'count']).reset_index()
+                agg_df.columns = ['date', 'total_value', 'row_count']
+                agg_df = agg_df.sort_values('date')
+
+                # Get values
+                last_row = agg_df.iloc[-1]
+                last_value = last_row['total_value']
+                last_row_count = last_row['row_count']
+
+                # Calculate statistics excluding last period
+                history = agg_df.iloc[:-1]
+                median_value = history['total_value'].median()
+                median_row_count = history['row_count'].median()
+                prev_value = history.iloc[-1]['total_value'] if len(history) > 0 else median_value
+
+                details['last_value'] = float(last_value)
+                details['median_value'] = float(median_value)
+                details['prev_value'] = float(prev_value)
+                details['last_row_count'] = int(last_row_count)
+                details['median_row_count'] = int(median_row_count)
+
+                # Detection 1: Value significantly below median
+                if median_value > 0:
+                    drop_pct = (1 - last_value / median_value) * 100
+                    details['drop_pct'] = float(drop_pct)
+
+                    if drop_pct > 50:  # More than 50% below median
+                        details['reason'] = f"Final period value is {drop_pct:.0f}% below median"
+                        return True, details
+
+                # Detection 2: Row count significantly below median (for multi-slice)
+                if median_row_count > 0:
+                    row_drop_pct = (1 - last_row_count / median_row_count) * 100
+                    details['row_drop_pct'] = float(row_drop_pct)
+
+                    if row_drop_pct > 30:  # More than 30% fewer rows
+                        details['reason'] = f"Final period has {row_drop_pct:.0f}% fewer rows than median"
+                        return True, details
+
+                # Detection 3: Sudden drop from previous period
+                if prev_value > 0:
+                    sudden_drop_pct = (1 - last_value / prev_value) * 100
+                    details['sudden_drop_pct'] = float(sudden_drop_pct)
+
+                    if sudden_drop_pct > 70:  # More than 70% drop from previous
+                        details['reason'] = f"Final period dropped {sudden_drop_pct:.0f}% from previous period"
+                        return True, details
+
+            else:
+                # Single slice data - simpler analysis
+                values = df.set_index(df_dates)[target_column].sort_index()
+                last_value = values.iloc[-1]
+                prev_values = values.iloc[:-1]
+
+                median_value = prev_values.median()
+                prev_value = prev_values.iloc[-1] if len(prev_values) > 0 else median_value
+
+                details['last_value'] = float(last_value)
+                details['median_value'] = float(median_value)
+                details['prev_value'] = float(prev_value)
+
+                # Detection: Value significantly below median
+                if median_value > 0:
+                    drop_pct = (1 - last_value / median_value) * 100
+                    details['drop_pct'] = float(drop_pct)
+
+                    if drop_pct > 50:
+                        details['reason'] = f"Final period value is {drop_pct:.0f}% below median"
+                        return True, details
+
+                # Detection: Sudden drop from previous
+                if prev_value > 0:
+                    sudden_drop_pct = (1 - last_value / prev_value) * 100
+                    details['sudden_drop_pct'] = float(sudden_drop_pct)
+
+                    if sudden_drop_pct > 70:
+                        details['reason'] = f"Final period dropped {sudden_drop_pct:.0f}% from previous period"
+                        return True, details
+
+            return False, details
+
+        except Exception as e:
+            logger.warning(f"Error detecting incomplete final period: {e}")
+            return False, {'error': str(e)}
