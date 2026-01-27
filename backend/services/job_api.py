@@ -5,6 +5,8 @@ Provides REST endpoints for job creation, submission, status, and cancellation.
 """
 
 import logging
+import os
+from enum import Enum
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -18,16 +20,30 @@ router = APIRouter(prefix="/api/v2/jobs", tags=["jobs"])
 
 
 # Request/Response Models
+class TrainingMode(str, Enum):
+    """Supported distributed training modes."""
+    AUTOGLUON = "autogluon"
+    STATSFORECAST = "statsforecast"
+    NEURALFORECAST = "neuralforecast"
+    MMF = "mmf"
+    LEGACY = "legacy"
+
+
 class JobConfig(BaseModel):
     """Training job configuration."""
     data: List[dict] = Field(..., description="Training data")
     time_col: str = Field(..., description="Time column name")
     target_col: str = Field(..., description="Target column name")
+    id_col: Optional[str] = Field(None, description="Series ID column for multi-series")
     covariates: List[str] = Field(default_factory=list, description="Covariate columns")
     horizon: int = Field(default=12, description="Forecast horizon")
-    frequency: str = Field(default="weekly", description="Data frequency")
-    models: List[str] = Field(default=["prophet"], description="Models to train")
+    frequency: str = Field(default="W", description="Data frequency (D, W, M)")
+    training_mode: TrainingMode = Field(default=TrainingMode.AUTOGLUON, description="AutoML framework to use")
+    models: List[str] = Field(default=["prophet"], description="Models to train (legacy mode)")
     seasonality_mode: str = Field(default="multiplicative", description="Seasonality mode")
+    time_limit: int = Field(default=600, description="Training time limit in seconds")
+    presets: str = Field(default="medium_quality", description="AutoGluon presets")
+    season_length: Optional[int] = Field(None, description="Seasonal period length")
 
 
 class CreateJobRequest(BaseModel):
@@ -58,11 +74,55 @@ class JobListResponse(BaseModel):
 @router.get("/delegation-status")
 async def get_delegation_status():
     """Check if cluster delegation is enabled and configured."""
-    import os
     return {
         "enabled": is_delegation_enabled(),
         "cluster_id": os.getenv("DEDICATED_CLUSTER_ID"),
-        "message": "Cluster delegation is enabled" if is_delegation_enabled() else "Cluster delegation is disabled"
+        "message": "Cluster delegation is enabled" if is_delegation_enabled() else "Cluster delegation is disabled",
+        "training_modes": [mode.value for mode in TrainingMode],
+    }
+
+
+@router.get("/training-modes")
+async def get_training_modes():
+    """Get available training modes with descriptions."""
+    return {
+        "modes": [
+            {
+                "value": TrainingMode.AUTOGLUON.value,
+                "name": "AutoGluon-TimeSeries",
+                "description": "Best accuracy with automatic ensembling. Includes Chronos foundation model.",
+                "speed": "medium",
+                "recommended": True,
+            },
+            {
+                "value": TrainingMode.STATSFORECAST.value,
+                "name": "StatsForecast (Nixtla)",
+                "description": "Lightning-fast statistical models. 500x faster than Prophet.",
+                "speed": "fast",
+                "recommended": False,
+            },
+            {
+                "value": TrainingMode.NEURALFORECAST.value,
+                "name": "NeuralForecast (Nixtla)",
+                "description": "Deep learning models (NHITS, NBEATS, TFT). Best for complex patterns.",
+                "speed": "slow",
+                "recommended": False,
+            },
+            {
+                "value": TrainingMode.MMF.value,
+                "name": "Many Model Forecasting",
+                "description": "Databricks solution with 40+ models. Best for production scale.",
+                "speed": "variable",
+                "recommended": False,
+            },
+            {
+                "value": TrainingMode.LEGACY.value,
+                "name": "Legacy (Prophet/ARIMA)",
+                "description": "Original implementation. Runs in App container.",
+                "speed": "medium",
+                "recommended": False,
+            },
+        ]
     }
 
 
@@ -83,7 +143,7 @@ async def create_job(request: CreateJobRequest):
         service = get_job_service()
         job = await service.create_job(
             user_id="default_user",  # TODO: Get from auth context
-            config=request.config.dict()
+            config=request.config.model_dump()
         )
         return _job_to_response(job)
     except Exception as e:

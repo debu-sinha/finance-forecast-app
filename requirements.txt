@@ -21,3 +21,34 @@ python-dateutil  # Robust date parsing for data normalizer
 openpyxl
 holidays
 python-multipart
+
+# =============================================================================
+# ADVANCED FORECASTING ENHANCEMENTS
+# =============================================================================
+
+# StatsForecast - Fast statistical models (AutoARIMA, AutoETS, AutoTheta)
+# 10-100x faster than statsmodels/pmdarima
+statsforecast>=1.7.0
+
+# Chronos - Amazon's pretrained time series foundation model
+# Requires PyTorch. For GPU acceleration:
+# pip install torch --index-url https://download.pytorch.org/whl/cu118
+chronos-forecasting>=1.4.0
+torch>=2.0.0
+
+# MAPIE - Conformal prediction intervals with coverage guarantees
+mapie>=0.8.0
+
+# =============================================================================
+# LAKEBASE POSTGRESQL (Multi-User Architecture)
+# =============================================================================
+
+# asyncpg - Fast async PostgreSQL driver for Lakebase
+# Required for high-concurrency session management and job tracking
+asyncpg>=0.29.0
+
+# psycopg2-binary - Sync PostgreSQL driver (fallback)
+# Use psycopg2 instead of psycopg2-binary in production for better performance
+psycopg2-binary>=2.9.9
+
+# Note: Ensemble and Conformal modules use only numpy/pandas (already installed)

@@ -10,6 +10,7 @@ import uuid
 import asyncio
 import logging
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Dict, Any, Optional, List
 
 from .job_state_store import JobStateStore, TrainingJob, JobStatus
@@ -19,6 +20,44 @@ logger = logging.getLogger(__name__)
 # Environment configuration
 DEDICATED_CLUSTER_ID = os.getenv("DEDICATED_CLUSTER_ID")
 ENABLE_CLUSTER_DELEGATION = os.getenv("ENABLE_CLUSTER_DELEGATION", "false").lower() == "true"
+
+# Concurrency limits
+MAX_CONCURRENT_JOBS_PER_USER = int(os.getenv("MAX_JOBS_PER_USER", "3"))
+MAX_TOTAL_CONCURRENT_JOBS = int(os.getenv("MAX_TOTAL_JOBS", "10"))
+
+
+class TrainingMode(str, Enum):
+    """Supported distributed training modes."""
+    AUTOGLUON = "autogluon"
+    STATSFORECAST = "statsforecast"
+    NEURALFORECAST = "neuralforecast"
+    MMF = "mmf"
+    LEGACY = "legacy"
+
+
+# Notebook paths per training mode
+NOTEBOOK_PATHS = {
+    TrainingMode.AUTOGLUON: os.getenv(
+        "AUTOGLUON_NOTEBOOK_PATH",
+        "/Workspace/Shared/finance-forecast/notebooks/train_distributed"
+    ),
+    TrainingMode.STATSFORECAST: os.getenv(
+        "STATSFORECAST_NOTEBOOK_PATH",
+        "/Workspace/Shared/finance-forecast/notebooks/train_distributed"
+    ),
+    TrainingMode.NEURALFORECAST: os.getenv(
+        "NEURALFORECAST_NOTEBOOK_PATH",
+        "/Workspace/Shared/finance-forecast/notebooks/train_distributed"
+    ),
+    TrainingMode.MMF: os.getenv(
+        "MMF_NOTEBOOK_PATH",
+        "/Workspace/Shared/finance-forecast/notebooks/train_mmf"
+    ),
+    TrainingMode.LEGACY: os.getenv(
+        "LEGACY_NOTEBOOK_PATH",
+        "/Workspace/Shared/finance-forecast/notebooks/train_legacy"
+    ),
+}
 
 
 class JobDelegationService:
@@ -58,7 +97,29 @@ class JobDelegationService:
         """
         Create a new training job (but don't submit yet).
         Returns the job for user review before starting.
+
+        Enforces concurrency limits per user and globally.
         """
+        # Check user concurrency limit
+        user_running_jobs = await self.state_store.count_running_jobs(user_id=user_id)
+        if user_running_jobs >= MAX_CONCURRENT_JOBS_PER_USER:
+            raise ValueError(
+                f"Maximum concurrent jobs ({MAX_CONCURRENT_JOBS_PER_USER}) reached for user. "
+                "Please wait for existing jobs to complete."
+            )
+
+        # Check global concurrency limit
+        total_running_jobs = await self.state_store.count_running_jobs()
+        if total_running_jobs >= MAX_TOTAL_CONCURRENT_JOBS:
+            raise ValueError(
+                "System is at maximum capacity. Please try again later."
+            )
+
+        # Validate training mode
+        training_mode = config.get("training_mode", "autogluon")
+        if training_mode not in [m.value for m in TrainingMode]:
+            raise ValueError(f"Invalid training mode: {training_mode}")
+
         job = TrainingJob(
             job_id=str(uuid.uuid4()),
             user_id=user_id,
@@ -71,7 +132,7 @@ class JobDelegationService:
         )
 
         await self.state_store.save(job)
-        logger.info(f"Created job {job.job_id} for user {user_id}")
+        logger.info(f"Created job {job.job_id} for user {user_id} with mode {training_mode}")
         return job
 
     async def submit_job(self, job_id: str) -> TrainingJob:
@@ -104,7 +165,9 @@ class JobDelegationService:
                         existing_cluster_id=DEDICATED_CLUSTER_ID,
                         python_wheel_task=None,
                         notebook_task=jobs.NotebookTask(
-                            notebook_path=self._get_training_notebook_path(),
+                            notebook_path=self._get_training_notebook_path(
+                                job.config.get("training_mode", "autogluon")
+                            ),
                             base_parameters={
                                 "job_id": job.job_id,
                                 "config": json.dumps(job.config)
@@ -279,13 +342,14 @@ class JobDelegationService:
             except Exception as e:
                 logger.error(f"Failed to sync job {job.job_id}: {e}")
 
-    def _get_training_notebook_path(self) -> str:
-        """Get the path to the training notebook in the workspace."""
-        # Default path - can be overridden via environment variable
-        return os.getenv(
-            "TRAINING_NOTEBOOK_PATH",
-            "/Workspace/Users/debu.sinha@databricks.com/finance-forecast-app/training_notebook"
-        )
+    def _get_training_notebook_path(self, training_mode: str = "autogluon") -> str:
+        """Get the path to the training notebook based on training mode."""
+        try:
+            mode = TrainingMode(training_mode)
+        except ValueError:
+            mode = TrainingMode.AUTOGLUON
+
+        return NOTEBOOK_PATHS.get(mode, NOTEBOOK_PATHS[TrainingMode.AUTOGLUON])
 
 
 # Singleton instance management
