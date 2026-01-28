@@ -943,6 +943,7 @@ async def train_model(request: TrainRequest):
                 logger.info(f"   Detected dimensions: {list(dim_info['dimensions'].keys())}")
 
                 # Perform aggregation with data quality checks
+                # Pass covariates so they're preserved during aggregation
                 raw_input_df, aggregation_report = prepare_data_with_aggregation(
                     df=raw_input_df,
                     date_col=request.time_col,
@@ -951,7 +952,8 @@ async def train_model(request: TrainRequest):
                     agg_method=request.aggregation.agg_method,
                     filter_dimensions=request.aggregation.filter_dimensions,
                     auto_detect_incomplete=request.aggregation.auto_detect_incomplete,
-                    frequency=request.frequency
+                    frequency=request.frequency,
+                    covariate_cols=request.covariates  # Preserve covariates during aggregation
                 )
 
                 # Update request.data with aggregated data for downstream processing

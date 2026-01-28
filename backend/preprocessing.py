@@ -615,7 +615,8 @@ def prepare_data_with_aggregation(
     agg_method: str = 'sum',
     filter_dimensions: Optional[Dict[str, Any]] = None,
     auto_detect_incomplete: bool = True,
-    frequency: str = 'weekly'
+    frequency: str = 'weekly',
+    covariate_cols: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Complete data preparation pipeline with aggregation and quality checks.
@@ -623,7 +624,7 @@ def prepare_data_with_aggregation(
     This is the main entry point for preparing multi-dimensional data for
     forecasting. It handles:
     1. Dimension filtering (if specified)
-    2. Aggregation to specified granularity
+    2. Aggregation to specified granularity (preserving covariates)
     3. Incomplete data detection
     4. Data quality validation
 
@@ -636,6 +637,7 @@ def prepare_data_with_aggregation(
         filter_dimensions: Dict of dimension filters, e.g., {'region': 'West', 'segment': ['A', 'B']}
         auto_detect_incomplete: Whether to detect and remove incomplete trailing data
         frequency: Data frequency for validation
+        covariate_cols: List of covariate columns to preserve during aggregation
 
     Returns:
         Tuple of (prepared DataFrame, preparation report)
@@ -669,9 +671,26 @@ def prepare_data_with_aggregation(
             'rows_after': len(df)
         }
 
-    # Step 2: Aggregate data
+    # Step 2: Aggregate data (preserving covariates)
+    # Build additional_agg dict for covariates - use 'max' for binary event flags
+    # and 'sum' for numeric covariates that should be aggregated
+    additional_agg = None
+    if covariate_cols:
+        additional_agg = {}
+        for cov in covariate_cols:
+            if cov in df.columns and cov != target_col:
+                # For binary event flags (0/1), use 'max' to preserve if ANY row had the event
+                # For continuous covariates, use 'sum' to aggregate
+                col_values = df[cov].dropna()
+                if len(col_values) > 0:
+                    is_binary = set(col_values.unique()).issubset({0, 1, 0.0, 1.0})
+                    additional_agg[cov] = 'max' if is_binary else 'sum'
+                    logger.info(f"   Covariate '{cov}' will be aggregated using '{additional_agg[cov]}'")
+        if additional_agg:
+            logger.info(f"   📋 Preserving {len(additional_agg)} covariate(s) during aggregation")
+
     df_agg, agg_report = aggregate_time_series(
-        df, date_col, target_col, group_by_cols, agg_method
+        df, date_col, target_col, group_by_cols, agg_method, additional_agg
     )
     report['aggregation'] = agg_report
 
