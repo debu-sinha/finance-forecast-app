@@ -983,8 +983,10 @@ def validate_mlflow_run_artifacts(run_id: str) -> Dict[str, Any]:
         for artifact_path in sorted(all_artifact_paths):
             logger.info(f"      - {artifact_path}")
 
-        # Check for model
-        model_artifacts = [a for a in all_artifact_paths if 'model' in a.lower() and ('MLmodel' in a or 'model.pkl' in a or 'python_model.pkl' in a)]
+        # Check for model - accept either pyfunc model (MLmodel, python_model.pkl) or backup pickle
+        model_artifacts = [a for a in all_artifact_paths if
+            ('model' in a.lower() and ('MLmodel' in a or 'model.pkl' in a or 'python_model.pkl' in a)) or
+            ('model_backup' in a.lower() and '.pkl' in a.lower())]
         if model_artifacts:
             validation_result["model_logged"] = True
             logger.info(f"   ✅ Model artifacts found: {model_artifacts}")
