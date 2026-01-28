@@ -1124,10 +1124,24 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         
         best_artifact_uri = mlflow.get_artifact_uri("model")
     
-    # Validation data
-    test_future = test_df[['ds'] + [c for c in covariates if c in test_df.columns]].copy()
+    # Validation data - use the model's actual extra_regressors, not the covariates list
+    # This ensures all regressors the model expects are present in test_future
+    model_regressors = list(best_model.extra_regressors.keys()) if hasattr(best_model, 'extra_regressors') else []
+    test_future = test_df[['ds']].copy()
+    for reg in model_regressors:
+        if reg in test_df.columns:
+            test_future[reg] = test_df[reg].copy()
+        elif reg in history_df.columns:
+            # Use historical mean if missing from test_df
+            mean_val = float(history_df[reg].mean())
+            test_future[reg] = mean_val
+            logger.warning(f"⚠️ Regressor '{reg}' missing from test_df, using historical mean={mean_val:.4f}")
+        else:
+            # Fallback to 0 for binary event flags
+            test_future[reg] = 0.0
+            logger.warning(f"⚠️ Regressor '{reg}' missing from both test_df and history_df, using 0")
     validation_forecast = best_model.predict(test_future)
-    val_cols = ['ds', 'y'] + [c for c in covariates if c in test_df.columns]
+    val_cols = ['ds', 'y'] + [c for c in model_regressors if c in test_df.columns]
     validation_data = test_df[val_cols].merge(validation_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], on='ds', how='left').rename(columns={'ds': time_col})
 
     # ==========================================================================
