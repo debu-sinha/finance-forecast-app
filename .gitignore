@@ -44,14 +44,18 @@ mlruns/
 build/
 *.egg-info/
 
-# Testing
+# Testing (NEVER COMMIT TEST FILES)
 .coverage
 htmlcov/
 .pytest_cache/
-backend/tests/test_simple_mode_e2e.py
-backend/tests/test_batch_e2e.py
+backend/tests/
+backend/test_*.py
 test_*.py
 test_*.csv
+*_test.py
+*_e2e.py
+tests/
+test_datasets/
 
 # Development documentation (internal session notes only)
 docs/SESSION_NOTES*.md
@@ -78,8 +82,21 @@ validation_output/
 # E2E test results (screenshots, logs)
 tests/results/
 
-# Puppeteer E2E tests (local only)
+# Puppeteer E2E tests (local only - NEVER COMMIT)
 tests/*.cjs
+e2e-tests/
+e2e-tests/**
+*puppeteer*
+comprehensive-e2e*.js
+complex-flow-test.js
+TEST_PLAN.md
+
+# Claude Code related files (local only - NEVER COMMIT)
+.claude/
+~/.claude/
+**/EB1A_STRATEGY*.md
+**/*claude-session*.json
+**/*claude-transcript*.jsonl
 
 # Deployment generated files
 .cluster_id
