@@ -28,12 +28,14 @@ from backend.models.automl_utils import (
     ForecastValidationResult,
     OverfittingReport,
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
 
+@log_io
 def _get_result_dataframe(result: Dict[str, Any], df_type: str) -> Optional[pd.DataFrame]:
     """
     Get validation or forecast DataFrame from a model result dict.
@@ -67,6 +69,7 @@ def _get_result_dataframe(result: Dict[str, Any], df_type: str) -> Optional[pd.D
     return None
 
 
+@log_io
 def _get_model_name(result: Dict[str, Any]) -> str:
     """
     Get model name from a result dict.
@@ -82,6 +85,7 @@ def _get_model_name(result: Dict[str, Any]) -> str:
     return result.get('model_name') or result.get('model_type') or 'Unknown'
 
 
+@log_io
 def calculate_inverse_mape_weights(
     validation_errors: Dict[str, float],
     min_weight: float = 0.05
@@ -123,6 +127,7 @@ def calculate_inverse_mape_weights(
     return weights
 
 
+@log_io
 def calculate_equal_weights(model_names: List[str]) -> Dict[str, float]:
     """
     Calculate equal weights for all models.
@@ -224,6 +229,7 @@ class EnsembleModelWrapper(mlflow.pyfunc.PythonModel):
         })
 
 
+@log_io
 def _validate_model_predictions(
     model_result: Dict[str, Any],
     historical_mean: float = None,
@@ -309,6 +315,7 @@ def _validate_model_predictions(
     return True, "", validation_result
 
 
+@log_io
 def _check_model_overfitting(
     model_result: Dict[str, Any],
     max_severity: str = 'high'
@@ -363,6 +370,7 @@ def _check_model_overfitting(
     return should_include, overfitting_report
 
 
+@log_io
 def create_ensemble_forecast(
     model_results: List[Dict[str, Any]],
     weighting_method: str = 'inverse_mape',
@@ -492,6 +500,43 @@ def create_ensemble_forecast(
     if not model_results:
         raise ValueError("No valid model results after MAPE filtering")
 
+    # STEP 3b: Filter by forecast divergence
+    # Exclude models whose forecast mean diverges > 50% from the median forecast.
+    # This catches models that have low eval MAPE but produce unreasonable extrapolations.
+    logger.info(f"")
+    logger.info(f"📋 Step 3b: Filtering by forecast divergence...")
+    forecast_means = []
+    for result in model_results:
+        fcst_df = _get_result_dataframe(result, 'fcst')
+        if fcst_df is not None and 'yhat' in fcst_df.columns:
+            fcst_mean = fcst_df['yhat'].mean()
+            if not np.isnan(fcst_mean) and not np.isinf(fcst_mean):
+                forecast_means.append((_get_model_name(result), fcst_mean))
+
+    if len(forecast_means) >= 3:
+        median_forecast = np.median([m[1] for m in forecast_means])
+        divergence_filtered = []
+        for result in model_results:
+            model_name = _get_model_name(result)
+            fcst_df = _get_result_dataframe(result, 'fcst')
+            if fcst_df is not None and 'yhat' in fcst_df.columns:
+                fcst_mean = fcst_df['yhat'].mean()
+                divergence_ratio = fcst_mean / median_forecast if median_forecast != 0 else 1.0
+                if 0.5 <= divergence_ratio <= 1.5:
+                    divergence_filtered.append(result)
+                    logger.info(f"   ✅ {model_name}: forecast mean={fcst_mean:,.0f} ({divergence_ratio:.2f}x median)")
+                else:
+                    logger.warning(f"   🚫 {model_name}: EXCLUDED - forecast mean={fcst_mean:,.0f} ({divergence_ratio:.2f}x median, diverges > 50%)")
+            else:
+                divergence_filtered.append(result)
+        # Only apply filter if we still have >= 2 models
+        if len(divergence_filtered) >= 2:
+            model_results = divergence_filtered
+        else:
+            logger.warning(f"   ⚠️ Divergence filter would leave < 2 models, skipping")
+    else:
+        logger.info(f"   Skipping (need >= 3 models for median-based filtering)")
+
     if len(model_results) < 2:
         logger.warning("Ensemble requires at least 2 valid models. Returning single model result.")
         result = model_results[0]
@@ -506,10 +551,13 @@ def create_ensemble_forecast(
     logger.info(f"📋 Step 4: Creating weighted ensemble from {len(model_results)} models...")
 
     # Calculate weights using AutoML-style methods
+    # max_weight=0.40 prevents any single model from dominating the ensemble
+    # (e.g., Prophet with 0.69% eval MAPE getting 53% weight while over-extrapolating)
     weights = calculate_ensemble_weights(
         model_results=model_results,
         method=weighting_method,
         min_weight=min_weight,
+        max_weight=0.40,
         normalize=True
     )
 
@@ -609,6 +657,7 @@ def create_ensemble_forecast(
     return ensemble_val_df, ensemble_fcst_df, ensemble_metrics, weights
 
 
+@log_io
 def train_ensemble_model(
     model_results: List[Dict[str, Any]],
     train_df: pd.DataFrame,

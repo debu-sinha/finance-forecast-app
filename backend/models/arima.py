@@ -21,6 +21,7 @@ from backend.models.utils import (
     detect_weekly_freq_code, detect_flat_forecast, get_fallback_arima_orders,
     get_fallback_sarimax_orders
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -125,7 +126,7 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
     }
     """
 
-    def __init__(self, fitted_model, order, seasonal_order, frequency, covariates, covariate_means, weekly_freq_code=None):
+    def __init__(self, fitted_model, order, seasonal_order, frequency, covariates, covariate_means, weekly_freq_code=None, historical_max=None, historical_mean=None):
         self.fitted_model = fitted_model
         self.order = order
         self.seasonal_order = seasonal_order
@@ -136,6 +137,9 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
         self.frequency = freq_to_human.get(frequency, frequency)
         # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
         self.weekly_freq_code = weekly_freq_code or 'W-MON'
+        # Store historical bounds for explosion detection at inference time
+        self.historical_max = historical_max or 0
+        self.historical_mean = historical_mean or 0
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -192,6 +196,13 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
             else:
                 forecast_values = self.fitted_model.forecast(steps=periods)
 
+        # CRITICAL: Detect numerical explosion (e.g., SARIMAX producing 4.8e+31)
+        # Replace with naive forecast if values exceed 10x the historical max
+        if hasattr(self, 'historical_max') and self.historical_max > 0:
+            if np.any(np.isnan(forecast_values)) or np.any(np.isinf(forecast_values)) or np.max(np.abs(forecast_values)) > 10 * self.historical_max:
+                logger.error(f"SARIMAX wrapper: numerical explosion detected (max={np.max(np.abs(forecast_values)):.2e}, hist_max={self.historical_max:,.0f}). Using historical mean as fallback.")
+                forecast_values = np.full(len(forecast_values), self.historical_mean if hasattr(self, 'historical_mean') else self.historical_max * 0.5)
+
         # CRITICAL: Clip negative forecasts - financial metrics cannot be negative
         forecast_values = np.maximum(forecast_values, 0.0)
         lower_bounds = np.maximum(forecast_values * 0.9, 0.0)
@@ -204,6 +215,7 @@ class SARIMAXModelWrapper(mlflow.pyfunc.PythonModel):
             'yhat_upper': upper_bounds
         })
 
+@log_io
 def generate_arima_training_code(
     order: Tuple[int, int, int], horizon: int, frequency: str,
     metrics: Dict[str, float], train_size: int, test_size: int
@@ -291,6 +303,7 @@ test_size = {test_size}
 '''
     return code
 
+@log_io
 def generate_sarimax_training_code(
     order: Tuple[int, int, int],
     seasonal_order: Tuple[int, int, int, int],
@@ -383,6 +396,7 @@ exog_test = None
 '''
     return code
 
+@log_io
 def evaluate_arima_params(
     order: Tuple[int, int, int],
     train_y: np.ndarray,
@@ -429,6 +443,13 @@ def evaluate_arima_params(
         # Validate on test set
         test_predictions = fitted_model.forecast(steps=len(test_y))
         metrics = compute_metrics(test_y, test_predictions)
+
+        # Penalize orders that produce flat test predictions
+        flat_check = detect_flat_forecast(test_predictions, train_y)
+        if flat_check['is_flat']:
+            logger.warning(f"  ⚠️ ARIMA{order}: flat test predictions — penalizing")
+            metrics["mape"] = float('inf')
+
         metrics["aic"] = aic
 
         if not skip_mlflow_logging and run_id:
@@ -457,6 +478,7 @@ def evaluate_arima_params(
         logger.warning(f"  ✗ ARIMA{order} failed: {e}")
         return None
 
+@log_io
 def evaluate_sarimax_params(
     order: Tuple[int, int, int],
     seasonal_order: Tuple[int, int, int, int],
@@ -511,6 +533,13 @@ def evaluate_sarimax_params(
 
         test_predictions = fitted_model.forecast(steps=len(test_y), exog=test_exog)
         metrics = compute_metrics(test_y, test_predictions)
+
+        # Penalize orders that produce flat test predictions
+        flat_check = detect_flat_forecast(test_predictions, train_y)
+        if flat_check['is_flat']:
+            logger.warning(f"  ⚠️ SARIMAX{order}x{seasonal_order}: flat test predictions — penalizing")
+            metrics["mape"] = float('inf')
+
         metrics["aic"] = aic
 
         if not skip_mlflow_logging and run_id:
@@ -540,6 +569,7 @@ def evaluate_sarimax_params(
         logger.warning(f"  ✗ SARIMAX{order}x{seasonal_order} failed: {e}")
         return None
 
+@log_io
 def train_arima_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -903,6 +933,7 @@ def train_arima_model(
     
     return best_run_id, f"runs:/{best_run_id}/model", best_metrics, validation_data, forecast_data, best_artifact_uri, best_order
 
+@log_io
 def train_sarimax_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1176,6 +1207,29 @@ def train_sarimax_model(
 
         forecast_values = final_fitted_model.forecast(steps=horizon, exog=future_exog)
 
+        # CRITICAL: Detect and handle numerically explosive forecasts
+        # SARIMAX can produce astronomically large values (e.g., 4.8e+31) when
+        # the model is numerically unstable. Detect and replace with naive forecast.
+        hist_max = np.max(np.abs(full_data['y'].values))
+        hist_mean = np.mean(full_data['y'].values)
+        forecast_abs_max = np.max(np.abs(forecast_values))
+        has_explosion = (
+            np.any(np.isnan(forecast_values)) or
+            np.any(np.isinf(forecast_values)) or
+            forecast_abs_max > 10 * hist_max
+        )
+        if has_explosion:
+            logger.error(f"🚨 SARIMAX numerical explosion detected!")
+            logger.error(f"   Forecast max: {forecast_abs_max:,.0f}, Historical max: {hist_max:,.0f}")
+            logger.error(f"   Ratio: {forecast_abs_max / hist_max if hist_max > 0 else 'inf':.1f}x")
+            logger.warning(f"   Replacing with naive seasonal forecast (last {horizon} values repeated)")
+            # Use the last horizon values as a naive seasonal forecast
+            naive_values = full_data['y'].values[-horizon:]
+            if len(naive_values) < horizon:
+                naive_values = np.full(horizon, hist_mean)
+            forecast_values = naive_values.copy()
+            logger.info(f"   Naive forecast range: {forecast_values.min():,.0f} - {forecast_values.max():,.0f}")
+
         # CRITICAL: Detect and handle flat forecasts
         flat_check = detect_flat_forecast(forecast_values, full_data['y'].values)
         if flat_check['is_flat']:
@@ -1316,7 +1370,9 @@ def train_sarimax_model(
             weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
             model_wrapper = SARIMAXModelWrapper(
                 final_fitted_model, best_order, best_seasonal_order,
-                frequency, valid_covariates, covariate_means, weekly_freq_code
+                frequency, valid_covariates, covariate_means, weekly_freq_code,
+                historical_max=float(np.max(np.abs(full_data['y'].values))),
+                historical_mean=float(np.mean(full_data['y'].values))
             )
 
             mlflow.pyfunc.log_model(

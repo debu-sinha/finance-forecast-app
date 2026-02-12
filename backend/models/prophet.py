@@ -18,6 +18,7 @@ from backend.models.utils import (
     compute_metrics, register_model_to_unity_catalog, analyze_covariate_impact,
     detect_flat_forecast, validate_forecast_reasonableness
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -168,6 +169,7 @@ class ProphetModelWrapper(mlflow.pyfunc.PythonModel):
 
         return result
 
+@log_io
 def _clean_numeric_string(series: pd.Series) -> pd.Series:
     """
     Clean numeric strings that may contain formatting characters.
@@ -189,6 +191,7 @@ def _clean_numeric_string(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors='coerce')
 
 
+@log_io
 def prepare_prophet_data(data: List[Dict[str, Any]], time_col: str, target_col: str, covariates: List[str]) -> pd.DataFrame:
     df = pd.DataFrame(data)
     prophet_df = pd.DataFrame()
@@ -219,6 +222,7 @@ def prepare_prophet_data(data: List[Dict[str, Any]], time_col: str, target_col: 
     # Do not drop NaNs here, as they may contain future covariates
     return prophet_df.sort_values('ds').reset_index(drop=True)
 
+@log_io
 def generate_prophet_training_code(
     time_col: str, target_col: str, covariates: List[str], horizon: int,
     frequency: str, best_params: Dict[str, Any], seasonality_mode: str,
@@ -277,6 +281,7 @@ random.seed({random_seed})
 SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
 
 
+@log_io
 def evaluate_param_set(params, country, covariates, train_df, test_df, time_col, target_col, experiment_id, parent_run_id, skip_mlflow_logging=False, custom_holidays_df=None, confidence_level=0.95):
     """
     Evaluate a single hyperparameter combination.
@@ -412,7 +417,8 @@ def evaluate_param_set(params, country, covariates, train_df, test_df, time_col,
             client.set_terminated(run_id, status="FAILED")
         return {"params": params, "metrics": None, "run_id": run_id, "status": "FAILED", "error": str(e)}
 
-def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None, forecast_start_date=None):
+@log_io
+def train_prophet_model(data, time_col, target_col, covariates, horizon, frequency, seasonality_mode="multiplicative", test_size=None, regressor_method='mean', country='US', random_seed=42, future_features=None, hyperparameter_filters=None, train_df_override=None, test_df_override=None, forecast_start_date=None, pipeline_trace=None):
     # Set global random seeds for reproducibility
     np.random.seed(random_seed)
     import random
@@ -500,6 +506,15 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
 
         logger.info(f"Merged dataframe now has {len(df)} rows (historical + future features).")
 
+        # TRACE: After future features merge
+        if pipeline_trace:
+            pipeline_trace.add_step("PROPHET_AFTER_FUTURE_MERGE", df, "y", "ds", covariates, {
+                "future_feature_rows": len(future_features),
+                "merged_total_rows": len(df),
+                "historical_rows": len(df[df['y'].notna()]),
+                "future_only_rows": len(df[df['y'].isna()]),
+            })
+
     original_covariates = covariates.copy() if covariates else []
     df = enhance_features_for_forecasting(
         df=df,
@@ -516,6 +531,16 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 covariates.append(col)
 
     logger.info(f"Preprocessing added {len(covariates) - len(original_covariates)} derived features: {[c for c in covariates if c not in original_covariates]}")
+
+    # TRACE: After feature engineering
+    if pipeline_trace:
+        pipeline_trace.add_step("PROPHET_AFTER_FEATURE_ENG", df, "y", "ds", covariates, {
+            "original_covariates": original_covariates,
+            "derived_features_added": [c for c in covariates if c not in original_covariates],
+            "total_covariates": len(covariates),
+            "total_columns": len(df.columns),
+            "all_columns": list(df.columns),
+        })
 
     history_df = df.dropna(subset=['y']).copy()
 
@@ -557,6 +582,16 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
 
     if lag_cols:
         logger.info(f"Filled NaN values with 0 in lag features: {lag_cols}")
+
+    # TRACE: Train data as fed to Prophet
+    if pipeline_trace:
+        pipeline_trace.add_step("PROPHET_TRAIN_INPUT", train_df, "y", "ds", covariates, {
+            "valid_covariates": covariates,
+            "train_rows": len(train_df),
+            "eval_rows": len(test_df),
+            "lag_features": lag_cols,
+            "n_covariates": len(covariates),
+        })
 
     # =========================================================================
     # BUILD CUSTOM HOLIDAYS DATAFRAME WITH MULTI-DAY EFFECT WINDOWS
@@ -874,22 +909,55 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         # Prophet with linear growth can produce extreme extrapolations if it detects
         # changepoints that cause steep trend changes. This is especially problematic
         # for financial data where negative values are impossible.
+        #
+        # We compare forecast against RECENT history (last 2*horizon periods) rather
+        # than full historical mean, which is fairer for data with strong trends.
         # ==========================================================================
-        historical_mean = history_df['y'].mean()
+        full_historical_mean = history_df['y'].mean()
         history_max_date = history_df['ds'].max()
         future_forecast = forecast[forecast['ds'] > history_max_date]
         forecast_mean = future_forecast['yhat'].mean() if len(future_forecast) > 0 else forecast['yhat'].mean()
         has_negative = (forecast['yhat'] < 0).any()
+
+        # Use recent history for trend-aware comparison
+        recent_window = min(2 * horizon, max(len(history_df) // 4, horizon))
+        recent_mean = history_df['y'].iloc[-recent_window:].mean()
+        historical_mean = recent_mean if recent_mean > 0 else full_historical_mean
+
         ratio = abs(forecast_mean / historical_mean) if historical_mean != 0 else 1.0
-        is_unreasonable = has_negative or (forecast_mean < 0) or (ratio > 5.0) or (ratio < 0.2)
+        full_ratio = abs(forecast_mean / full_historical_mean) if full_historical_mean != 0 else 1.0
+        is_unreasonable = has_negative or (forecast_mean < 0) or (ratio > 2.0) or (ratio < 0.5) or (full_ratio > 5.0)
         current_growth = best_params.get('growth', 'linear')
 
         # Debug logging for fallback decision
         logger.info(f"📊 Fallback decision check:")
         logger.info(f"   History max date: {history_max_date}, Future forecast rows: {len(future_forecast)}")
-        logger.info(f"   Historical mean: {historical_mean:,.0f}, Forecast mean: {forecast_mean:,.0f}")
-        logger.info(f"   Has negative: {has_negative}, Ratio: {ratio:.2f}, Current growth: {current_growth}")
-        logger.info(f"   is_unreasonable: {is_unreasonable}")
+        logger.info(f"   Full historical mean: {full_historical_mean:,.0f}, Recent mean ({recent_window} periods): {historical_mean:,.0f}")
+        logger.info(f"   Forecast mean: {forecast_mean:,.0f}")
+        logger.info(f"   Has negative: {has_negative}, Ratio (vs recent): {ratio:.2f}, Ratio (vs full): {full_ratio:.2f}")
+        logger.info(f"   Current growth: {current_growth}, is_unreasonable: {is_unreasonable}")
+
+        # ==========================================================================
+        # TREND SCALING: Dampen over-extrapolation before triggering full fallback
+        # ==========================================================================
+        # If forecast exceeds TREND_SCALE_THRESHOLD * recent mean, scale down
+        # to cap at that threshold. Preserves seasonality shape while dampening
+        # aggressive trends. Only applies when not already unreasonable.
+        # ==========================================================================
+        TREND_SCALE_THRESHOLD = 1.3
+        if not is_unreasonable and not has_negative and ratio > TREND_SCALE_THRESHOLD and historical_mean > 0:
+            target_mean = historical_mean * TREND_SCALE_THRESHOLD
+            scale_factor = target_mean / forecast_mean
+            logger.warning(f"📉 TREND SCALING: Prophet forecast {forecast_mean:,.0f} is {ratio:.2f}x recent mean ({historical_mean:,.0f})")
+            logger.warning(f"   Scaling forecast by {scale_factor:.3f} to cap at {TREND_SCALE_THRESHOLD}x recent mean")
+            logger.warning(f"   Before: mean={forecast_mean:,.0f}, After: mean={target_mean:,.0f}")
+            forecast.loc[forecast['ds'] > history_max_date, 'yhat'] *= scale_factor
+            forecast.loc[forecast['ds'] > history_max_date, 'yhat_lower'] *= scale_factor
+            forecast.loc[forecast['ds'] > history_max_date, 'yhat_upper'] *= scale_factor
+            # Recompute forecast_mean and ratio after scaling
+            future_forecast = forecast[forecast['ds'] > history_max_date]
+            forecast_mean = future_forecast['yhat'].mean()
+            ratio = abs(forecast_mean / historical_mean) if historical_mean != 0 else 1.0
 
         # ==========================================================================
         # MULTI-LEVEL FALLBACK STRATEGY
@@ -1020,6 +1088,48 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 final_has_negative = (forecast['yhat'] < 0).any()
                 logger.info(f"   ✅ Level 3 minimal: forecast mean: {final_forecast_mean:,.0f}")
                 logger.info(f"   ✅ Level 3 minimal: has negative: {final_has_negative}")
+
+        # ==========================================================================
+        # FLAT GROWTH LEVEL CORRECTION
+        # ==========================================================================
+        # Prophet with growth='flat' (whether chosen by grid search or by fallback)
+        # anchors the forecast near the overall historical mean. For series with
+        # genuine growth trends, this causes under-prediction because the overall
+        # mean is much lower than the recent level.
+        #
+        # Fix: When flat growth forecast is significantly below recent level,
+        # scale it up to match recent level. Preserves seasonality shape while
+        # correcting the level anchor.
+        #
+        # Based on the "damped trend" principle (Gardner & McKenzie, 1985):
+        # preserve recent level but dampen forward extrapolation.
+        # ==========================================================================
+        effective_growth = best_params.get('growth', 'linear')
+        if effective_growth == 'flat':
+            future_mask = forecast['ds'] > history_max_date
+            flat_forecast_mean = forecast[future_mask]['yhat'].mean() if future_mask.any() else 0
+
+            if flat_forecast_mean > 0 and historical_mean > 0:
+                level_gap_ratio = historical_mean / flat_forecast_mean
+
+                if level_gap_ratio > 1.10:
+                    # Flat forecast is significantly below recent level - restore it
+                    # Scale to recent mean (not above) to avoid re-introducing over-extrapolation
+                    restore_scale = historical_mean / flat_forecast_mean
+
+                    # Safety cap: never scale beyond 1.95x
+                    restore_scale = min(restore_scale, 1.95)
+
+                    logger.warning(f"📈 FLAT LEVEL CORRECTION: Flat growth forecast ({flat_forecast_mean:,.0f}) "
+                                   f"is {level_gap_ratio:.2f}x below recent level ({historical_mean:,.0f})")
+                    logger.warning(f"   Restoring by {restore_scale:.3f}x to match recent level")
+
+                    forecast.loc[future_mask, 'yhat'] *= restore_scale
+                    forecast.loc[future_mask, 'yhat_lower'] *= restore_scale
+                    forecast.loc[future_mask, 'yhat_upper'] *= restore_scale
+
+                    restored_mean = forecast[future_mask]['yhat'].mean()
+                    logger.warning(f"   After correction: forecast mean = {restored_mean:,.0f}")
 
         # Log model - CRITICAL: Use final_model (trained on full data), NOT best_model (trained only on train split)
         # Using best_model was causing negative predictions during holdout evaluation because:
@@ -1206,5 +1316,24 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             forecast_future['yhat_upper'] = forecast_future[['yhat', 'yhat_upper']].max(axis=1)
     
     covariate_impacts = analyze_covariate_impact(final_model, df, covariates)
-    
+
+    # TRACE: Prophet forecast output - final forecast values vs historical scale
+    if pipeline_trace:
+        fc_values = forecast_future['yhat'].values if 'yhat' in forecast_future.columns else []
+        hist_values = history_df['y'].values
+        pipeline_trace.add_step("PROPHET_FORECAST_OUTPUT", forecast_future, "yhat", time_col, covariates, {
+            "forecast_rows": len(forecast_future),
+            "forecast_mean": float(np.mean(fc_values)) if len(fc_values) > 0 else None,
+            "forecast_min": float(np.min(fc_values)) if len(fc_values) > 0 else None,
+            "forecast_max": float(np.max(fc_values)) if len(fc_values) > 0 else None,
+            "historical_mean": float(np.mean(hist_values)),
+            "historical_min": float(np.min(hist_values)),
+            "historical_max": float(np.max(hist_values)),
+            "forecast_to_history_ratio": float(np.mean(fc_values) / np.mean(hist_values)) if len(fc_values) > 0 and np.mean(hist_values) != 0 else None,
+            "best_params": {k: str(v) for k, v in best_params.items()},
+            "best_mape": best_metrics.get("mape"),
+            "fallback_level": "3-minimal" if best_params.get("minimal_model") else ("2-no-covariates" if best_params.get("covariates_dropped") else ("1-flat" if best_params.get("growth") == "flat" else "0-normal")),
+            "n_covariate_impacts": len(covariate_impacts),
+        })
+
     return parent_run_id, f"runs:/{parent_run_id}/model", best_metrics, validation_data.where(pd.notnull(validation_data), None).to_dict(orient='records'), forecast_future.where(pd.notnull(forecast_future), None).to_dict(orient='records'), best_artifact_uri, covariate_impacts

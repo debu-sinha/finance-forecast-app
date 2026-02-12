@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 import warnings
+from backend.utils.logging_utils import log_io
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ TRAINING_PRESETS = {
 }
 
 
+@log_io
 def get_preset_config(preset: Union[str, TrainingPreset]) -> Dict[str, Any]:
     """Get configuration for a training preset."""
     if isinstance(preset, str):
@@ -105,6 +107,7 @@ MIN_DATA_REQUIREMENTS = {
 }
 
 
+@log_io
 def check_data_quality(
     df: pd.DataFrame,
     date_col: str = 'ds',
@@ -283,6 +286,7 @@ class ForecastValidationResult:
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
+@log_io
 def validate_forecast(
     predictions: np.ndarray,
     historical_mean: float,
@@ -388,6 +392,7 @@ def validate_forecast(
     return result
 
 
+@log_io
 def validate_prediction_intervals(
     lower: np.ndarray,
     upper: np.ndarray,
@@ -449,6 +454,7 @@ class OverfittingReport:
     recommendations: List[str] = field(default_factory=list)
 
 
+@log_io
 def detect_overfitting(
     train_mape: float,
     eval_mape: float,
@@ -541,6 +547,7 @@ def detect_overfitting(
 # ENHANCED CROSS-VALIDATION (Nixtla, sktime patterns)
 # =============================================================================
 
+@log_io
 def weighted_temporal_cv_score(
     fold_scores: List[float],
     fold_weights: Optional[List[float]] = None,
@@ -583,6 +590,7 @@ def weighted_temporal_cv_score(
 # MODEL SELECTION FOR ENSEMBLE (AutoGluon patterns)
 # =============================================================================
 
+@log_io
 def select_models_for_ensemble(
     model_results: List[Dict[str, Any]],
     max_mape_ratio: float = 3.0,
@@ -696,10 +704,12 @@ def select_models_for_ensemble(
 # ENSEMBLE WEIGHTS (Multiple framework patterns)
 # =============================================================================
 
+@log_io
 def calculate_ensemble_weights(
     model_results: List[Dict[str, Any]],
     method: str = 'inverse_mape',
     min_weight: float = 0.05,
+    max_weight: float = 0.40,
     normalize: bool = True
 ) -> Dict[str, float]:
     """
@@ -716,6 +726,7 @@ def calculate_ensemble_weights(
         model_results: List of model results with 'model_name' and 'mape'
         method: Weighting method
         min_weight: Minimum weight for any model
+        max_weight: Maximum weight for any single model (prevents domination)
         normalize: Whether to normalize weights to sum to 1
 
     Returns:
@@ -775,10 +786,23 @@ def calculate_ensemble_weights(
     for name in weights:
         weights[name] = max(weights[name], min_weight)
 
-    # Normalize
+    # Normalize first pass
     if normalize:
         total = sum(weights.values())
         weights = {name: w / total for name, w in weights.items()}
+
+    # Apply maximum weight cap to prevent single-model domination
+    # A model with very low eval MAPE (e.g., 0.69%) can get 53% weight via
+    # inverse_mape, which contaminates the ensemble if the model over-extrapolates.
+    if max_weight < 1.0 and len(weights) > 1:
+        capped = False
+        for name in weights:
+            if weights[name] > max_weight:
+                weights[name] = max_weight
+                capped = True
+        if capped and normalize:
+            total = sum(weights.values())
+            weights = {name: w / total for name, w in weights.items()}
 
     return weights
 
@@ -787,6 +811,7 @@ def calculate_ensemble_weights(
 # FEATURE ENGINEERING (MLForecast patterns)
 # =============================================================================
 
+@log_io
 def create_lag_features(
     df: pd.DataFrame,
     target_col: str,
@@ -847,6 +872,7 @@ def create_lag_features(
 # MONTE CARLO PREDICTION INTERVALS (GluonTS pattern)
 # =============================================================================
 
+@log_io
 def generate_monte_carlo_intervals(
     point_forecasts: np.ndarray,
     residuals: np.ndarray,
@@ -904,6 +930,7 @@ class RegistrationValidation:
     reasons: List[str]
 
 
+@log_io
 def validate_for_registration(
     model_result: Dict[str, Any],
     metrics: Dict[str, float],
@@ -968,6 +995,7 @@ def validate_for_registration(
 # UTILITY FUNCTIONS
 # =============================================================================
 
+@log_io
 def log_automl_summary(
     data_quality: DataQualityReport,
     model_results: List[Dict[str, Any]],
