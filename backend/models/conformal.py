@@ -9,12 +9,14 @@ import numpy as np
 from typing import Dict, Any, Tuple, Optional
 import logging
 import warnings
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
 
+@log_io
 def calculate_conformal_intervals(
     residuals: np.ndarray,
     point_forecasts: np.ndarray,
@@ -57,6 +59,7 @@ def calculate_conformal_intervals(
     return lower, upper
 
 
+@log_io
 def calculate_asymmetric_conformal_intervals(
     residuals: np.ndarray,
     point_forecasts: np.ndarray,
@@ -102,6 +105,7 @@ def calculate_asymmetric_conformal_intervals(
     return lower, upper
 
 
+@log_io
 def calculate_growing_intervals(
     residuals: np.ndarray,
     point_forecasts: np.ndarray,
@@ -146,6 +150,7 @@ def calculate_growing_intervals(
     return lower, upper
 
 
+@log_io
 def add_conformal_intervals(
     validation_residuals: np.ndarray,
     forecast_df: pd.DataFrame,
@@ -199,6 +204,7 @@ def add_conformal_intervals(
     return forecast_df
 
 
+@log_io
 def evaluate_interval_coverage(
     actuals: np.ndarray,
     lower_bounds: np.ndarray,
@@ -253,6 +259,7 @@ def evaluate_interval_coverage(
     return results
 
 
+@log_io
 def calibrate_intervals(
     validation_actuals: np.ndarray,
     validation_predictions: np.ndarray,
@@ -339,6 +346,7 @@ class ConformalPredictor:
         self._scale = 1.0
         self._quantile_value = None
 
+    @log_io
     def fit(
         self,
         validation_actuals: np.ndarray,
@@ -381,6 +389,7 @@ class ConformalPredictor:
 
         return self
 
+    @log_io
     def predict_intervals(
         self,
         point_forecasts: np.ndarray
@@ -424,6 +433,7 @@ class ConformalPredictor:
 
         return lower, upper
 
+    @log_io
     def transform(self, forecast_df: pd.DataFrame) -> pd.DataFrame:
         """
         Add conformal intervals to a forecast DataFrame.

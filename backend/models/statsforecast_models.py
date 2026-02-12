@@ -20,6 +20,7 @@ from backend.models.utils import (
     compute_metrics, time_series_cross_validate, compute_prediction_intervals,
     detect_weekly_freq_code, detect_flat_forecast
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -158,6 +159,7 @@ class StatsForecastModelWrapper(mlflow.pyfunc.PythonModel):
         })
 
 
+@log_io
 def _prepare_statsforecast_data(
     train_df: pd.DataFrame,
     unique_id: str = 'series_1'
@@ -174,6 +176,7 @@ def _prepare_statsforecast_data(
     return sf_df.sort_values('ds').reset_index(drop=True)
 
 
+@log_io
 def train_statsforecast_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -223,7 +226,7 @@ def train_statsforecast_model(
         from statsforecast.models import AutoARIMA, AutoETS, AutoTheta
     except ImportError as e:
         raise ImportError(
-            "StatsForecast not installed. Install with: pip install statsforecast>=1.7.0"
+            f"StatsForecast import failed: {e}. Install/reinstall with: pip install statsforecast>=1.7.0"
         ) from e
 
     # Detect weekly frequency code for proper date alignment

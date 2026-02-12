@@ -8,6 +8,7 @@ from typing import Dict, Any, Tuple, List, Optional
 # from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, r2_score
 from scipy import stats
 from functools import lru_cache
+from backend.utils.logging_utils import log_io
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ _MAX_REASONABLE_MAPE = 500.0  # Above this indicates model failure
 _MIN_SAMPLE_SIZE = 3  # Minimum data points for meaningful metrics
 
 
+@log_io
 @lru_cache(maxsize=128)
 def _get_t_critical_value(n: int, confidence_level: float) -> float:
     """Cached t-distribution critical value computation."""
@@ -29,12 +31,14 @@ def _get_t_critical_value(n: int, confidence_level: float) -> float:
     return float(stats.t.ppf(1 - alpha / 2, df=max(1, n - 1)))
 
 
+@log_io
 @lru_cache(maxsize=32)
 def _get_z_critical_value(confidence_level: float) -> float:
     """Cached z-distribution critical value computation."""
     return float(stats.norm.ppf(1 - (1 - confidence_level) / 2))
 
 
+@log_io
 def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
     """
     Detect the appropriate weekly frequency code based on actual data.
@@ -71,6 +75,7 @@ def detect_weekly_freq_code(df: pd.DataFrame, frequency: str) -> str:
     return 'W-MON'
 
 
+@log_io
 def validate_weekly_alignment(
     df: pd.DataFrame,
     expected_freq_code: Optional[str] = None,
@@ -182,6 +187,7 @@ def validate_weekly_alignment(
     return n_misaligned == 0, df, diagnostics
 
 
+@log_io
 def align_forecast_dates_to_data(
     forecast_df: pd.DataFrame,
     historical_df: pd.DataFrame,
@@ -225,6 +231,7 @@ def align_forecast_dates_to_data(
 
     return fixed_forecast
 
+@log_io
 def safe_smape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -> float:
     """
     Compute Symmetric MAPE (SMAPE) - handles zero values gracefully.
@@ -253,6 +260,7 @@ def safe_smape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -
     return float(np.mean(smape))
 
 
+@log_io
 def safe_wape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -> float:
     """
     Compute Weighted Absolute Percentage Error (WAPE).
@@ -287,6 +295,7 @@ def safe_wape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) ->
     return float(np.clip(wape, 0, 500.0))
 
 
+@log_io
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) -> float:
     """
     Compute MAPE with protection against division by zero.
@@ -347,6 +356,7 @@ def safe_mape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-10) ->
     return mape
 
 
+@log_io
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     """
     Compute forecast accuracy metrics with robust handling.
@@ -430,6 +440,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     }
 
 
+@log_io
 def check_stationarity(
     series: np.ndarray,
     significance: float = 0.05
@@ -543,6 +554,7 @@ def check_stationarity(
     return result
 
 
+@log_io
 def time_series_cross_validate(
     y: np.ndarray,
     model_fit_fn,
@@ -619,6 +631,7 @@ def time_series_cross_validate(
         "n_splits": len(cv_scores)
     }
 
+@log_io
 def compute_prediction_intervals(
     y_train: np.ndarray,
     y_pred_train: np.ndarray,
@@ -658,6 +671,7 @@ def compute_prediction_intervals(
     return lower_bounds, upper_bounds
 
 
+@log_io
 def clip_forecast_non_negative(
     forecast_values: np.ndarray,
     lower_bounds: np.ndarray = None,
@@ -704,6 +718,7 @@ def clip_forecast_non_negative(
     return clipped_forecast, clipped_lower, clipped_upper
 
 
+@log_io
 def sanitize_forecast_output(
     forecast_df: pd.DataFrame,
     clip_negative: bool = True,
@@ -752,6 +767,7 @@ def sanitize_forecast_output(
     return df
 
 
+@log_io
 def register_model_to_unity_catalog(model_uri: str, model_name: str, tags: Optional[Dict[str, str]] = None) -> str:
     """Register a model to Unity Catalog with improved error handling"""
     try:
@@ -831,6 +847,7 @@ def register_model_to_unity_catalog(model_uri: str, model_name: str, tags: Optio
         logger.error(f"Model registration failed: {e}")
         return "0"
 
+@log_io
 def log_artifact_with_validation(artifact_path: str, artifact_dir: str, description: str) -> bool:
     """
     Log an artifact to MLflow with validation and detailed logging.
@@ -864,6 +881,7 @@ def log_artifact_with_validation(artifact_path: str, artifact_dir: str, descript
         return False
 
 
+@log_io
 def log_model_with_validation(
     model_name: str,
     artifact_path: str,
@@ -934,6 +952,7 @@ def log_model_with_validation(
         return False
 
 
+@log_io
 def validate_mlflow_run_artifacts(run_id: str) -> Dict[str, Any]:
     """
     Validate that all expected artifacts were logged to an MLflow run.
@@ -1030,6 +1049,7 @@ def validate_mlflow_run_artifacts(run_id: str) -> Dict[str, Any]:
         }
 
 
+@log_io
 def analyze_covariate_impact(
     model,  # Prophet model (type hint removed for lazy import)
     df: pd.DataFrame,
@@ -1089,6 +1109,7 @@ def analyze_covariate_impact(
     return impacts
 
 
+@log_io
 def compute_segment_mape_summary(
     segment_results: List[Dict[str, Any]],
     mape_threshold_good: float = 10.0,
@@ -1210,6 +1231,7 @@ def compute_segment_mape_summary(
     }
 
 
+@log_io
 def format_segment_mape_report(summary: Dict[str, Any]) -> str:
     """
     Format segment MAPE summary as a human-readable report.
@@ -1265,6 +1287,7 @@ def format_segment_mape_report(summary: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+@log_io
 def compute_data_quality_summary(
     df: pd.DataFrame,
     date_col: str = 'ds',
@@ -1418,6 +1441,7 @@ def compute_data_quality_summary(
     return summary
 
 
+@log_io
 def format_data_quality_report(summary: Dict[str, Any]) -> str:
     """
     Format data quality summary as a human-readable report.
@@ -1488,6 +1512,7 @@ def format_data_quality_report(summary: Dict[str, Any]) -> str:
 # DATA LEAKAGE DETECTION UTILITIES
 # =============================================================================
 
+@log_io
 def validate_train_test_separation(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1569,6 +1594,7 @@ def validate_train_test_separation(
     return result
 
 
+@log_io
 def validate_no_future_leakage(
     df: pd.DataFrame,
     target_col: str,
@@ -1662,6 +1688,7 @@ def validate_no_future_leakage(
     return result
 
 
+@log_io
 def assert_no_data_leakage(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1698,6 +1725,7 @@ def assert_no_data_leakage(
     return True
 
 
+@log_io
 def validate_forecast_output(
     forecast_df: pd.DataFrame,
     expected_horizon: int,
@@ -1832,6 +1860,7 @@ def validate_forecast_output(
 # RESIDUAL DIAGNOSTICS
 # =============================================================================
 
+@log_io
 def compute_residual_acf_diagnostics(
     residuals: np.ndarray,
     max_lags: int = 10,
@@ -1956,6 +1985,7 @@ def compute_residual_acf_diagnostics(
 # CONFORMAL PREDICTION INTERVALS
 # =============================================================================
 
+@log_io
 def compute_conformal_prediction_intervals(
     y_train: np.ndarray,
     y_pred_train: np.ndarray,
@@ -2057,6 +2087,7 @@ def compute_conformal_prediction_intervals(
     return lower_bounds, upper_bounds, diagnostics
 
 
+@log_io
 def validate_forecast_reasonableness(
     forecast_values: np.ndarray,
     historical_values: np.ndarray,
@@ -2147,6 +2178,7 @@ def validate_forecast_reasonableness(
 # FLAT FORECAST DETECTION
 # =============================================================================
 
+@log_io
 def detect_flat_forecast(
     forecast_values: np.ndarray,
     historical_values: np.ndarray,
@@ -2249,6 +2281,7 @@ def detect_flat_forecast(
     return result
 
 
+@log_io
 def get_fallback_arima_orders() -> List[Tuple[int, int, int]]:
     """
     Get fallback ARIMA orders known to produce non-flat forecasts.
@@ -2264,6 +2297,7 @@ def get_fallback_arima_orders() -> List[Tuple[int, int, int]]:
     ]
 
 
+@log_io
 def get_fallback_sarimax_orders() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]]:
     """
     Get fallback SARIMAX orders known to produce non-flat forecasts.
@@ -2279,6 +2313,7 @@ def get_fallback_sarimax_orders() -> List[Tuple[Tuple[int, int, int], Tuple[int,
     ]
 
 
+@log_io
 def get_fallback_ets_params() -> List[Tuple[Optional[str], Optional[str]]]:
     """
     Get fallback ETS parameters known to produce non-flat forecasts.

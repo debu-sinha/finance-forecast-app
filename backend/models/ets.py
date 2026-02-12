@@ -17,6 +17,7 @@ from backend.models.utils import (
     compute_metrics, time_series_cross_validate, compute_prediction_intervals,
     detect_weekly_freq_code, detect_flat_forecast, get_fallback_ets_params
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -87,6 +88,7 @@ class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
             'yhat_upper': forecast_values * 1.1
         })
 
+@log_io
 def generate_ets_training_code(
     params: Dict[str, Any], seasonal_periods: int, horizon: int, frequency: str,
     metrics: Dict[str, float], train_size: int, test_size: int
@@ -191,6 +193,7 @@ test_size = {test_size}
 '''
     return code
 
+@log_io
 def evaluate_ets_params(
     trend: Optional[str],
     seasonal: Optional[str],
@@ -265,6 +268,7 @@ def evaluate_ets_params(
         logger.warning(f"  ✗ ETS({trend}/{seasonal}) failed: {e}")
         return None
 
+@log_io
 def train_exponential_smoothing_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,

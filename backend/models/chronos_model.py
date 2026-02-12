@@ -21,6 +21,7 @@ import pickle
 from backend.models.utils import (
     compute_metrics, detect_weekly_freq_code, detect_flat_forecast, compute_prediction_intervals
 )
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -36,7 +37,7 @@ try:
     logger.info("Chronos foundation model is available")
 except ImportError as e:
     CHRONOS_ERROR = str(e)
-    logger.warning(f"Chronos not available: {e}. Using naive fallback.")
+    logger.warning(f"Chronos import failed: {e}. If version mismatch, try: pip install 'huggingface-hub<1.0'. Using naive fallback.")
 
 # Model size configurations
 _CHRONOS_MODELS = {
@@ -56,6 +57,7 @@ _CHRONOS_MODELS = {
 # }
 
 
+@log_io
 def _get_device():
     """Detect the best available device for Chronos inference."""
     if not CHRONOS_AVAILABLE:
@@ -76,6 +78,7 @@ def _get_device():
         return "cpu"
 
 
+@log_io
 def _naive_forecast(history: np.ndarray, horizon: int, confidence_level: float = 0.95) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate naive seasonal forecast when Chronos is not available.
 
@@ -163,6 +166,7 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
         self.confidence_level = confidence_level
         self._pipeline = None
 
+    @log_io
     def _load_pipeline(self):
         """Lazy load the Chronos pipeline."""
         if self._pipeline is not None:
@@ -269,6 +273,7 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
         })
 
 
+@log_io
 def train_chronos_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,

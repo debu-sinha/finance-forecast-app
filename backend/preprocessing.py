@@ -32,6 +32,8 @@ from functools import lru_cache
 from dataclasses import dataclass, field
 import logging
 
+from backend.utils.logging_utils import log_io
+
 try:
     import holidays
     HOLIDAYS_AVAILABLE = True
@@ -64,6 +66,7 @@ MIN_DATA_REQUIREMENTS = {
 }
 
 
+@log_io
 def validate_data_quality(
     df: pd.DataFrame,
     date_col: str = 'ds',
@@ -297,6 +300,7 @@ def validate_data_quality(
     return df, report
 
 
+@log_io
 def detect_incomplete_trailing_data(
     df: pd.DataFrame,
     date_col: str = 'ds',
@@ -416,6 +420,7 @@ def detect_incomplete_trailing_data(
 # DATA AGGREGATION FOR MULTI-DIMENSIONAL TIME SERIES
 # =============================================================================
 
+@log_io
 def aggregate_time_series(
     df: pd.DataFrame,
     date_col: str,
@@ -523,6 +528,7 @@ def aggregate_time_series(
     return df_agg, report
 
 
+@log_io
 def detect_dimension_columns(
     df: pd.DataFrame,
     date_col: str,
@@ -607,6 +613,7 @@ def detect_dimension_columns(
     }
 
 
+@log_io
 def prepare_data_with_aggregation(
     df: pd.DataFrame,
     date_col: str,
@@ -774,6 +781,7 @@ LAG_DATA_REQUIREMENTS = {
 }
 
 
+@log_io
 def validate_lag_data_sufficiency(
     n_rows: int,
     frequency: str,
@@ -826,6 +834,7 @@ def validate_lag_data_sufficiency(
     return result
 
 
+@log_io
 def get_thanksgiving_date(year: int) -> pd.Timestamp:
     """Get the date of Thanksgiving (4th Thursday of November) for a given year."""
     first_day = pd.Timestamp(year=year, month=11, day=1)
@@ -834,16 +843,19 @@ def get_thanksgiving_date(year: int) -> pd.Timestamp:
     return fourth_thursday
 
 
+@log_io
 def get_christmas_date(year: int) -> pd.Timestamp:
     """Get Christmas date for a given year."""
     return pd.Timestamp(year=year, month=12, day=25)
 
 
+@log_io
 def get_black_friday_date(year: int) -> pd.Timestamp:
     """Get Black Friday (day after Thanksgiving) for a given year."""
     return get_thanksgiving_date(year) + pd.Timedelta(days=1)
 
 
+@log_io
 def get_easter_date(year: int) -> pd.Timestamp:
     """
     Calculate Easter Sunday using the Anonymous Gregorian algorithm.
@@ -866,6 +878,7 @@ def get_easter_date(year: int) -> pd.Timestamp:
     return pd.Timestamp(year=year, month=month, day=day)
 
 
+@log_io
 def get_super_bowl_date(year: int) -> pd.Timestamp:
     """
     Get Super Bowl Sunday for a given year.
@@ -885,6 +898,7 @@ def get_super_bowl_date(year: int) -> pd.Timestamp:
     return first_sunday
 
 
+@log_io
 def get_all_key_holiday_dates(year: int) -> Dict[str, pd.Timestamp]:
     """
     Get all key holiday dates for a given year.
@@ -943,6 +957,7 @@ def get_all_key_holiday_dates(year: int) -> Dict[str, pd.Timestamp]:
     return holidays_dict
 
 
+@log_io
 def get_holiday_weeks_for_year(year: int, country: str = 'US') -> Dict[pd.Timestamp, str]:
     """
     Get a mapping of week start dates to holiday names for a given year.
@@ -982,6 +997,7 @@ def get_holiday_weeks_for_year(year: int, country: str = 'US') -> Dict[pd.Timest
     return week_holidays
 
 
+@log_io
 def _add_holiday_features(df: pd.DataFrame, date_col: str, frequency: str) -> List[str]:
     """
     Add holiday indicator features for both daily and weekly data.
@@ -1013,6 +1029,7 @@ def _add_holiday_features(df: pd.DataFrame, date_col: str, frequency: str) -> Li
     return _add_weekly_holiday_features(df, date_col)
 
 
+@log_io
 def _add_daily_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
     """
     Add comprehensive holiday features for daily data.
@@ -1145,6 +1162,7 @@ def _add_daily_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
     return added_cols
 
 
+@log_io
 def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
     """
     Add holiday week indicator features for weekly data.
@@ -1245,6 +1263,7 @@ def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
     return added_cols
 
 
+@log_io
 def _add_holiday_proximity_features(
     df: pd.DataFrame,
     date_col: str,
@@ -1341,6 +1360,7 @@ def _add_holiday_proximity_features(
     return added_cols
 
 
+@log_io
 def enhance_features_for_forecasting(
     df: pd.DataFrame,
     date_col: str = 'ds',
@@ -1396,6 +1416,7 @@ def enhance_features_for_forecasting(
     return result
 
 
+@log_io
 def _add_calendar_features(df: pd.DataFrame, date_col: str) -> None:
     """
     Add calendar features that help capture day/week/month patterns.
@@ -1430,6 +1451,7 @@ def _add_calendar_features(df: pd.DataFrame, date_col: str) -> None:
     logger.info("Added calendar features: day_of_week, is_weekend, month, quarter, day_of_month, week_of_year")
 
 
+@log_io
 def _add_trend_features(df: pd.DataFrame, date_col: str) -> None:
     """
     Add trend features that help tree-based models (XGBoost) capture trends.
@@ -1447,6 +1469,7 @@ def _add_trend_features(df: pd.DataFrame, date_col: str) -> None:
     logger.info("Added trend features: time_index, year")
 
 
+@log_io
 def _add_yoy_lag_features_if_available(
     df: pd.DataFrame,
     target_col: str,
@@ -1500,6 +1523,7 @@ def _add_yoy_lag_features_if_available(
     logger.info(f"Added YoY lag features: {lag_col}, {lag_col}_avg ({non_null_count} non-null values)")
 
 
+@log_io
 def get_derived_feature_columns(promo_cols: Optional[List[str]] = None) -> List[str]:
     """
     Get the list of derived feature column names that may be added.
@@ -1574,6 +1598,7 @@ def get_derived_feature_columns(promo_cols: Optional[List[str]] = None) -> List[
 
 
 @lru_cache(maxsize=32)
+@log_io
 def _build_prophet_holidays_cached(
     start_year: int,
     end_year: int,
@@ -1608,6 +1633,7 @@ def _build_prophet_holidays_cached(
     return tuple(holidays_list)
 
 
+@log_io
 def build_prophet_holidays_dataframe(
     start_year: int,
     end_year: int,
@@ -1651,6 +1677,7 @@ def build_prophet_holidays_dataframe(
     return holidays_df
 
 
+@log_io
 def prepare_future_features(
     future_df: pd.DataFrame,
     historical_df: pd.DataFrame,
@@ -1698,6 +1725,7 @@ def prepare_future_features(
     return result
 
 
+@log_io
 def _add_future_yoy_lags(
     future_df: pd.DataFrame,
     historical_df: pd.DataFrame,

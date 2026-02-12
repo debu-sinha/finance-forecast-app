@@ -12,6 +12,7 @@ import warnings
 import holidays
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from backend.models.utils import compute_metrics, compute_prediction_intervals, detect_weekly_freq_code
+from backend.utils.logging_utils import log_io
 
 warnings.filterwarnings('ignore')
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 SKIP_CHILD_RUNS = os.environ.get("MLFLOW_SKIP_CHILD_RUNS", "false").lower() == "true"
 
 
+@log_io
 def evaluate_xgboost_params(
     params: Dict[str, Any],
     X_train: pd.DataFrame,
@@ -139,6 +141,7 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
         self.training_data_length = training_data_length or len(last_known_values)
         self.training_start_date = training_start_date
 
+    @log_io
     def _create_calendar_features(self, df):
         """Create enhanced calendar features from date column"""
         df = df.copy()
@@ -290,6 +293,7 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
             'yhat_upper': upper_bounds
         })
 
+@log_io
 def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates: List[str] = None, include_lags: bool = True, frequency: str = 'daily') -> pd.DataFrame:
     """
     Create all features for XGBoost time series model including YoY lag features
@@ -400,6 +404,7 @@ def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates:
 
     return df
 
+@log_io
 def generate_xgboost_training_code(
     params: Dict[str, Any],
     feature_columns: List[str],
@@ -442,6 +447,7 @@ COVARIATES = {covariates}
 # =============================================================================
 # Feature Engineering Functions
 # =============================================================================
+@log_io
 def create_calendar_features(df):
     """Create calendar features from date column"""
     df = df.copy()
@@ -453,6 +459,7 @@ def create_calendar_features(df):
     df['quarter'] = df['ds'].dt.quarter
     return df
 
+@log_io
 def create_lag_features(df, target_col='y'):
     """Create lag and rolling features"""
     df = df.copy()
@@ -493,6 +500,7 @@ def create_lag_features(df, target_col='y'):
 '''
     return code
 
+@log_io
 def train_xgboost_model(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,

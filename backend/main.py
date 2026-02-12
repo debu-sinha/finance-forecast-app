@@ -23,11 +23,15 @@ from backend.schemas import (
     AggregateRequest, AggregateResponse, TestModelRequest, TestModelResponse,
     ModelTestResult, BatchDeployRequest, BatchDeployResponse, BatchSegmentInfo,
     DataAnalysisRequest, DataAnalysisResponse,
+    ForecastAdvisorRequest, ForecastAdvisorResponse,
+    HolidayAnalysisRequest, HolidayAnalysisResponse,
     # Multi-user architecture schemas
     SessionCreateRequest, SessionResponse, TrainAsyncRequest, TrainAsyncResponse,
     JobStatusResponse, JobResultsResponse, UserHistoryResponse, UserHistoryItem,
     ReproduceJobRequest, ReproduceJobResponse
 )
+from backend.utils.logging_utils import log_io, log_route_io_middleware
+from backend.utils.pipeline_trace import PipelineTrace, store_trace, get_latest_trace, list_trace_ids
 from backend.models.prophet import train_prophet_model, prepare_prophet_data
 from backend.models.arima import train_arima_model, train_sarimax_model
 from backend.models.ets import train_exponential_smoothing_model
@@ -134,17 +138,18 @@ except ImportError as e:
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, 'training.log')
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Create formatter
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # Root logger setup
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # Console handler (stdout)
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 console_handler.setFormatter(log_formatter)
 
 # File handler (writes to backend/logs/training.log)
@@ -156,6 +161,17 @@ file_handler.setFormatter(log_formatter)
 root_logger.addHandler(console_handler)
 root_logger.addHandler(file_handler)
 
+# Debug file handler (only created when LOG_LEVEL=DEBUG to avoid disk usage)
+if LOG_LEVEL == "DEBUG":
+    from logging.handlers import RotatingFileHandler
+    debug_log_file = os.path.join(LOG_DIR, 'debug.log')
+    debug_handler = RotatingFileHandler(
+        debug_log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(log_formatter)
+    root_logger.addHandler(debug_handler)
+
 logger = logging.getLogger(__name__)
 logger.info(f"📝 Logging to file: {LOG_FILE}")
 
@@ -164,6 +180,7 @@ if not AUTOML_UTILS_AVAILABLE:
     logger.warning(f"AutoML utilities not available: {_automl_import_error if '_automl_import_error' in dir() else 'unknown error'}")
 
 
+@log_io
 def truncate_log_file():
     """Truncate the log file to start fresh for a new training run."""
     global file_handler
@@ -187,6 +204,7 @@ def truncate_log_file():
         logger.warning(f"Could not truncate log file: {e}")
 
 
+@log_io
 def cleanup_temp_files_and_memory():
     """Clean up temp files and free memory to prevent 'too many open files' errors."""
     try:
@@ -212,6 +230,7 @@ def cleanup_temp_files_and_memory():
         logger.warning(f"Cleanup warning (non-fatal): {e}")
 
 
+@log_io
 def log_dataframe_summary(df, name: str, show_sample: bool = True):
     """Log a comprehensive summary of a DataFrame for debugging."""
     import pandas as pd
@@ -286,6 +305,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add request/response I/O logging middleware (active at DEBUG level only)
+log_route_io_middleware(app)
+
 # Mount static files
 static_dir = "dist" if os.path.exists("dist") else "../dist"
 if os.path.exists(static_dir):
@@ -344,6 +366,36 @@ async def health_check():
     except Exception as e:
         logger.debug(f"MLflow setup failed (expected in dev): {type(e).__name__}")
     return HealthResponse(**status_data)
+
+
+# =============================================================================
+# DEBUG / PIPELINE TRACE ENDPOINTS
+# =============================================================================
+
+@app.get("/api/debug/pipeline-trace")
+async def get_pipeline_trace_endpoint(trace_id: str = None):
+    """Retrieve the most recent pipeline trace, or a specific one by trace_id."""
+    trace_data = get_latest_trace(trace_id)
+    if not trace_data:
+        return {"error": "No pipeline traces available. Run a training first.", "available_traces": []}
+    return trace_data
+
+
+@app.get("/api/debug/pipeline-traces")
+async def list_pipeline_traces():
+    """List all stored pipeline trace IDs."""
+    return {"trace_ids": list_trace_ids()}
+
+
+@app.get("/api/debug/training-log")
+async def get_training_log(lines: int = 500):
+    """Return the last N lines of the training log file."""
+    try:
+        with open(LOG_FILE, 'r') as f:
+            all_lines = f.readlines()
+        return {"log": "".join(all_lines[-lines:]), "total_lines": len(all_lines)}
+    except FileNotFoundError:
+        return {"log": "", "total_lines": 0}
 
 
 # =============================================================================
@@ -878,6 +930,200 @@ async def detect_dimensions(request: dict):
         raise HTTPException(status_code=500, detail=f"Dimension detection failed: {str(e)}")
 
 
+@app.post("/api/forecast-advisor", response_model=ForecastAdvisorResponse)
+async def forecast_advisor(request: ForecastAdvisorRequest):
+    """
+    Smart Forecast Advisor — analyzes all data slices using research-backed
+    forecastability metrics (spectral entropy, STL-based trend/seasonal strength),
+    recommends model selection, training windows, and aggregation levels.
+
+    Call this before training to get data-driven recommendations across all slices.
+    """
+    try:
+        import pandas as pd
+        from backend.forecast_advisor import ForecastAdvisor
+
+        logger.info(
+            f"Forecast Advisor: {len(request.data)} rows, target={request.target_col}, "
+            f"dimensions={request.dimension_cols}"
+        )
+
+        df = pd.DataFrame(request.data)
+
+        if len(df) == 0:
+            raise HTTPException(status_code=400, detail="No data provided")
+
+        if request.time_col not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Time column '{request.time_col}' not found in data"
+            )
+        if request.target_col not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target column '{request.target_col}' not found in data"
+            )
+        for col in request.dimension_cols:
+            if col not in df.columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Dimension column '{col}' not found in data"
+                )
+
+        advisor = ForecastAdvisor()
+        result = advisor.analyze_all_slices(
+            df=df,
+            time_col=request.time_col,
+            target_col=request.target_col,
+            dimension_cols=request.dimension_cols,
+            frequency=request.frequency,
+            horizon=request.horizon,
+        )
+
+        # Convert dataclass result to response model
+        slice_analyses = []
+        for sa in result.slice_analyses:
+            slice_analyses.append({
+                "slice_name": sa.slice_name,
+                "filters": sa.filters,
+                "forecastability_score": sa.forecastability_score,
+                "grade": sa.grade.value,
+                "spectral_entropy": sa.spectral_entropy,
+                "trend_strength": sa.trend_strength,
+                "seasonal_strength": sa.seasonal_strength,
+                "total_growth_pct": sa.total_growth_pct,
+                "recent_growth_pct": sa.recent_growth_pct,
+                "data_quality": {
+                    "n_observations": sa.data_quality.n_observations,
+                    "has_sufficient_history": sa.data_quality.has_sufficient_history,
+                    "missing_pct": sa.data_quality.missing_pct,
+                    "gap_count": sa.data_quality.gap_count,
+                    "anomalous_week_count": sa.data_quality.anomalous_week_count,
+                    "anomalous_weeks": sa.data_quality.anomalous_weeks,
+                    "volume_level": sa.data_quality.volume_level,
+                    "weekly_mean": sa.data_quality.weekly_mean,
+                    "warnings": sa.data_quality.warnings,
+                },
+                "recommended_models": sa.recommended_models,
+                "excluded_models": sa.excluded_models,
+                "model_exclusion_reasons": sa.model_exclusion_reasons,
+                "recommended_training_window": sa.recommended_training_window,
+                "training_window_reason": sa.training_window_reason,
+                "expected_mape_range": list(sa.expected_mape_range),
+            })
+
+        agg_recs = []
+        for ar in result.aggregation_recommendations:
+            agg_recs.append({
+                "from_slices": ar.from_slices,
+                "to_slice": ar.to_slice,
+                "reason": ar.reason,
+                "combined_forecastability_score": ar.combined_forecastability_score,
+                "improvement_pct": ar.improvement_pct,
+            })
+
+        return ForecastAdvisorResponse(
+            slice_analyses=slice_analyses,
+            aggregation_recommendations=agg_recs,
+            summary=result.summary,
+            overall_data_quality=result.overall_data_quality,
+            total_slices=result.total_slices,
+            forecastable_slices=result.forecastable_slices,
+            problematic_slices=result.problematic_slices,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Forecast advisor failed: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Forecast advisor failed: {str(e)}")
+
+
+@app.post("/api/holiday-analysis", response_model=HolidayAnalysisResponse)
+async def holiday_analysis(request: HolidayAnalysisRequest):
+    """
+    Holiday and Event Impact Analysis — detects and quantifies holiday/event
+    impacts using STL remainder analysis, then matches anomalous weeks to known
+    holidays with impact quantification.
+
+    Call this before training to understand holiday effects in the data.
+    """
+    try:
+        import pandas as pd
+        from backend.holiday_analyzer import HolidayAnalyzer
+
+        logger.info(
+            f"Holiday Analysis: {len(request.data)} rows, target={request.target_col}"
+        )
+
+        df = pd.DataFrame(request.data)
+
+        if len(df) == 0:
+            raise HTTPException(status_code=400, detail="No data provided")
+
+        if request.time_col not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Time column '{request.time_col}' not found in data"
+            )
+        if request.target_col not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target column '{request.target_col}' not found in data"
+            )
+
+        analyzer = HolidayAnalyzer()
+        result = analyzer.analyze(
+            df=df,
+            time_col=request.time_col,
+            target_col=request.target_col,
+            frequency=request.frequency,
+            country=request.country,
+        )
+
+        # Convert dataclass result to response model
+        holiday_impacts = []
+        for hi in result.holiday_impacts:
+            holiday_impacts.append({
+                "holiday_name": hi.holiday_name,
+                "avg_lift_pct": hi.avg_lift_pct,
+                "consistency": hi.consistency,
+                "direction": hi.direction,
+                "confidence": hi.confidence,
+                "yearly_impacts": {str(k): v for k, v in hi.yearly_impacts.items()},
+                "recommendation": hi.recommendation,
+            })
+
+        anomalous_events = []
+        for ae in result.anomalous_events:
+            anomalous_events.append({
+                "week_date": ae.week_date,
+                "deviation_pct": ae.deviation_pct,
+                "direction": ae.direction,
+                "matched_holiday": ae.matched_holiday,
+                "is_recurring": ae.is_recurring,
+                "note": ae.note,
+            })
+
+        return HolidayAnalysisResponse(
+            holiday_impacts=holiday_impacts,
+            anomalous_events=anomalous_events,
+            summary=result.summary,
+            training_recommendations=result.training_recommendations,
+            detected_partial_weeks=result.detected_partial_weeks,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Holiday analysis failed: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Holiday analysis failed: {str(e)}")
+
+
 @app.post("/api/train", response_model=TrainResponse)
 async def train_model(request: TrainRequest):
     try:
@@ -887,11 +1133,31 @@ async def train_model(request: TrainRequest):
         if not request.batch_id:
             truncate_log_file()
 
+        # Initialize pipeline trace for debugging
+        trace = PipelineTrace(target_col=request.target_col, time_col=request.time_col)
+
         logger.info(f"")
         logger.info(f"{'#'*70}")
-        logger.info(f"#  NEW TRAINING RUN STARTED")
+        logger.info(f"#  NEW TRAINING RUN STARTED (trace_id={trace.trace_id})")
         logger.info(f"{'#'*70}")
         logger.info(f"Training request: target={request.target_col}, horizon={request.horizon}, data_rows={len(request.data)}")
+
+        # TRACE Step 0: Request parameters
+        trace.add_step("REQUEST_PARAMS", details={
+            "target_col": request.target_col,
+            "time_col": request.time_col,
+            "horizon": request.horizon,
+            "frequency": request.frequency,
+            "seasonality_mode": request.seasonality_mode,
+            "covariates": request.covariates or [],
+            "models": request.models,
+            "from_date": request.from_date,
+            "to_date": request.to_date,
+            "filters": request.filters or {},
+            "random_seed": request.random_seed,
+            "regressor_method": request.regressor_method,
+            "data_rows_received": len(request.data),
+        })
 
         # Log segment/filter info for batch training
         if request.filters:
@@ -910,6 +1176,10 @@ async def train_model(request: TrainRequest):
         # ========================================
         raw_input_df = pd.DataFrame(request.data)
         log_dataframe_summary(raw_input_df, "RAW INPUT DATA (from frontend)")
+
+        # TRACE Step 1: Raw input
+        trace.add_step("RAW_INPUT", raw_input_df, request.target_col, request.time_col,
+                        request.covariates, {"source": "frontend_payload"})
 
         # ========================================
         # DATA AGGREGATION (for multi-dimensional data)
@@ -960,6 +1230,15 @@ async def train_model(request: TrainRequest):
                 request.data = raw_input_df.to_dict(orient='records')
 
                 log_dataframe_summary(raw_input_df, "AGGREGATED DATA (after dimension aggregation)")
+
+                # TRACE Step 2: After aggregation
+                trace.add_step("AFTER_AGGREGATION", raw_input_df, request.target_col, request.time_col,
+                                request.covariates, {
+                                    "aggregation_method": request.aggregation.agg_method,
+                                    "group_by_cols": request.aggregation.group_by_cols,
+                                    "filter_dimensions": request.aggregation.filter_dimensions,
+                                    "aggregation_report_keys": list(aggregation_report.keys()) if aggregation_report else [],
+                                })
 
                 # Log incomplete data detection results
                 if aggregation_report.get('incomplete_detection', {}).get('n_dropped', 0) > 0:
@@ -1050,6 +1329,15 @@ async def train_model(request: TrainRequest):
         # ========================================
         log_dataframe_summary(df, "COMBINED/PROCESSED DATASET (after prepare_prophet_data)")
 
+        # TRACE Step 3: After prepare_prophet_data (column renaming, type conversion)
+        trace.add_step("AFTER_PREPARE_DATA", df, "y", "ds", safe_covariates, {
+            "original_time_col": request.time_col,
+            "original_target_col": request.target_col,
+            "renamed_to": {"time": "ds", "target": "y"},
+            "covariates_present": [c for c in safe_covariates if c in df.columns],
+            "covariates_missing": [c for c in safe_covariates if c not in df.columns],
+        })
+
         # Store pre-filter data for logging (shallow copy for logging only)
         pre_filter_df = df
 
@@ -1093,6 +1381,16 @@ async def train_model(request: TrainRequest):
         # ========================================
         log_dataframe_summary(df, f"DATE-FILTERED DATASET (from_date={request.from_date or 'N/A'}, to_date={effective_to_date})")
 
+        # TRACE Step 4: After date filtering
+        trace.add_step("AFTER_DATE_FILTER", df, "y", "ds", safe_covariates, {
+            "from_date": request.from_date or "(all)",
+            "to_date": request.to_date,
+            "effective_to_date": effective_to_date,
+            "rows_before_filter": original_len,
+            "rows_after_filter": len(df),
+            "rows_dropped": original_len - len(df),
+        })
+
         # ========================================
         # DATA QUALITY VALIDATION (AutoML Best Practices)
         # ========================================
@@ -1134,6 +1432,15 @@ async def train_model(request: TrainRequest):
             historical_mean = df['y'].mean()
             historical_std = df['y'].std()
             data_quality_report = None
+
+        # TRACE Step 5: After data quality validation
+        trace.add_step("AFTER_DATA_QUALITY", df, "y", "ds", safe_covariates, {
+            "quality_valid": data_quality_report.is_valid if data_quality_report else "N/A",
+            "quality_issues": data_quality_report.issues[:5] if data_quality_report and data_quality_report.issues else [],
+            "transformations_applied": data_quality_report.transformations_applied[:5] if data_quality_report and hasattr(data_quality_report, 'transformations_applied') and data_quality_report.transformations_applied else [],
+            "historical_mean": float(historical_mean) if historical_mean else None,
+            "historical_std": float(historical_std) if historical_std else None,
+        })
 
         # ========================================
         # CRITICAL: VALIDATE DATA IS SORTED BY DATE
@@ -1201,12 +1508,40 @@ async def train_model(request: TrainRequest):
         # Log TRAIN set details
         log_dataframe_summary(train_df, "TRAINING SET")
 
+        # TRACE Step 6: Train split
+        trace.add_step("TRAIN_SPLIT", train_df, "y", "ds", safe_covariates, {
+            "split_type": "train",
+            "total_rows": total_rows,
+            "train_rows": len(train_df),
+            "train_pct": round(len(train_df) / total_rows * 100, 1),
+            "date_start": str(train_df['ds'].min()) if len(train_df) > 0 else None,
+            "date_end": str(train_df['ds'].max()) if len(train_df) > 0 else None,
+        })
+
         # Log EVAL set details
         log_dataframe_summary(eval_df, "EVAL SET (hyperparameter tuning)")
+
+        # TRACE Step 7: Eval split
+        trace.add_step("EVAL_SPLIT", eval_df, "y", "ds", safe_covariates, {
+            "split_type": "eval",
+            "eval_rows": len(eval_df),
+            "eval_pct": round(len(eval_df) / total_rows * 100, 1),
+            "date_start": str(eval_df['ds'].min()) if len(eval_df) > 0 else None,
+            "date_end": str(eval_df['ds'].max()) if len(eval_df) > 0 else None,
+        })
 
         # Log HOLDOUT set details if exists
         if holdout_size > 0:
             log_dataframe_summary(holdout_df, "HOLDOUT SET (final model selection)")
+
+            # TRACE Step 8: Holdout split
+            trace.add_step("HOLDOUT_SPLIT", holdout_df, "y", "ds", safe_covariates, {
+                "split_type": "holdout",
+                "holdout_rows": len(holdout_df),
+                "holdout_pct": round(len(holdout_df) / total_rows * 100, 1),
+                "date_start": str(holdout_df['ds'].min()),
+                "date_end": str(holdout_df['ds'].max()),
+            })
 
         # Log the split points
         logger.info(f"")
@@ -1392,7 +1727,8 @@ async def train_model(request: TrainRequest):
                             request_hp_filters,
                             train_df_override=train_df,  # Pass pre-split data
                             test_df_override=test_df,    # Pass pre-split data
-                            forecast_start_date=to_date  # Forecast starts from user's to_date
+                            forecast_start_date=to_date,  # Forecast starts from user's to_date
+                            pipeline_trace=trace          # Pass pipeline trace for debugging
                         )
                         result = ModelResult(
                             model_type='prophet', model_name='Prophet (MLflow)', run_id=run_id,
@@ -1542,6 +1878,37 @@ async def train_model(request: TrainRequest):
                         completed_models += 1
                         logger.info(f"✅ {model_type.upper()} completed - MAPE: {metrics['mape']:.2f}%")
                         logger.info(f"📈 Progress: {completed_models}/{total_models} models completed")
+
+                        # TRACE Step 9: Per-model result
+                        fcst_values = [r.get('yhat', 0) for r in (result.forecast if isinstance(result.forecast, list) else [])]
+                        trace.add_step(f"MODEL_RESULT_{model_type.upper()}", train_df, "y", "ds", safe_covariates, {
+                            "model_name": result.model_name,
+                            "mape": metrics.get('mape'),
+                            "rmse": metrics.get('rmse'),
+                            "r2": metrics.get('r2'),
+                            "cv_mape": metrics.get('cv_mape'),
+                            "validation_rows": len(val) if isinstance(val, (list, pd.DataFrame)) else 0,
+                            "forecast_rows": len(fcst_values),
+                            "forecast_min": min(fcst_values) if fcst_values else None,
+                            "forecast_max": max(fcst_values) if fcst_values else None,
+                            "forecast_mean": sum(fcst_values) / len(fcst_values) if fcst_values else None,
+                            "historical_mean": float(train_df['y'].mean()),
+                            "forecast_vs_history_ratio": (sum(fcst_values) / len(fcst_values)) / max(float(train_df['y'].mean()), 1e-10) if fcst_values else None,
+                        })
+
+                        # Penalize models with flat forecasts to prevent selection as best
+                        try:
+                            fcst_records = result.forecast
+                            if isinstance(fcst_records, list) and len(fcst_records) > 1:
+                                from backend.models.utils import detect_flat_forecast
+                                yhat_vals = np.array([r.get('yhat', 0) for r in fcst_records])
+                                flat_info = detect_flat_forecast(yhat_vals, train_df['y'].values)
+                                if flat_info['is_flat']:
+                                    logger.warning(f"🚨 {result.model_name} produces flat forecast — penalizing for selection")
+                                    metrics['mape'] = metrics['mape'] + 1000.0
+                        except Exception as flat_err:
+                            logger.debug(f"Flat forecast check skipped for {model_type}: {flat_err}")
+
                         if metrics['mape'] < best_mape:
                             best_mape = metrics['mape']
                             best_model_name = result.model_name
@@ -1672,6 +2039,18 @@ async def train_model(request: TrainRequest):
 
                     model_results.append(ensemble_result)
                     logger.info(f"✅ Ensemble created with weights: {weights_str}")
+
+                    # TRACE Step 10: Ensemble
+                    ens_fcst_vals = [r.get('yhat', 0) for r in ensemble_fcst.to_dict('records')]
+                    trace.add_step("ENSEMBLE", train_df, "y", "ds", safe_covariates, {
+                        "n_models": len(ensemble_inputs),
+                        "weights": ensemble_info.get('weights', {}),
+                        "ensemble_mape": ensemble_metrics.get('mape'),
+                        "ensemble_rmse": ensemble_metrics.get('rmse'),
+                        "forecast_min": min(ens_fcst_vals) if ens_fcst_vals else None,
+                        "forecast_max": max(ens_fcst_vals) if ens_fcst_vals else None,
+                        "forecast_mean": sum(ens_fcst_vals) / len(ens_fcst_vals) if ens_fcst_vals else None,
+                    })
 
             except Exception as e:
                 logger.warning(f"Ensemble creation failed: {e}")
@@ -2073,7 +2452,26 @@ async def train_model(request: TrainRequest):
                 logger.error(error_detail)
                 raise HTTPException(status_code=500, detail=error_detail)
 
-        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data)
+        # TRACE Step 11: Final response
+        trace.add_step("FINAL_RESPONSE", details={
+            "best_model": best_model_name,
+            "best_mape": float(best_mape) if best_mape != float('inf') else None,
+            "n_models_returned": len(model_results),
+            "n_models_succeeded": len([r for r in model_results if r.run_id and r.metrics.mape != 'N/A']),
+            "n_models_failed": len([r for r in model_results if r.metrics.mape == 'N/A']),
+            "history_rows": len(history_data),
+            "model_summary": [{
+                "name": r.model_name,
+                "mape": r.metrics.mape,
+                "is_best": r.is_best,
+                "forecast_rows": len(r.forecast) if r.forecast else 0,
+            } for r in model_results],
+        })
+
+        # Store trace for retrieval via /api/debug/pipeline-trace
+        store_trace(trace)
+
+        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data, trace_id=trace.trace_id)
 
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
