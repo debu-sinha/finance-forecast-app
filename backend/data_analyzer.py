@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,6 +110,7 @@ class AnalysisResult:
     overall_recommendation: str
 
 
+@log_io
 def analyze_time_series(
     df: pd.DataFrame,
     time_col: str,
@@ -162,6 +165,7 @@ def analyze_time_series(
     return result
 
 
+@log_io
 def _analyze_characteristics(
     df: pd.DataFrame,
     time_col: str,
@@ -227,6 +231,7 @@ def _analyze_characteristics(
     return chars
 
 
+@log_io
 def _detect_frequency(df: pd.DataFrame, time_col: str) -> str:
     """Auto-detect the frequency of the time series."""
     if len(df) < 2:
@@ -249,6 +254,7 @@ def _detect_frequency(df: pd.DataFrame, time_col: str) -> str:
         return "irregular"
 
 
+@log_io
 def _check_for_gaps(df: pd.DataFrame, time_col: str, frequency: str) -> Tuple[bool, int]:
     """Check for missing time periods in the data."""
     if len(df) < 2:
@@ -271,6 +277,7 @@ def _check_for_gaps(df: pd.DataFrame, time_col: str, frequency: str) -> Tuple[bo
     return len(gaps) > 0, len(gaps)
 
 
+@log_io
 def _detect_trend(values: np.ndarray) -> Tuple[TrendType, float]:
     """Detect trend in the time series using linear regression."""
     if len(values) < 3:
@@ -311,6 +318,7 @@ def _detect_trend(values: np.ndarray) -> Tuple[TrendType, float]:
         return TrendType.FLAT, 0.0
 
 
+@log_io
 def _detect_seasonality(values: np.ndarray, frequency: str) -> Tuple[SeasonalityType, float]:
     """Detect seasonality using autocorrelation analysis."""
     if len(values) < 4:
@@ -357,6 +365,7 @@ def _detect_seasonality(values: np.ndarray, frequency: str) -> Tuple[Seasonality
         return SeasonalityType.NONE, 0.0
 
 
+@log_io
 def _detect_seasonality_mode(chars: DataCharacteristics) -> str:
     """
     Determine whether multiplicative or additive seasonality is more appropriate.
@@ -398,6 +407,7 @@ def _detect_seasonality_mode(chars: DataCharacteristics) -> str:
     return 'additive'
 
 
+@log_io
 def _detect_outliers(values: np.ndarray) -> Tuple[bool, float]:
     """Detect outliers using IQR method."""
     if len(values) < 4:
@@ -416,6 +426,7 @@ def _detect_outliers(values: np.ndarray) -> Tuple[bool, float]:
     return outlier_pct > 1, float(outlier_pct)
 
 
+@log_io
 def _check_autocorrelation(values: np.ndarray) -> Tuple[bool, float]:
     """Check for lag-1 autocorrelation."""
     if len(values) < 3:
@@ -434,6 +445,7 @@ def _check_autocorrelation(values: np.ndarray) -> Tuple[bool, float]:
         return False, 0.0
 
 
+@log_io
 def _calculate_quality(chars: DataCharacteristics) -> Tuple[DataQuality, float]:
     """Calculate overall data quality score."""
     score = 100.0
@@ -488,6 +500,7 @@ def _calculate_quality(chars: DataCharacteristics) -> Tuple[DataQuality, float]:
     return quality, score
 
 
+@log_io
 def _add_warnings(chars: DataCharacteristics) -> None:
     """Add relevant warnings based on characteristics."""
     if chars.n_observations < 52:
@@ -523,8 +536,14 @@ def _add_warnings(chars: DataCharacteristics) -> None:
         )
 
 
+@log_io
 def _generate_model_recommendations(chars: DataCharacteristics) -> List[ModelRecommendation]:
-    """Generate model recommendations based on data characteristics."""
+    """Generate model recommendations based on data characteristics.
+
+    Model defaults based on 12-slice benchmark testing (TOT_VOL + TOT_SUB,
+    Oct 2025 cutoff, 12-week horizon). ARIMA, SARIMAX, and XGBoost are disabled
+    by default due to reliability issues. See Forecast_Data_Quality_Analysis.md.
+    """
     recommendations = []
 
     # Prophet recommendation
@@ -558,6 +577,7 @@ def _generate_model_recommendations(chars: DataCharacteristics) -> List[ModelRec
     return recommendations
 
 
+@log_io
 def _recommend_prophet(chars: DataCharacteristics) -> ModelRecommendation:
     """Generate Prophet model recommendation."""
     confidence = 0.7  # Base confidence
@@ -599,65 +619,59 @@ def _recommend_prophet(chars: DataCharacteristics) -> ModelRecommendation:
     )
 
 
+@log_io
 def _recommend_arima(chars: DataCharacteristics) -> ModelRecommendation:
-    """Generate ARIMA model recommendation."""
-    confidence = 0.6  # Base confidence
-    reasons = []
+    """Generate ARIMA model recommendation.
+
+    Disabled by default based on 12-slice benchmark testing (TOT_VOL + TOT_SUB,
+    Oct 2025 cutoff, 12-week horizon). StatsForecast AutoARIMA provides equivalent
+    functionality with better reliability. ARIMA frequently fails or produces
+    degenerate (0,1,0) flat forecasts.
+    """
+    reasons = [
+        "Disabled by default: StatsForecast AutoARIMA provides equivalent "
+        "functionality with better reliability. ARIMA frequently fails or "
+        "produces degenerate (0,1,0) flat forecasts."
+    ]
     hp_filter = {}
 
-    # ARIMA works well with autocorrelated data
-    if chars.has_autocorrelation:
-        confidence += 0.2
-        reasons.append("Good autocorrelation structure for ARIMA")
-
-    # ARIMA needs sufficient data
+    # Keep hyperparameter logic for users who force-enable ARIMA
     if chars.n_observations < 30:
-        confidence -= 0.3
-        reasons.append("Too few observations for reliable ARIMA")
         hp_filter['max_p'] = 2
         hp_filter['max_q'] = 2
     elif chars.n_observations < 100:
         hp_filter['max_p'] = 3
         hp_filter['max_q'] = 3
 
-    # Stationary series work better with ARIMA
     if chars.trend_type != TrendType.FLAT:
-        hp_filter['d_values'] = [1, 2]  # Need differencing
-        reasons.append("Non-stationary trend detected - will use differencing")
-
-    # ARIMA is univariate - no covariates
-    reasons.append("ARIMA is univariate - external regressors not used")
-
-    recommended = confidence >= 0.5
+        hp_filter['d_values'] = [1, 2]
 
     return ModelRecommendation(
         model_name="ARIMA",
-        recommended=recommended,
-        confidence=min(1.0, max(0.0, confidence)),
-        reason="; ".join(reasons) if reasons else "Standard ARIMA recommendation",
+        recommended=False,
+        confidence=0.0,
+        reason="; ".join(reasons),
         hyperparameter_filter=hp_filter
     )
 
 
+@log_io
 def _recommend_sarimax(chars: DataCharacteristics) -> ModelRecommendation:
-    """Generate SARIMAX (Seasonal ARIMA with eXogenous variables) recommendation."""
-    confidence = 0.65  # Base confidence
-    reasons = []
+    """Generate SARIMAX (Seasonal ARIMA with eXogenous variables) recommendation.
+
+    Disabled by default based on 12-slice benchmark testing (TOT_VOL + TOT_SUB,
+    Oct 2025 cutoff, 12-week horizon). SARIMAX is numerically unstable and has
+    produced forecast explosions exceeding +/-100 billion in testing. Use Prophet
+    with covariates instead for seasonal modeling with exogenous variables.
+    """
+    reasons = [
+        "Disabled by default: numerically unstable — observed forecast explosions "
+        "exceeding +/-100 billion in benchmark testing. Use Prophet with covariates instead."
+    ]
     hp_filter = {}
 
-    # SARIMAX excels when you have external regressors (covariates)
-    # It's essentially ARIMA + ability to use external variables
-    reasons.append("SARIMAX supports external regressors (covariates)")
-
-    # Strong seasonality makes SARIMAX particularly valuable
-    if chars.seasonality_type in [SeasonalityType.STRONG, SeasonalityType.MODERATE]:
-        confidence += 0.15
-        reasons.append("Strong/moderate seasonality detected - SARIMAX can model this explicitly")
-
-    # SARIMAX needs reasonable data for seasonal components
+    # Keep hyperparameter logic for users who force-enable SARIMAX
     if chars.n_observations < 52:
-        confidence -= 0.15
-        reasons.append("Limited data may affect seasonal component estimation")
         hp_filter['p_values'] = [0, 1, 2]
         hp_filter['d_values'] = [0, 1]
         hp_filter['q_values'] = [0, 1]
@@ -666,27 +680,16 @@ def _recommend_sarimax(chars: DataCharacteristics) -> ModelRecommendation:
         hp_filter['d_values'] = [0, 1, 2]
         hp_filter['q_values'] = [0, 1, 2]
 
-    # SARIMAX handles trends well
-    if chars.trend_type != TrendType.FLAT:
-        confidence += 0.05
-        reasons.append("SARIMAX can model the detected trend with differencing")
-
-    # Strong autocorrelation is good for ARIMA-family models
-    if chars.has_autocorrelation:
-        confidence += 0.1
-        reasons.append("Time series autocorrelation suits SARIMAX modeling")
-
-    recommended = confidence >= 0.5
-
     return ModelRecommendation(
         model_name="SARIMAX",
-        recommended=recommended,
-        confidence=min(1.0, max(0.0, confidence)),
-        reason="; ".join(reasons) if reasons else "Standard SARIMAX recommendation",
+        recommended=False,
+        confidence=0.0,
+        reason="; ".join(reasons),
         hyperparameter_filter=hp_filter
     )
 
 
+@log_io
 def _recommend_ets(chars: DataCharacteristics) -> ModelRecommendation:
     """Generate ETS (Exponential Smoothing) recommendation."""
     confidence = 0.6  # Base confidence
@@ -730,49 +733,43 @@ def _recommend_ets(chars: DataCharacteristics) -> ModelRecommendation:
     )
 
 
+@log_io
 def _recommend_xgboost(chars: DataCharacteristics) -> ModelRecommendation:
-    """Generate XGBoost recommendation."""
-    confidence = 0.65  # Base confidence
-    reasons = []
+    """Generate XGBoost recommendation.
+
+    Disabled by default based on 12-slice benchmark testing (TOT_VOL + TOT_SUB,
+    Oct 2025 cutoff, 12-week horizon). XGBoost cannot extrapolate beyond the
+    training data range, causing systematic under-prediction on trending data
+    (-48% error observed). Use StatsForecast or Prophet for trend-following.
+    """
+    reasons = [
+        "Disabled by default: cannot extrapolate beyond training range, causing "
+        "systematic under-prediction on trending data (-48% error observed). "
+        "Use StatsForecast or Prophet for trends."
+    ]
     hp_filter = {}
 
-    # XGBoost needs enough data
+    # Keep hyperparameter logic for users who force-enable XGBoost
     if chars.n_observations < 100:
-        confidence -= 0.2
-        reasons.append("XGBoost typically needs more data for optimal performance")
         hp_filter['n_estimators'] = [50, 100]
         hp_filter['max_depth'] = [3]
     elif chars.n_observations > 500:
-        confidence += 0.15
-        reasons.append("Large dataset suits XGBoost well")
         hp_filter['n_estimators'] = [100, 200, 300]
         hp_filter['max_depth'] = [3, 5, 7]
 
-    # XGBoost handles complex patterns
-    if chars.has_outliers:
-        confidence += 0.1
-        reasons.append("XGBoost is robust to outliers")
-
-    # XGBoost with covariates
-    if chars.seasonality_type != SeasonalityType.NONE:
-        reasons.append("Calendar features will capture seasonality")
-
-    # High variance data
     if chars.cv > 1.0:
-        hp_filter['learning_rate'] = [0.05, 0.1]  # More conservative
-        reasons.append("High variance - using conservative learning rate")
-
-    recommended = confidence >= 0.5
+        hp_filter['learning_rate'] = [0.05, 0.1]
 
     return ModelRecommendation(
         model_name="XGBoost",
-        recommended=recommended,
-        confidence=min(1.0, max(0.0, confidence)),
-        reason="; ".join(reasons) if reasons else "Standard XGBoost recommendation",
+        recommended=False,
+        confidence=0.0,
+        reason="; ".join(reasons),
         hyperparameter_filter=hp_filter
     )
 
 
+@log_io
 def _recommend_statsforecast(chars: DataCharacteristics) -> ModelRecommendation:
     """Generate StatsForecast (AutoARIMA, AutoETS, AutoTheta) recommendation."""
     confidence = 0.75  # Base confidence - StatsForecast is generally reliable
@@ -827,6 +824,7 @@ def _recommend_statsforecast(chars: DataCharacteristics) -> ModelRecommendation:
     )
 
 
+@log_io
 def _recommend_chronos(chars: DataCharacteristics) -> ModelRecommendation:
     """Generate Chronos (Amazon's zero-shot foundation model) recommendation."""
     confidence = 0.70  # Base confidence - Chronos is a solid baseline
@@ -883,6 +881,7 @@ def _recommend_chronos(chars: DataCharacteristics) -> ModelRecommendation:
     )
 
 
+@log_io
 def _generate_hyperparameter_filters(chars: DataCharacteristics) -> Dict[str, Dict[str, Any]]:
     """Generate hyperparameter filters for all models."""
     filters = {}
@@ -1022,6 +1021,7 @@ def _generate_hyperparameter_filters(chars: DataCharacteristics) -> Dict[str, Di
     return filters
 
 
+@log_io
 def _generate_overall_recommendation(
     chars: DataCharacteristics,
     recommendations: List[ModelRecommendation]
@@ -1060,6 +1060,7 @@ def _generate_overall_recommendation(
     )
 
 
+@log_io
 def _log_analysis_summary(result: AnalysisResult) -> None:
     """Log a summary of the analysis."""
     chars = result.characteristics
@@ -1087,6 +1088,7 @@ def _log_analysis_summary(result: AnalysisResult) -> None:
     logger.info("=" * 60)
 
 
+@log_io
 def get_analysis_summary_for_ui(result: AnalysisResult) -> Dict[str, Any]:
     """
     Convert analysis result to a format suitable for the UI.
@@ -1140,6 +1142,7 @@ def get_analysis_summary_for_ui(result: AnalysisResult) -> Dict[str, Any]:
     }
 
 
+@log_io
 def _get_quality_description(quality: DataQuality) -> str:
     """Get a user-friendly description for data quality levels."""
     descriptions = {

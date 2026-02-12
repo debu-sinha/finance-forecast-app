@@ -64,7 +64,7 @@ class TrainRequest(BaseModel):
         return v
     test_size: Optional[int] = Field(default=None, description="Size of test set for validation")
     regressor_method: str = Field(default="mean", description="How to fill future covariates: 'mean', 'last_value', 'linear_trend'")
-    models: List[str] = Field(default=["prophet"], description="Models to train: 'prophet', 'arima', 'exponential_smoothing', 'sarimax', 'xgboost'")
+    models: List[str] = Field(default=["prophet"], description="Models to train. Recommended: 'prophet', 'exponential_smoothing', 'statsforecast', 'chronos'. Available but not recommended: 'arima', 'sarimax', 'xgboost' (see /api/analyze-data for reasons).")
     catalog_name: str = Field(default=os.getenv("UC_CATALOG_NAME", "main"), description="Unity Catalog catalog name")
     schema_name: str = Field(default=os.getenv("UC_SCHEMA_NAME", "default"), description="Unity Catalog schema name")
     model_name: str = Field(default=os.getenv("UC_MODEL_NAME_ONLY", "finance_forecast_model"), description="Model name in Unity Catalog")
@@ -190,6 +190,7 @@ class TrainResponse(BaseModel):
     best_model: str = Field(..., description="Best performing model name")
     artifact_uri: str = Field(..., description="MLflow artifact location")
     history: List[Dict[str, Any]] = Field(default=[], description="Historical data (actuals) used for training")
+    trace_id: Optional[str] = Field(default=None, description="Pipeline trace ID for debugging")
     
     class Config:
         json_schema_extra = {
@@ -479,6 +480,121 @@ class DataAnalysisResponse(BaseModel):
     notes: List[str] = Field(..., description="Additional notes")
     overallRecommendation: str = Field(..., description="Overall recommendation summary")
     hyperparameterFilters: Dict[str, Dict[str, Any]] = Field(..., description="Hyperparameter filters per model")
+
+
+# =============================================================================
+# SMART FORECAST ADVISOR SCHEMAS
+# =============================================================================
+
+class ForecastAdvisorRequest(BaseModel):
+    """Smart forecast advisor — analyzes all slices with research-backed metrics.
+
+    Uses spectral entropy (Goerg 2013), STL-based trend/seasonal strength
+    (Hyndman et al. 2015), and FFORMA-inspired feature profiling to score
+    forecastability, recommend models, training windows, and aggregations.
+    """
+    data: List[Dict[str, Any]] = Field(..., description="Full dataset with all dimensions")
+    time_col: str = Field(..., description="Date column name")
+    target_col: str = Field(..., description="Target column to forecast")
+    dimension_cols: List[str] = Field(..., description="Dimension columns to slice by (e.g., ['IS_CGNA', 'BUSINESS_SEGMENT', 'MX_TYPE'])")
+    frequency: str = Field(default="weekly", description="Data frequency: 'daily', 'weekly', 'monthly'")
+    horizon: int = Field(default=12, ge=1, le=52, description="Forecast horizon in periods")
+
+
+class DataQualityCheckResponse(BaseModel):
+    """Data quality assessment for a single slice (prerequisites, not forecastability)."""
+    n_observations: int = Field(..., description="Number of time series observations")
+    has_sufficient_history: bool = Field(..., description="Whether there's enough data (>= 104 weeks for weekly)")
+    missing_pct: float = Field(..., description="Percentage of missing values")
+    gap_count: int = Field(..., description="Number of gaps in the time series")
+    anomalous_week_count: int = Field(..., description="Number of detected anomalous weeks")
+    anomalous_weeks: List[str] = Field(default=[], description="ISO dates of anomalous weeks")
+    volume_level: str = Field(..., description="Volume classification: very_low, low, medium, high, very_high")
+    weekly_mean: float = Field(..., description="Mean weekly value")
+    warnings: List[str] = Field(default=[], description="Data quality warnings")
+
+
+class SliceAnalysisResponse(BaseModel):
+    """Forecastability analysis for a single data slice."""
+    slice_name: str = Field(..., description="Slice identifier (e.g., 'CGNA=1/Pickup/Enterprise')")
+    filters: Dict[str, str] = Field(..., description="Dimension filter values for this slice")
+    forecastability_score: float = Field(..., ge=0, le=100, description="Forecastability score 0-100 based on spectral entropy + STL features")
+    grade: str = Field(..., description="Grade: excellent, good, fair, poor, unforecastable")
+    spectral_entropy: float = Field(..., description="Spectral entropy 0-1 (lower = more forecastable)")
+    trend_strength: float = Field(..., description="STL trend strength 0-1")
+    seasonal_strength: float = Field(..., description="STL seasonal strength 0-1")
+    total_growth_pct: float = Field(..., description="Total growth % over training period")
+    recent_growth_pct: float = Field(..., description="Recent growth % (last 26 vs prior 26 weeks)")
+    data_quality: DataQualityCheckResponse = Field(..., description="Data quality assessment")
+    recommended_models: List[str] = Field(..., description="Models recommended for this slice")
+    excluded_models: List[str] = Field(..., description="Models excluded for this slice")
+    model_exclusion_reasons: Dict[str, str] = Field(default={}, description="Reason each model was excluded")
+    recommended_training_window: Optional[int] = Field(default=None, description="Recommended training window in weeks (None = use all)")
+    training_window_reason: str = Field(default="", description="Why this training window was recommended")
+    expected_mape_range: List[float] = Field(default=[], description="Expected MAPE range [low, high] based on forecastability")
+
+
+class AggregationRecommendationResponse(BaseModel):
+    """Recommendation to merge underperforming slices."""
+    from_slices: List[str] = Field(..., description="Slice names to merge")
+    to_slice: str = Field(..., description="Suggested combined slice name")
+    reason: str = Field(..., description="Why merging helps")
+    combined_forecastability_score: float = Field(..., description="Projected forecastability score after merging")
+    improvement_pct: float = Field(..., description="How much the score improves vs individual slices")
+
+
+class ForecastAdvisorResponse(BaseModel):
+    """Response from the smart forecast advisor."""
+    slice_analyses: List[SliceAnalysisResponse] = Field(..., description="Per-slice forecastability analysis")
+    aggregation_recommendations: List[AggregationRecommendationResponse] = Field(default=[], description="Recommendations to merge underperforming slices")
+    summary: str = Field(..., description="Human-readable summary of all findings")
+    overall_data_quality: str = Field(..., description="Overall data quality: excellent, good, fair, poor")
+    total_slices: int = Field(..., description="Total number of slices analyzed")
+    forecastable_slices: int = Field(..., description="Number of slices with score >= 40")
+    problematic_slices: int = Field(..., description="Number of slices with score < 40")
+
+
+# =============================================================================
+# HOLIDAY / EVENT ANALYSIS SCHEMAS
+# =============================================================================
+
+class HolidayAnalysisRequest(BaseModel):
+    """Request for holiday/event impact analysis using STL remainder decomposition."""
+    data: List[Dict[str, Any]] = Field(..., description="Time series data")
+    time_col: str = Field(..., description="Date column name")
+    target_col: str = Field(..., description="Target column to analyze")
+    frequency: str = Field(default="weekly", description="Data frequency")
+    country: str = Field(default="US", description="Country code for holiday calendar")
+
+
+class HolidayImpactResponse(BaseModel):
+    """Quantified impact of a known holiday on the time series."""
+    holiday_name: str = Field(..., description="Holiday name (e.g., 'Thanksgiving')")
+    avg_lift_pct: float = Field(..., description="Average % deviation from expected (positive = spike, negative = dip)")
+    consistency: float = Field(..., ge=0, le=1, description="How consistent the effect is across years (1 = identical every year)")
+    direction: str = Field(..., description="'increase' or 'decrease'")
+    confidence: str = Field(..., description="'high' (3+ years), 'medium' (2 years), 'low' (1 year)")
+    yearly_impacts: Dict[str, float] = Field(default={}, description="Per-year impact percentages")
+    recommendation: str = Field(default="", description="Actionable recommendation for training")
+
+
+class AnomalousEventResponse(BaseModel):
+    """An unexplained anomalous week detected in the time series."""
+    week_date: str = Field(..., description="ISO date of the anomalous week")
+    deviation_pct: float = Field(..., description="% deviation from STL expected value")
+    direction: str = Field(..., description="'spike' or 'dip'")
+    matched_holiday: Optional[str] = Field(default=None, description="Matched holiday name, if any")
+    is_recurring: bool = Field(default=False, description="Whether similar anomaly appears in same week across years")
+    note: str = Field(default="", description="Human-readable description")
+
+
+class HolidayAnalysisResponse(BaseModel):
+    """Response from holiday/event impact analysis."""
+    holiday_impacts: List[HolidayImpactResponse] = Field(default=[], description="Known holidays with measured impact")
+    anomalous_events: List[AnomalousEventResponse] = Field(default=[], description="Unexplained anomalous weeks")
+    summary: str = Field(..., description="Human-readable summary")
+    training_recommendations: List[str] = Field(default=[], description="Actionable recommendations for training configuration")
+    detected_partial_weeks: List[str] = Field(default=[], description="Weeks that appear to be partial data")
 
 
 # =============================================================================
