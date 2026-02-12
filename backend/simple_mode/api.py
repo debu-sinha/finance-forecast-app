@@ -20,10 +20,12 @@ from .data_profiler import DataProfiler, DataProfile
 from .autopilot_config import AutopilotConfig, ForecastConfig, generate_hyperparameter_filters
 from .forecast_explainer import ForecastExplainer, format_explanation_for_display
 from .excel_exporter import export_forecast_to_excel
+from backend.utils.logging_utils import log_io
 
 logger = logging.getLogger(__name__)
 
 
+@log_io
 def _sanitize_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
     """Sanitize float values to be JSON-compliant (no NaN or Inf)."""
     import math
@@ -38,6 +40,7 @@ def _sanitize_float(value: Any, default: Optional[float] = 0.0) -> Optional[floa
         return default
 
 
+@log_io
 def _sanitize_dict(d: Dict[str, Any], float_keys: List[str] = None) -> Dict[str, Any]:
     """Recursively sanitize dict values to be JSON-compliant."""
     import math
@@ -57,6 +60,7 @@ def _sanitize_dict(d: Dict[str, Any], float_keys: List[str] = None) -> Dict[str,
     return result
 
 
+@log_io
 def _sanitize_list(lst: List[Any]) -> List[Any]:
     """Recursively sanitize list values to be JSON-compliant."""
     import math
@@ -751,6 +755,7 @@ async def reproduce_forecast(run_id: str):
 
 # Helper functions
 
+@log_io
 def _parse_file(content: bytes, filename: str) -> pd.DataFrame:
     """Parse uploaded file into DataFrame."""
 
@@ -771,6 +776,7 @@ def _parse_file(content: bytes, filename: str) -> pd.DataFrame:
     return df
 
 
+@log_io
 def _clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean columns that contain comma-formatted numbers.
@@ -793,6 +799,7 @@ def _clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@log_io
 async def _run_forecast(
     df: pd.DataFrame,
     config: ForecastConfig,
@@ -1865,6 +1872,7 @@ async def _run_forecast(
     })
 
 
+@log_io
 def _select_models_for_data(profile: DataProfile, data_length: int) -> List[str]:
     """
     Select which models to train based on data characteristics.
@@ -1945,6 +1953,7 @@ def _select_models_for_data(profile: DataProfile, data_length: int) -> List[str]
     return models
 
 
+@log_io
 def _evaluate_on_holdout(
     result: Dict[str, Any],
     holdout_df: pd.DataFrame,
@@ -2099,6 +2108,7 @@ def _evaluate_on_holdout(
         return float(metrics.get('mape', 100.0))
 
 
+@log_io
 def _detect_forecast_anomalies(
     result: Dict[str, Any],
     historical_data: pd.DataFrame,
@@ -2290,6 +2300,7 @@ def _detect_forecast_anomalies(
     return anomalies
 
 
+@log_io
 def _generate_selection_reason(
     best_result: Optional[Dict[str, Any]],
     model_comparison: List[Dict[str, Any]]
@@ -2357,6 +2368,7 @@ def _generate_selection_reason(
     return " ".join(parts)
 
 
+@log_io
 def register_simple_mode_routes(app):
     """Register simple mode routes with the main FastAPI app."""
     app.include_router(router)

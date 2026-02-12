@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pandas
-numpy
+numpy<2.4  # numba (used by statsforecast) requires numpy<2.4
 prophet
 mlflow
 mlflow[databricks]
@@ -34,6 +34,7 @@ statsforecast>=1.7.0
 # Requires PyTorch. For GPU acceleration:
 # pip install torch --index-url https://download.pytorch.org/whl/cu118
 chronos-forecasting>=1.4.0
+huggingface-hub<1.0  # Required by chronos-forecasting; version >=1.0 is incompatible
 torch>=2.0.0
 
 # MAPIE - Conformal prediction intervals with coverage guarantees

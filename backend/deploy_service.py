@@ -7,8 +7,11 @@ from typing import Optional, Dict, Any
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import EndpointCoreConfigInput, ServedEntityInput, AutoCaptureConfigInput
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
+@log_io
 def get_databricks_client() -> WorkspaceClient:
     try:
         return WorkspaceClient()
@@ -18,6 +21,7 @@ def get_databricks_client() -> WorkspaceClient:
         if not host or not token: raise ValueError("DATABRICKS_HOST/TOKEN required")
         return WorkspaceClient(host=host, token=token)
 
+@log_io
 def deploy_model_to_serving(model_name: str, model_version: str, endpoint_name: str, workload_size: str = "Small", scale_to_zero: bool = True) -> Dict[str, Any]:
     try:
         client = get_databricks_client()
@@ -57,6 +61,7 @@ def deploy_model_to_serving(model_name: str, model_version: str, endpoint_name: 
         logger.error(f"Deployment failed: {e}")
         raise Exception(f"Failed to deploy: {str(e)}")
 
+@log_io
 def get_endpoint_status(endpoint_name: str) -> Dict[str, Any]:
     try:
         client = get_databricks_client()
@@ -65,6 +70,7 @@ def get_endpoint_status(endpoint_name: str) -> Dict[str, Any]:
     except Exception as e:
         return {"endpoint_name": endpoint_name, "state": "error", "error": str(e)}
 
+@log_io
 def delete_endpoint(endpoint_name: str) -> Dict[str, str]:
     try:
         get_databricks_client().serving_endpoints.delete(endpoint_name)
@@ -72,12 +78,14 @@ def delete_endpoint(endpoint_name: str) -> Dict[str, str]:
     except Exception as e:
         raise Exception(f"Failed to delete: {str(e)}")
 
+@log_io
 def invoke_endpoint(endpoint_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return {"predictions": get_databricks_client().serving_endpoints.query(name=endpoint_name, dataframe_records=[data]).predictions, "endpoint_name": endpoint_name}
     except Exception as e:
         raise Exception(f"Failed to invoke: {str(e)}")
 
+@log_io
 def list_endpoints() -> Dict[str, Any]:
     try:
         endpoints = [{"name": e.name, "state": e.state.config_update if e.state else "unknown", "creator": e.creator} for e in get_databricks_client().serving_endpoints.list()]
@@ -86,6 +94,7 @@ def list_endpoints() -> Dict[str, Any]:
         return {"endpoints": [], "count": 0, "error": str(e)}
 
 
+@log_io
 def test_model_inference(
     model_name: str,
     model_version: str,

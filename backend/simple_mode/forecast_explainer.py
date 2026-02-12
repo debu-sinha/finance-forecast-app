@@ -12,6 +12,8 @@ import pandas as pd
 import numpy as np
 import logging
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,6 +125,7 @@ class ForecastExplainer:
     Users can understand and explain every number.
     """
 
+    @log_io
     def explain(
         self,
         forecast_result: Dict[str, Any],
@@ -194,6 +197,7 @@ class ForecastExplainer:
             audit_trail=audit_trail,
         )
 
+    @log_io
     def _generate_summary(
         self, result: Dict[str, Any], config: Dict[str, Any]
     ) -> str:
@@ -238,6 +242,7 @@ All parameters were optimized for your specific data patterns."""
 
         return summary
 
+    @log_io
     def _decompose_forecast(self, result: Dict[str, Any]) -> ForecastComponents:
         """Break down forecast into explainable components like Excel formula."""
 
@@ -311,6 +316,7 @@ All parameters were optimized for your specific data patterns."""
             period_breakdown=period_breakdown,
         )
 
+    @log_io
     def _estimate_components(
         self, forecast_values: List[float], forecast_dates: List
     ) -> Tuple[List[float], List[float], List[float], List[float]]:
@@ -341,6 +347,7 @@ All parameters were optimized for your specific data patterns."""
 
         return base_values, trend_values, seasonal_values, holiday_values
 
+    @log_io
     def _calculate_holiday_effect_from_impacts(
         self,
         covariate_impacts: List[Dict[str, Any]],
@@ -387,6 +394,7 @@ All parameters were optimized for your specific data patterns."""
 
         return total_holiday_impact
 
+    @log_io
     def _generate_period_explanation(
         self, forecast: float, base: float, trend: float,
         seasonal: float, holiday: float
@@ -409,6 +417,7 @@ All parameters were optimized for your specific data patterns."""
 
         return " ".join(parts) + f" = ${forecast:,.0f}"
 
+    @log_io
     def _assess_confidence(
         self, result: Dict[str, Any], profile: Dict[str, Any]
     ) -> ConfidenceAssessment:
@@ -488,6 +497,7 @@ All parameters were optimized for your specific data patterns."""
             explanation=explanation,
         )
 
+    @log_io
     def _generate_caveats(
         self, result: Dict[str, Any], profile: Dict[str, Any]
     ) -> List[str]:
@@ -526,6 +536,7 @@ All parameters were optimized for your specific data patterns."""
 
         return caveats
 
+    @log_io
     def _build_audit_trail(
         self, result: Dict[str, Any], config: Dict[str, Any], profile: Dict[str, Any]
     ) -> AuditTrail:
@@ -567,6 +578,7 @@ All parameters were optimized for your specific data patterns."""
         )
 
 
+@log_io
 def format_explanation_for_display(explanation: ForecastExplanation) -> Dict[str, Any]:
     """Format explanation for frontend display."""
 

@@ -22,6 +22,7 @@ except ImportError:
 import pandas as pd
 
 from .forecast_explainer import ForecastExplanation
+from backend.utils.logging_utils import log_io
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class ExcelExporter:
         bottom=Side(style='thin')
     )
 
+    @log_io
     def export(
         self,
         forecast_result: Dict[str, Any],
@@ -109,6 +111,7 @@ class ExcelExporter:
 
         return output.getvalue()
 
+    @log_io
     def _add_summary_sheet(
         self, wb: Workbook, result: Dict[str, Any], explanation: ForecastExplanation,
         slice_forecasts: Optional[List[Dict[str, Any]]] = None
@@ -220,6 +223,7 @@ class ExcelExporter:
         ws.column_dimensions['C'].width = 15
         ws.column_dimensions['D'].width = 15
 
+    @log_io
     def _add_forecast_detail_sheet(self, wb: Workbook, explanation: ForecastExplanation):
         """
         Create detailed forecast sheet with formulas.
@@ -284,6 +288,7 @@ class ExcelExporter:
         for i, width in enumerate(widths, 1):
             ws.column_dimensions[chr(64 + i)].width = width
 
+    @log_io
     def _add_decomposition_sheet(self, wb: Workbook, explanation: ForecastExplanation):
         """Create component breakdown sheet with pie/bar visualization."""
 
@@ -338,6 +343,7 @@ class ExcelExporter:
         ws.column_dimensions['B'].width = 15
         ws.column_dimensions['C'].width = 12
 
+    @log_io
     def _add_confidence_sheet(self, wb: Workbook, explanation: ForecastExplanation):
         """Create confidence and quality assessment sheet."""
 
@@ -394,6 +400,7 @@ class ExcelExporter:
         ws.column_dimensions['B'].width = 12
         ws.column_dimensions['C'].width = 30
 
+    @log_io
     def _add_audit_sheet(self, wb: Workbook, audit_trail):
         """Create audit trail sheet for compliance."""
 
@@ -457,6 +464,7 @@ class ExcelExporter:
         ws.column_dimensions['A'].width = 18
         ws.column_dimensions['B'].width = 50
 
+    @log_io
     def _add_raw_data_sheet(self, wb: Workbook, data: pd.DataFrame):
         """Add raw input data sheet."""
 
@@ -491,6 +499,7 @@ class ExcelExporter:
                     pass
             ws.column_dimensions[column].width = min(max_length + 2, 30)
 
+    @log_io
     def _add_slice_forecast_sheet(self, wb: Workbook, slice_data: Dict[str, Any]):
         """
         Add individual slice forecast sheet.
@@ -644,6 +653,7 @@ class ExcelExporter:
         ws.column_dimensions['E'].width = 15
 
 
+@log_io
 def export_forecast_to_excel(
     forecast_result: Dict[str, Any],
     explanation: ForecastExplanation,

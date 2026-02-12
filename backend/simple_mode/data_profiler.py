@@ -13,6 +13,8 @@ from datetime import datetime, date
 import hashlib
 import logging
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,6 +129,7 @@ class DataProfiler:
         'fee', 'discount', 'price', 'budget', 'marketing'
     ]
 
+    @log_io
     def profile(self, df: pd.DataFrame) -> DataProfile:
         """
         Analyze data and generate complete profile.
@@ -422,6 +425,7 @@ class DataProfiler:
             incomplete_period_details=incomplete_details,
         )
 
+    @log_io
     def _detect_date_column(self, df: pd.DataFrame) -> str:
         """Detect the date column from data."""
 
@@ -457,6 +461,7 @@ class DataProfiler:
             "named 'date', 'ds', 'week_start', or similar."
         )
 
+    @log_io
     def _detect_frequency(self, df: pd.DataFrame, date_column: str) -> str:
         """Detect if data is daily, weekly, or monthly."""
 
@@ -483,6 +488,7 @@ class DataProfiler:
         else:
             return "monthly"  # Default for longer gaps
 
+    @log_io
     def _detect_target_column(self, df: pd.DataFrame, date_column: str) -> str:
         """
         Detect the target (value) column.
@@ -566,6 +572,7 @@ class DataProfiler:
         logger.info(f"[TARGET DETECTION] Fallback to highest variance: {best_fallback}")
         return best_fallback
 
+    @log_io
     def _get_date_range(
         self, df: pd.DataFrame, date_column: str
     ) -> Tuple[date, date]:
@@ -573,12 +580,14 @@ class DataProfiler:
         dates = pd.to_datetime(df[date_column])
         return (dates.min().date(), dates.max().date())
 
+    @log_io
     def _calculate_history_months(self, date_range: Tuple[date, date]) -> float:
         """Calculate how many months of history we have."""
         start, end = date_range
         days = (end - start).days
         return round(days / 30.44, 1)  # Average days per month
 
+    @log_io
     def _find_missing_periods(
         self, df: pd.DataFrame, date_column: str, frequency: str
     ) -> List[date]:
@@ -631,6 +640,7 @@ class DataProfiler:
         # Return all missing dates (sorted), we'll limit display elsewhere
         return sorted([d.date() for d in missing])
 
+    @log_io
     def _detect_outliers(
         self, df: pd.DataFrame, target_column: str
     ) -> List[Dict[str, Any]]:
@@ -659,6 +669,7 @@ class DataProfiler:
 
         return outliers[:10]  # Return first 10
 
+    @log_io
     def _analyze_holiday_coverage(
         self, df: pd.DataFrame, date_column: str, frequency: str
     ) -> Tuple[List[str], float]:
@@ -715,6 +726,7 @@ class DataProfiler:
 
         return list(set(found_holidays)), round(total_score, 1)
 
+    @log_io
     def _detect_patterns(
         self, df: pd.DataFrame, target_column: str, frequency: str
     ) -> Tuple[bool, bool, Optional[int]]:
@@ -755,6 +767,7 @@ class DataProfiler:
 
         return bool(has_trend), bool(has_seasonality), seasonality_period
 
+    @log_io
     def _find_covariate_columns(
         self, df: pd.DataFrame, date_column: str, target_column: str
     ) -> List[str]:
@@ -780,6 +793,7 @@ class DataProfiler:
 
         return covariates
 
+    @log_io
     def _detect_leaky_covariates(
         self, df: pd.DataFrame, target_column: str, covariate_columns: List[str],
         correlation_threshold: float = 0.90
@@ -857,6 +871,7 @@ class DataProfiler:
 
         return leaky_columns, correlation_details
 
+    @log_io
     def _calculate_quality_score(
         self, df: pd.DataFrame, target_column: str,
         missing_values: int, missing_periods: int, outlier_count: int,
@@ -908,6 +923,7 @@ class DataProfiler:
 
         return round(max(score, 0), 1)
 
+    @log_io
     def _generate_warnings(
         self, history_months: float, holiday_coverage: float,
         missing_values: int, missing_periods_list: List[date],
@@ -982,6 +998,7 @@ class DataProfiler:
 
         return warnings
 
+    @log_io
     def _recommend_horizon(self, frequency: str) -> int:
         """Recommend forecast horizon based on frequency."""
         defaults = {
@@ -991,6 +1008,7 @@ class DataProfiler:
         }
         return defaults.get(frequency, 12)
 
+    @log_io
     def _recommend_models(
         self, history_months: float, has_seasonality: bool, has_covariates: bool
     ) -> List[str]:
@@ -1015,6 +1033,7 @@ class DataProfiler:
 
         return models
 
+    @log_io
     def _compute_data_hash(self, df: pd.DataFrame) -> str:
         """Compute deterministic hash of input data for reproducibility."""
 
@@ -1027,6 +1046,7 @@ class DataProfiler:
         # Compute SHA256
         return hashlib.sha256(csv_string.encode()).hexdigest()[:16]
 
+    @log_io
     def _detect_future_rows(
         self,
         df: pd.DataFrame,
@@ -1171,6 +1191,7 @@ class DataProfiler:
 
         return count, date_range, True, is_valid, issues
 
+    @log_io
     def _detect_incomplete_final_period(
         self,
         df: pd.DataFrame,

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, Any, Optional, List
 
+from backend.utils.logging_utils import log_io
+
 from .job_state_store import JobStateStore, TrainingJob, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,7 @@ class JobDelegationService:
                 raise
         return self._workspace_client
 
+    @log_io
     async def create_job(
         self,
         user_id: str,
@@ -135,6 +138,7 @@ class JobDelegationService:
         logger.info(f"Created job {job.job_id} for user {user_id} with mode {training_mode}")
         return job
 
+    @log_io
     async def submit_job(self, job_id: str) -> TrainingJob:
         """
         Submit a pending job to the Databricks cluster.
@@ -198,6 +202,7 @@ class JobDelegationService:
         await self.state_store.save(job)
         return job
 
+    @log_io
     async def get_job_status(self, job_id: str) -> TrainingJob:
         """
         Get current job status, syncing with Databricks if running.
@@ -215,6 +220,7 @@ class JobDelegationService:
 
         return job
 
+    @log_io
     async def _sync_job_status(self, job: TrainingJob) -> None:
         """Sync job status with Databricks."""
         from databricks.sdk.service.jobs import RunLifeCycleState, RunResultState
@@ -259,6 +265,7 @@ class JobDelegationService:
         elif run.state.life_cycle_state in [RunLifeCycleState.PENDING, RunLifeCycleState.QUEUED]:
             job.current_step = "Waiting for cluster resources..."
 
+    @log_io
     async def _fetch_results(self, job: TrainingJob, run) -> Dict[str, Any]:
         """Fetch training results from the completed run."""
         results = {
@@ -280,6 +287,7 @@ class JobDelegationService:
 
         return results
 
+    @log_io
     async def cancel_job(self, job_id: str) -> TrainingJob:
         """Cancel a running or pending job."""
         job = await self.state_store.get(job_id)
@@ -308,6 +316,7 @@ class JobDelegationService:
         logger.info(f"Job {job.job_id} cancelled")
         return job
 
+    @log_io
     async def list_jobs(
         self,
         user_id: Optional[str] = None,
@@ -321,6 +330,7 @@ class JobDelegationService:
             limit=limit
         )
 
+    @log_io
     async def delete_job(self, job_id: str) -> None:
         """Delete a job from the state store."""
         job = await self.state_store.get(job_id)
@@ -330,6 +340,7 @@ class JobDelegationService:
         await self.state_store.delete(job_id)
         logger.info(f"Deleted job {job_id}")
 
+    @log_io
     async def sync_running_jobs(self) -> None:
         """
         Sync status of all running jobs with Databricks.
@@ -342,6 +353,7 @@ class JobDelegationService:
             except Exception as e:
                 logger.error(f"Failed to sync job {job.job_id}: {e}")
 
+    @log_io
     def _get_training_notebook_path(self, training_mode: str = "autogluon") -> str:
         """Get the path to the training notebook based on training mode."""
         try:
@@ -356,6 +368,7 @@ class JobDelegationService:
 _job_service: Optional[JobDelegationService] = None
 
 
+@log_io
 def get_job_service() -> JobDelegationService:
     """Get or create the singleton JobDelegationService instance."""
     global _job_service
@@ -368,6 +381,7 @@ def get_job_service() -> JobDelegationService:
     return _job_service
 
 
+@log_io
 def is_delegation_enabled() -> bool:
     """Check if cluster delegation is enabled."""
     return ENABLE_CLUSTER_DELEGATION and DEDICATED_CLUSTER_ID is not None

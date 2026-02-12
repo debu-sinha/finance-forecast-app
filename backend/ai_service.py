@@ -7,10 +7,13 @@ import json
 import logging
 from typing import Dict, Any, List
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 MODELS_TO_TRY = ['databricks-gpt-5-1', 'databricks-gemini-3-pro', 'databricks-meta-llama-3-3-70b-instruct']
 
+@log_io(log_result=False)
 def call_databricks_model(prompt: str, system_prompt: str = "You are a helpful assistant.", temperature: float = 0.3, max_tokens: int = 2000) -> Dict[str, Any]:
     from databricks.sdk import WorkspaceClient
     from mlflow.utils.databricks_utils import get_databricks_host_creds
@@ -64,6 +67,7 @@ def call_databricks_model(prompt: str, system_prompt: str = "You are a helpful a
     
     raise Exception(f"All models failed. Last error: {last_error}")
 
+@log_io
 def analyze_dataset(sample_data: List[Dict[str, Any]], columns: List[str]) -> Dict[str, Any]:
     try:
         def json_serial(obj):
@@ -91,6 +95,7 @@ def analyze_dataset(sample_data: List[Dict[str, Any]], columns: List[str]) -> Di
             "seasonality": "Unknown"
         }
 
+@log_io
 def generate_forecast_insights(data_summary, target_col, time_col, covariates, filters, seasonality_mode, winning_model, frequency) -> Dict[str, Any]:
     prompt = f"""
     Context: Forecasting results.
@@ -104,6 +109,7 @@ def generate_forecast_insights(data_summary, target_col, time_col, covariates, f
     except Exception:
         return {"explanation": f"Model: {winning_model}", "pythonCode": "# Prophet code\nmodel = Prophet()\nmodel.fit(df)"}
 
+@log_io
 def generate_executive_summary(best_model_name, best_model_metrics, all_models, target_col, time_col, covariates, forecast_horizon, frequency, actuals_comparison=None) -> str:
     # Format model comparison with full hyperparameter details and ranking
     sorted_models = sorted(all_models, key=lambda m: float(m['metrics']['mape']))

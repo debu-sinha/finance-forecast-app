@@ -51,6 +51,7 @@ import { EvaluationChart } from './components/EvaluationChart';
 import { ForecastTable } from './components/ForecastTable';
 import { CovariateImpactChart } from './components/CovariateImpactChart';
 import { TrainTestSplitViz } from './components/TrainTestSplitViz';
+import { logger } from './utils/logger';
 
 // Helper component for data preview
 const DataPreview = ({ data, title }: { data: DataRow[], title: string }) => {
@@ -439,7 +440,7 @@ const App = () => {
         localStorage.setItem('batchTrainingSummary', JSON.stringify(lightweightSummary));
         localStorage.setItem('batchSegmentCols', JSON.stringify(batchSegmentCols));
       } catch (e) {
-        console.error('Failed to save batch results to localStorage:', e);
+        logger.error('Failed to save batch results to localStorage:', e);
       }
     }
   }, [batchTrainingSummary, batchSegmentCols]);
@@ -496,38 +497,38 @@ const App = () => {
   const featureFileInputRef = useRef<HTMLInputElement>(null);
 
   const filteredByCategories = useMemo(() => {
-    console.log('Filter Debug - Stage 1 (Category Filters):');
-    console.log('  mergedData.length:', mergedData.length);
-    console.log('  Active filters:', filters);
+    logger.debug('Filter Debug - Stage 1 (Category Filters):');
+    logger.debug('  mergedData.length:', mergedData.length);
+    logger.debug('  Active filters:', filters);
 
     if (mergedData.length > 0) {
-      console.log('  Sample row from mergedData:', mergedData[0]);
-      console.log('  IS_CGNA type:', typeof mergedData[0].IS_CGNA, 'value:', mergedData[0].IS_CGNA);
-      console.log('  BUSINESS_SEGMENT type:', typeof mergedData[0].BUSINESS_SEGMENT, 'value:', mergedData[0].BUSINESS_SEGMENT);
-      console.log('  MX_TYPE type:', typeof mergedData[0].MX_TYPE, 'value:', mergedData[0].MX_TYPE);
+      logger.debug('  Sample row from mergedData:', mergedData[0]);
+      logger.debug('  IS_CGNA type:', typeof mergedData[0].IS_CGNA, 'value:', mergedData[0].IS_CGNA);
+      logger.debug('  BUSINESS_SEGMENT type:', typeof mergedData[0].BUSINESS_SEGMENT, 'value:', mergedData[0].BUSINESS_SEGMENT);
+      logger.debug('  MX_TYPE type:', typeof mergedData[0].MX_TYPE, 'value:', mergedData[0].MX_TYPE);
     }
 
     // First, filter out feature-only rows (rows where target column is undefined)
     // This happens when features file has dates that don't exist in main data
     const dataWithTarget = targetCol ? mergedData.filter(row => row[targetCol] !== undefined) : mergedData;
-    console.log('  After removing feature-only rows:', dataWithTarget.length);
+    logger.debug('  After removing feature-only rows:', dataWithTarget.length);
 
     // Debug: Count how many rows match each filter individually
     if (Object.keys(filters).length > 0) {
       Object.entries(filters).forEach(([key, val]) => {
         const matchCount = dataWithTarget.filter(row => String(row[key]) === val).length;
-        console.log(`  Rows matching ${key}='${val}':`, matchCount);
+        logger.debug(`  Rows matching ${key}='${val}':`, matchCount);
       });
 
       // Show all unique values for each filter column
       Object.keys(filters).forEach(key => {
         const uniqueVals = Array.from(new Set(dataWithTarget.map(row => String(row[key])))).slice(0, 10);
-        console.log(`  Unique values for ${key}:`, uniqueVals);
+        logger.debug(`  Unique values for ${key}:`, uniqueVals);
       });
     }
 
     if (Object.keys(filters).length === 0) {
-      console.log('  No category filters applied');
+      logger.debug('  No category filters applied');
       return dataWithTarget;
     }
 
@@ -541,22 +542,35 @@ const App = () => {
         const filterVal = val;
         const match = rowVal === filterVal;
         if (!match && row === dataWithTarget[0]) {
-          console.log(`  First row doesn't match: ${key} - row has "${rowVal}" (${typeof row[key]}), filter wants "${filterVal}"`);
+          logger.debug(`  First row doesn't match: ${key} - row has "${rowVal}" (${typeof row[key]}), filter wants "${filterVal}"`);
         }
         return match;
       });
       return matches;
     });
 
-    console.log('  filteredByCategories.length:', result.length);
+    logger.debug('  filteredByCategories.length:', result.length);
+
+    // [PIPELINE STEP F4] AFTER_CATEGORY_FILTER
+    console.group(`[PIPELINE STEP F4] AFTER_CATEGORY_FILTER`);
+    console.log(`  Rows: ${dataWithTarget.length} → ${result.length} (dropped ${dataWithTarget.length - result.length})`);
+    console.log(`  Filters applied:`, filters);
+    if (result.length > 0 && targetCol) {
+      const f4Vals = result.map(r => Number(r[targetCol]) || 0);
+      console.log(`  Target '${targetCol}' stats: min=${Math.min(...f4Vals).toLocaleString()}, max=${Math.max(...f4Vals).toLocaleString()}, mean=${(f4Vals.reduce((a, b) => a + b, 0) / f4Vals.length).toLocaleString()}`);
+    }
+    console.log(`  First 3:`, result.slice(0, 3));
+    console.log(`  Last 3:`, result.slice(-3));
+    console.groupEnd();
+
     return result;
   }, [mergedData, filters, targetCol]);
 
   const filteredData = useMemo(() => {
-    console.log('Filter Debug - Stage 2 (Date Range):');
-    console.log('  filteredByCategories.length:', filteredByCategories.length);
-    console.log('  trainingStartDate:', trainingStartDate);
-    console.log('  trainingEndDate:', trainingEndDate);
+    logger.debug('Filter Debug - Stage 2 (Date Range):');
+    logger.debug('  filteredByCategories.length:', filteredByCategories.length);
+    logger.debug('  trainingStartDate:', trainingStartDate);
+    logger.debug('  trainingEndDate:', trainingEndDate);
 
     if (!timeCol) return filteredByCategories;
 
@@ -573,15 +587,32 @@ const App = () => {
       return true;
     });
 
-    console.log('  filteredData.length:', result.length);
+    logger.debug('  filteredData.length:', result.length);
+
+    // [PIPELINE STEP F5] AFTER_DATE_FILTER
+    console.group(`[PIPELINE STEP F5] AFTER_DATE_FILTER`);
+    console.log(`  Rows: ${filteredByCategories.length} → ${result.length} (dropped ${filteredByCategories.length - result.length})`);
+    console.log(`  Date range filter: ${trainingStartDate || '(start)'} to ${trainingEndDate || '(end)'}`);
+    if (result.length > 0 && timeCol) {
+      const f5Dates = result.map(r => String(r[timeCol])).sort();
+      console.log(`  Actual date range: ${f5Dates[0]} to ${f5Dates[f5Dates.length - 1]}`);
+    }
+    if (result.length > 0 && targetCol) {
+      const f5Vals = result.map(r => Number(r[targetCol]) || 0);
+      console.log(`  Target '${targetCol}' stats: min=${Math.min(...f5Vals).toLocaleString()}, max=${Math.max(...f5Vals).toLocaleString()}, mean=${(f5Vals.reduce((a, b) => a + b, 0) / f5Vals.length).toLocaleString()}`);
+    }
+    console.log(`  First 3:`, result.slice(0, 3));
+    console.log(`  Last 3:`, result.slice(-3));
+    console.groupEnd();
+
     return result;
   }, [filteredByCategories, timeCol, trainingStartDate, trainingEndDate]);
 
   const aggregatedData = useMemo(() => {
     if (!timeCol || !targetCol || filteredData.length === 0) return [];
 
-    console.log('Aggregation Debug:');
-    console.log('  filteredData.length:', filteredData.length);
+    logger.debug('Aggregation Debug:');
+    logger.debug('  filteredData.length:', filteredData.length);
 
     // Detect if target column is an average-type column (should use mean instead of sum)
     const isAverageColumn = targetCol.toLowerCase().includes('avg') ||
@@ -589,7 +620,7 @@ const App = () => {
                             targetCol.toLowerCase().includes('mean') ||
                             targetCol.toLowerCase().includes('rate') ||
                             targetCol.toLowerCase().includes('ue');
-    console.log('  isAverageColumn:', isAverageColumn, '(target:', targetCol, ')');
+    logger.debug('  isAverageColumn:', isAverageColumn, '(target:', targetCol, ')');
 
     // Track both sum and count for proper averaging
     const groups = new Map<string, { row: DataRow; sum: number; count: number }>();
@@ -620,19 +651,37 @@ const App = () => {
       new Date(String(a[timeCol])).getTime() - new Date(String(b[timeCol])).getTime()
     );
 
-    console.log('  aggregatedData.length:', result.length);
-    console.log('  Unique dates:', groups.size);
-    console.log('  Aggregation method:', isAverageColumn ? 'AVERAGE' : 'SUM');
+    logger.debug('  aggregatedData.length:', result.length);
+    logger.debug('  Unique dates:', groups.size);
+    logger.debug('  Aggregation method:', isAverageColumn ? 'AVERAGE' : 'SUM');
 
     // Debug: Log sample aggregated values to verify scale
     if (result.length > 0) {
       const targetValues = result.slice(0, 5).map(r => r[targetCol]);
-      console.log('  Sample target values (first 5):', targetValues);
+      logger.debug('  Sample target values (first 5):', targetValues);
       const maxVal = Math.max(...result.map(r => Number(r[targetCol]) || 0));
       const minVal = Math.min(...result.map(r => Number(r[targetCol]) || 0));
       const avgVal = result.reduce((sum, r) => sum + (Number(r[targetCol]) || 0), 0) / result.length;
-      console.log(`  Target range: min=${minVal.toLocaleString()}, max=${maxVal.toLocaleString()}, avg=${avgVal.toLocaleString()}`);
+      logger.debug(`  Target range: min=${minVal.toLocaleString()}, max=${maxVal.toLocaleString()}, avg=${avgVal.toLocaleString()}`);
     }
+
+    // [PIPELINE STEP F6] AFTER_AGGREGATION
+    console.group(`[PIPELINE STEP F6] AFTER_AGGREGATION`);
+    console.log(`  Rows: ${filteredData.length} → ${result.length}`);
+    console.log(`  Method: ${isAverageColumn ? 'MEAN' : 'SUM'}`);
+    console.log(`  Unique dates: ${groups.size}`);
+    if (result.length > 0) {
+      const f6Vals = result.map(r => Number(r[targetCol]) || 0);
+      const f6Sum = f6Vals.reduce((a, b) => a + b, 0);
+      console.log(`  Target '${targetCol}' stats: min=${Math.min(...f6Vals).toLocaleString()}, max=${Math.max(...f6Vals).toLocaleString()}, mean=${(f6Sum / f6Vals.length).toLocaleString()}, sum=${f6Sum.toLocaleString()}`);
+      const f6Dates = result.map(r => String(r[timeCol])).sort();
+      console.log(`  Date range: ${f6Dates[0]} to ${f6Dates[f6Dates.length - 1]}`);
+      const f6MultiCount = Array.from(groups.values()).filter(g => g.count > 1).length;
+      console.log(`  Dates with multiple rows aggregated: ${f6MultiCount}`);
+    }
+    console.log(`  First 3:`, result.slice(0, 3));
+    console.log(`  Last 3:`, result.slice(-3));
+    console.groupEnd();
 
     return result;
   }, [filteredData, timeCol, targetCol]);
@@ -753,12 +802,24 @@ const App = () => {
       const text = evt.target?.result as string;
       const parsedData = parseCSV(text);
       if (parsedData.length > 0) {
-        console.log('📁 MAIN FILE UPLOAD:');
-        console.log('  Total rows:', parsedData.length);
-        console.log('  First row:', parsedData[0]);
-        console.log('  IS_CGNA:', parsedData[0].IS_CGNA, '(type:', typeof parsedData[0].IS_CGNA, ')');
-        console.log('  BUSINESS_SEGMENT:', parsedData[0].BUSINESS_SEGMENT, '(type:', typeof parsedData[0].BUSINESS_SEGMENT, ')');
-        console.log('  MX_TYPE:', parsedData[0].MX_TYPE, '(type:', typeof parsedData[0].MX_TYPE, ')');
+        logger.debug('📁 MAIN FILE UPLOAD:');
+        logger.debug('  Total rows:', parsedData.length);
+        logger.debug('  First row:', parsedData[0]);
+        logger.debug('  IS_CGNA:', parsedData[0].IS_CGNA, '(type:', typeof parsedData[0].IS_CGNA, ')');
+        logger.debug('  BUSINESS_SEGMENT:', parsedData[0].BUSINESS_SEGMENT, '(type:', typeof parsedData[0].BUSINESS_SEGMENT, ')');
+        logger.debug('  MX_TYPE:', parsedData[0].MX_TYPE, '(type:', typeof parsedData[0].MX_TYPE, ')');
+
+        // [PIPELINE STEP F1] MAIN_FILE_PARSED
+        console.group(`[PIPELINE STEP F1] MAIN_FILE_PARSED`);
+        console.log(`  Rows: ${parsedData.length}`);
+        const f1Cols = Object.keys(parsedData[0]);
+        console.log(`  Columns (${f1Cols.length}): ${f1Cols.join(', ')}`);
+        console.log(`  fileName: ${file.name}`);
+        const f1NumCols = f1Cols.filter(c => typeof parsedData[0][c] === 'number' || !isNaN(Number(parsedData[0][c])));
+        console.log(`  Numeric columns: ${f1NumCols.join(', ')}`);
+        console.log(`  First 3:`, parsedData.slice(0, 3));
+        console.log(`  Last 3:`, parsedData.slice(-3));
+        console.groupEnd();
 
         setMainData(parsedData);
         const cols = Object.keys(parsedData[0]);
@@ -790,6 +851,18 @@ const App = () => {
       const text = evt.target?.result as string;
       const parsedData = parseCSV(text);
       if (parsedData.length > 0) {
+        // [PIPELINE STEP F2] FEATURE_FILE_PARSED
+        console.group(`[PIPELINE STEP F2] FEATURE_FILE_PARSED`);
+        console.log(`  Rows: ${parsedData.length}`);
+        const f2Cols = Object.keys(parsedData[0]);
+        console.log(`  Columns (${f2Cols.length}): ${f2Cols.join(', ')}`);
+        console.log(`  fileName: ${file.name}`);
+        const f2DateRange = parsedData.map(r => String(r[f2Cols[0]]));
+        console.log(`  Date range: ${f2DateRange[0]} to ${f2DateRange[f2DateRange.length - 1]}`);
+        console.log(`  First 3:`, parsedData.slice(0, 3));
+        console.log(`  Last 3:`, parsedData.slice(-3));
+        console.groupEnd();
+
         setFeatureData(parsedData);
         const cols = Object.keys(parsedData[0]);
         setFeatureColumns(cols);
@@ -887,7 +960,7 @@ const App = () => {
       filteredActuals = actualsData.filter(row => {
         return activeFilters.every(([col, val]) => String(row[col]) === val);
       });
-      console.log(`Applied ${activeFilters.length} filters: ${filteredActuals.length} rows (from ${actualsData.length})`);
+      logger.debug(`Applied ${activeFilters.length} filters: ${filteredActuals.length} rows (from ${actualsData.length})`);
     }
 
     if (filteredActuals.length === 0) {
@@ -988,7 +1061,7 @@ const App = () => {
 
       // Warn about duplicates
       if (duplicateDates.length > 0) {
-        console.warn(`Found ${duplicateDates.length} duplicate dates in actuals - values were summed. First few: ${duplicateDates.slice(0, 3).join(', ')}`);
+        logger.warn(`Found ${duplicateDates.length} duplicate dates in actuals - values were summed. First few: ${duplicateDates.slice(0, 3).join(', ')}`);
       }
 
       // Build a map of training data covariates by date for context lookup
@@ -1042,14 +1115,14 @@ const App = () => {
 
       // Parse forecast dates
       let parsedForecastDates: string[] = [];
-      console.log('Raw forecast data (first 3):', forecast.slice(0, 3));
-      console.log('timeCol is:', timeCol);
+      logger.debug('Raw forecast data (first 3):', forecast.slice(0, 3));
+      logger.debug('timeCol is:', timeCol);
 
       // Check which date column exists in forecast data
       const firstRow = forecast[0];
       const hasDs = firstRow?.ds !== undefined;
       const hasTimeCol = firstRow?.[timeCol] !== undefined;
-      console.log('Forecast date columns: ds=', hasDs, ', [', timeCol, ']=', hasTimeCol);
+      logger.debug('Forecast date columns: ds=', hasDs, ', [', timeCol, ']=', hasTimeCol);
 
       forecast.forEach(fcstRow => {
         // The date field might be 'ds' or the original timeCol name
@@ -1069,11 +1142,11 @@ const App = () => {
         }
       });
 
-      console.log('Actuals Comparison Debug:');
-      console.log('  Actuals dates (first 5):', parsedActualDates.slice(0, 5));
-      console.log('  Forecast dates (first 5):', parsedForecastDates.slice(0, 5));
-      console.log('  Actuals count:', actualsMap.size);
-      console.log('  Forecast count:', forecast.length);
+      logger.debug('Actuals Comparison Debug:');
+      logger.debug('  Actuals dates (first 5):', parsedActualDates.slice(0, 5));
+      logger.debug('  Forecast dates (first 5):', parsedForecastDates.slice(0, 5));
+      logger.debug('  Actuals count:', actualsMap.size);
+      logger.debug('  Forecast count:', forecast.length);
 
       // Match forecasts with actuals
       forecast.forEach(fcstRow => {
@@ -1097,7 +1170,7 @@ const App = () => {
 
           // Debug: Log first few comparisons to verify data integrity
           if (comparisonRows.length < 3) {
-            console.log(`Comparison ${comparisonRows.length + 1}: date=${dateKey}, actual=${actual}, predicted=${predicted}, yhat_raw=${fcstRow.yhat}`);
+            logger.debug(`Comparison ${comparisonRows.length + 1}: date=${dateKey}, actual=${actual}, predicted=${predicted}, yhat_raw=${fcstRow.yhat}`);
           }
 
           const error = actual - predicted;
@@ -1173,7 +1246,7 @@ const App = () => {
 
       setActualsComparison(result);
     } catch (err) {
-      console.error('Error comparing actuals:', err);
+      logger.error('Error comparing actuals:', err);
       alert('Error comparing actuals with forecast. Please check the file format.');
     } finally {
       setIsComparingActuals(false);
@@ -1245,7 +1318,7 @@ const App = () => {
         executiveSummary: summary
       } : null);
     } catch (error) {
-      console.error('Failed to regenerate executive summary:', error);
+      logger.error('Failed to regenerate executive summary:', error);
       alert('Failed to regenerate executive summary. Please try again.');
     } finally {
       setIsGeneratingSummary(false);
@@ -1361,12 +1434,30 @@ const App = () => {
 
     setMergedData(finalData);
 
-    console.log('MERGE DEBUG:');
-    console.log('  mainData.length:', mainData.length);
-    console.log('  First 3 rows of mainData:', mainData.slice(0, 3));
-    console.log('  mergedData.length:', finalData.length);
-    console.log('  First 3 rows of mergedData:', finalData.slice(0, 3));
-    console.log('  Last 3 rows of mergedData:', finalData.slice(-3));
+    logger.debug('MERGE DEBUG:');
+    logger.debug('  mainData.length:', mainData.length);
+    logger.debug('  First 3 rows of mainData:', mainData.slice(0, 3));
+    logger.debug('  mergedData.length:', finalData.length);
+    logger.debug('  First 3 rows of mergedData:', finalData.slice(0, 3));
+    logger.debug('  Last 3 rows of mergedData:', finalData.slice(-3));
+
+    // [PIPELINE STEP F3] AFTER_MERGE
+    console.group(`[PIPELINE STEP F3] AFTER_MERGE`);
+    console.log(`  Main rows: ${mainData.length}, Feature rows: ${featureData.length}`);
+    console.log(`  Merged rows: ${finalData.length}`);
+    const f3MatchCount = featureData.length > 0 ? finalData.filter(r => {
+      const d = parseFlexibleDate(String(r[mainDateCol]));
+      return d && featureMap.has(d.toISOString().split('T')[0]);
+    }).length : 0;
+    console.log(`  Rows matched with features: ${f3MatchCount}`);
+    console.log(`  Rows zero-filled (no match): ${featureData.length > 0 ? finalData.length - f3MatchCount : 0}`);
+    const f3MergedCols = finalData.length > 0 ? Object.keys(finalData[0]) : [];
+    const f3FeatureColsAdded = f3MergedCols.filter(c => !mainColumns.includes(c));
+    console.log(`  Feature columns added: ${f3FeatureColsAdded.join(', ')}`);
+    console.log(`  All columns (${f3MergedCols.length}): ${f3MergedCols.join(', ')}`);
+    console.log(`  First 3:`, finalData.slice(0, 3));
+    console.log(`  Last 3:`, finalData.slice(-3));
+    console.groupEnd();
 
     // Use all available columns from both datasets to ensure dropdowns are complete
     // even if the first row of merged data (e.g. a future row) is missing some columns
@@ -1387,7 +1478,14 @@ const App = () => {
 
     if (result.suggestedTimeColumn) setTimeCol(result.suggestedTimeColumn);
     if (result.suggestedTargetColumn) setTargetCol(result.suggestedTargetColumn);
-    if (result.suggestedCovariates) setCovariates(result.suggestedCovariates);
+    if (result.suggestedCovariates) {
+      // When a feature/promo file is provided, only auto-select covariates from that file
+      const externalCols = featureColumns.filter(c => c !== featureDateCol);
+      const filtered = externalCols.length > 0
+        ? result.suggestedCovariates.filter((c: string) => externalCols.includes(c))
+        : result.suggestedCovariates;
+      setCovariates(filtered);
+    }
     if (result.suggestedGroupColumns) setGroupCols(result.suggestedGroupColumns);
 
     setIsAnalyzing(false);
@@ -1424,7 +1522,7 @@ const App = () => {
       errors.push(`Insufficient data: ${aggregatedData.length} rows available, but need more than ${horizon} rows for a ${horizon}-period forecast.`);
     } else if (aggregatedData.length > 0 && aggregatedData.length < horizon + 10) {
       // Still allow but warn - this is marginal
-      console.warn(`⚠️ Limited data: ${aggregatedData.length} rows for ${horizon}-period forecast. Consider reducing horizon for better model accuracy.`);
+      logger.warn(`⚠️ Limited data: ${aggregatedData.length} rows for ${horizon}-period forecast. Consider reducing horizon for better model accuracy.`);
     }
 
     // Check for missing values in target column
@@ -1471,9 +1569,9 @@ const App = () => {
       );
       setDataAnalysis(result);
       setShowDataAnalysis(true);
-      console.log('📊 Data analysis result:', result);
+      logger.debug('📊 Data analysis result:', result);
     } catch (error) {
-      console.error('Data analysis failed:', error);
+      logger.error('Data analysis failed:', error);
     } finally {
       setIsAnalyzingData(false);
     }
@@ -1505,7 +1603,7 @@ const App = () => {
   };
 
   const handleTrainModel = async () => {
-    console.log('🚀 handleTrainModel called!');
+    logger.debug('🚀 handleTrainModel called!');
 
     // Clear previous errors
     setTrainingError(null);
@@ -1513,13 +1611,13 @@ const App = () => {
 
     // Validate before training
     const errors = validateTrainingData();
-    console.log('📋 Validation errors:', errors);
+    logger.debug('📋 Validation errors:', errors);
     if (errors.length > 0) {
       setValidationErrors(errors);
-      console.log('❌ Training blocked by validation errors');
+      logger.debug('❌ Training blocked by validation errors');
       return;
     }
-    console.log('✅ Validation passed, starting training...');
+    logger.debug('✅ Validation passed, starting training...');
 
     setStep(AppStep.TRAINING);
     setIsTraining(true);
@@ -1548,6 +1646,22 @@ const App = () => {
       });
       return cleanRow;
     });
+
+    // [PIPELINE STEP F7] CLEAN_HISTORY_EXTRACTED
+    console.group(`[PIPELINE STEP F7] CLEAN_HISTORY_EXTRACTED`);
+    console.log(`  Rows: ${cleanHistoryData.length}`);
+    const f7Cols = cleanHistoryData.length > 0 ? Object.keys(cleanHistoryData[0]) : [];
+    console.log(`  Columns (${f7Cols.length}): ${f7Cols.join(', ')}`);
+    console.log(`  Covariates included: ${covariates.join(', ') || '(none)'}`);
+    if (cleanHistoryData.length > 0) {
+      const f7Vals = cleanHistoryData.map(r => Number(r[targetCol]) || 0);
+      console.log(`  Target '${targetCol}' stats: min=${Math.min(...f7Vals).toLocaleString()}, max=${Math.max(...f7Vals).toLocaleString()}, mean=${(f7Vals.reduce((a, b) => a + b, 0) / f7Vals.length).toLocaleString()}`);
+      const f7Dates = cleanHistoryData.map(r => String(r[timeCol])).sort();
+      console.log(`  Date range: ${f7Dates[0]} to ${f7Dates[f7Dates.length - 1]}`);
+    }
+    console.log(`  First 3:`, cleanHistoryData.slice(0, 3));
+    console.log(`  Last 3:`, cleanHistoryData.slice(-3));
+    console.groupEnd();
 
     try {
       const modelDisplayNames: Record<string, string> = {
@@ -1600,9 +1714,9 @@ const App = () => {
           return cleanRow;
         });
 
-      console.log('🔮 Future Features Extracted:');
-      console.log('  Sending ALL feature data rows:', futureFeatures.length);
-      console.log('  Sample future row:', futureFeatures[0]);
+      logger.debug('🔮 Future Features Extracted:');
+      logger.debug('  Sending ALL feature data rows:', futureFeatures.length);
+      logger.debug('  Sample future row:', futureFeatures[0]);
 
       // Check for Black Friday specifically
       const blackFridayRows = futureFeatures.filter(row => {
@@ -1611,20 +1725,54 @@ const App = () => {
         const dateStr = parsedDate.toISOString().split('T')[0];
         return dateStr.includes('11-2') && row['Black Friday'] === 1; // November dates with Black Friday
       });
-      console.log('  Black Friday rows in features:', blackFridayRows.length);
+      logger.debug('  Black Friday rows in features:', blackFridayRows.length);
       if (blackFridayRows.length > 0) {
-        console.log('  Black Friday dates:', blackFridayRows.map(r => {
+        logger.debug('  Black Friday dates:', blackFridayRows.map(r => {
           const d = parseFlexibleDate(String(r[timeCol]));
           return d ? d.toISOString().split('T')[0] : 'invalid';
         }));
       }
 
+      // [PIPELINE STEP F8] FUTURE_FEATURES_EXTRACTED
+      console.group(`[PIPELINE STEP F8] FUTURE_FEATURES_EXTRACTED`);
+      console.log(`  Rows: ${futureFeatures.length}`);
+      if (futureFeatures.length > 0) {
+        const f8Cols = Object.keys(futureFeatures[0]);
+        console.log(`  Columns (${f8Cols.length}): ${f8Cols.join(', ')}`);
+        const f8Dates = futureFeatures.map(r => {
+          const d = parseFlexibleDate(String(r[timeCol]));
+          return d ? d.toISOString().split('T')[0] : 'invalid';
+        }).sort();
+        console.log(`  Date range: ${f8Dates[0]} to ${f8Dates[f8Dates.length - 1]}`);
+      } else {
+        console.log(`  No future features (feature file not loaded or empty)`);
+      }
+      console.log(`  First 3:`, futureFeatures.slice(0, 3));
+      console.log(`  Last 3:`, futureFeatures.slice(-3));
+      console.groupEnd();
 
       // Pass hyperparameter filters from data analysis to reduce model search space
       const hyperparameterFilters = dataAnalysis?.hyperparameterFilters || undefined;
       if (hyperparameterFilters) {
-        console.log('📊 Using data-driven hyperparameter filters:', Object.keys(hyperparameterFilters));
+        logger.debug('📊 Using data-driven hyperparameter filters:', Object.keys(hyperparameterFilters));
       }
+
+      // [PIPELINE STEP F9] API_PAYLOAD
+      console.group(`[PIPELINE STEP F9] API_PAYLOAD`);
+      console.log(`  History rows: ${cleanHistoryData.length}`);
+      console.log(`  Time col: ${timeCol}, Target col: ${targetCol}`);
+      console.log(`  Covariates: ${covariates.join(', ') || '(none)'}`);
+      console.log(`  Horizon: ${horizon}, Frequency: ${frequency}`);
+      console.log(`  Models: ${selectedModels.join(', ')}`);
+      console.log(`  Seasonality: ${seasonalityMode}, Regressor: ${regressorMethod}`);
+      console.log(`  Date range: ${trainingStartDate || '(start)'} to ${trainingEndDate || '(end)'}`);
+      console.log(`  Random seed: ${randomSeed}`);
+      console.log(`  Future features rows: ${futureFeatures.length}`);
+      console.log(`  Filters:`, filters);
+      console.log(`  HP filters:`, hyperparameterFilters || '(none)');
+      const f9PayloadSize = JSON.stringify(cleanHistoryData).length + JSON.stringify(futureFeatures).length;
+      console.log(`  Approx payload size: ${(f9PayloadSize / 1024).toFixed(1)} KB`);
+      console.groupEnd();
 
       const backendResponse = await trainModelOnBackend(
         cleanHistoryData,
@@ -1651,27 +1799,46 @@ const App = () => {
       setTrainingProgress(80);
       setTrainingStatus('Finalizing MLflow Registration...');
 
-      console.log('📦 Backend Response:', backendResponse);
-      console.log('📦 Backend Response models:', backendResponse?.models);
-      console.log('📦 Backend Response models length:', backendResponse?.models?.length);
+      logger.debug('📦 Backend Response:', backendResponse);
+      logger.debug('📦 Backend Response models:', backendResponse?.models);
+      logger.debug('📦 Backend Response models length:', backendResponse?.models?.length);
 
-      // DEBUG: Alert to verify we're reaching this point
-      // alert('DEBUG: Backend response received. Models: ' + (backendResponse?.models?.length || 0));
+      // [PIPELINE STEP F10] RESPONSE_RECEIVED
+      console.group(`[PIPELINE STEP F10] RESPONSE_RECEIVED`);
+      console.log(`  Models returned: ${backendResponse?.models?.length || 0}`);
+      console.log(`  Trace ID: ${backendResponse?.trace_id || '(none)'}`);
+      if (backendResponse?.models && Array.isArray(backendResponse.models)) {
+        backendResponse.models.forEach((m: any) => {
+          const status = m.error ? 'FAILED' : 'OK';
+          console.log(`  Model '${m.model_name}': ${status}, MAPE=${m.metrics?.mape || 'N/A'}, RMSE=${m.metrics?.rmse || 'N/A'}, isBest=${m.is_best}`);
+          if (m.forecast && Array.isArray(m.forecast)) {
+            const fcVals = m.forecast.map((f: any) => f.yhat).filter((v: any) => v != null);
+            if (fcVals.length > 0) {
+              console.log(`    Forecast: ${fcVals.length} periods, min=${Math.min(...fcVals).toLocaleString()}, max=${Math.max(...fcVals).toLocaleString()}, mean=${(fcVals.reduce((a: number, b: number) => a + b, 0) / fcVals.length).toLocaleString()}`);
+            }
+          }
+        });
+        const bestModel = backendResponse.models.find((m: any) => m.is_best);
+        if (bestModel) {
+          console.log(`  Best model: ${bestModel.model_name} (MAPE=${bestModel.metrics?.mape})`);
+        }
+      }
+      console.groupEnd();
 
       // Backend now returns multiple model results - filter out failed ones for display
       if (!backendResponse?.models || !Array.isArray(backendResponse.models)) {
-        console.error('❌ Invalid backend response - models is not an array:', backendResponse);
+        logger.error('❌ Invalid backend response - models is not an array:', backendResponse);
         throw new Error('Invalid backend response: models array not found');
       }
 
       const modelResults: ModelRunResult[] = backendResponse.models
         .filter((m: any) => {
           const passed = !m.error && m.metrics?.mape !== 'N/A';
-          console.log(`  Model ${m.model_name}: error=${m.error}, mape=${m.metrics?.mape}, passed=${passed}`);
+          logger.debug(`  Model ${m.model_name}: error=${m.error}, mape=${m.metrics?.mape}, passed=${passed}`);
           return passed;
         })  // Only successful models
         .map((m: any) => {
-          console.log('Processing model:', m.model_name, 'isBest:', m.is_best, 'experimentUrl:', m.experiment_url);
+          logger.debug('Processing model:', m.model_name, 'isBest:', m.is_best, 'experimentUrl:', m.experiment_url);
           return {
             modelType: m.model_type,
             modelName: m.model_name,
@@ -1715,7 +1882,7 @@ const App = () => {
         return { ...mp, status: 'failed' as const, error: 'Model not returned by backend' };
       }));
 
-      console.log('Processed models:', modelResults.length, 'Best:', modelResults.find(m => m.isBest)?.modelName);
+      logger.debug('Processed models:', modelResults.length, 'Best:', modelResults.find(m => m.isBest)?.modelName);
 
       // Check if any models succeeded
       if (modelResults.length === 0) {
@@ -1723,11 +1890,11 @@ const App = () => {
           .filter((m: any) => m.error || m.metrics.mape === 'N/A')
           .map((m: any) => `${m.model_type}: ${m.error || 'Unknown error'}`)
           .join('\n');
-        console.error('❌ All models failed:', failedModels);
+        logger.error('❌ All models failed:', failedModels);
         throw new Error(`All models failed to train:\n${failedModels}`);
       }
 
-      console.log('🔄 Calling generateForecastInsights...');
+      logger.debug('🔄 Calling generateForecastInsights...');
       const aiResult = await generateForecastInsights(
         analysis?.summary || '',
         targetCol,
@@ -1742,16 +1909,16 @@ const App = () => {
         regressorMethod
       );
 
-      console.log('✅ generateForecastInsights returned:', aiResult ? 'success' : 'null');
+      logger.debug('✅ generateForecastInsights returned:', aiResult ? 'success' : 'null');
 
       // Extract covariate impacts from best model
       const bestModel = modelResults.find(m => m.isBest) || modelResults[0];
-      console.log('🔍 bestModel found:', bestModel ? bestModel.modelName : 'NOT FOUND');
+      logger.debug('🔍 bestModel found:', bestModel ? bestModel.modelName : 'NOT FOUND');
       const bestModelData = backendResponse.models.find((m: any) => m.is_best) || backendResponse.models[0];
       const covariateImpacts = bestModelData?.covariate_impacts || [];
 
-      console.log('Covariate Impacts:', covariateImpacts);
-      console.log('🏆 Best Model:', bestModel.modelName);
+      logger.debug('Covariate Impacts:', covariateImpacts);
+      logger.debug('🏆 Best Model:', bestModel.modelName);
 
       setTrainingResult({
         history: sortedData,
@@ -1768,7 +1935,7 @@ const App = () => {
 
       setTrainingProgress(100);
       setTrainingStatus('Generating Executive Summary...');
-      console.log('🎯 All models trained, generating executive summary...');
+      logger.debug('🎯 All models trained, generating executive summary...');
 
       // Generate executive summary
       setIsGeneratingSummary(true);
@@ -1795,31 +1962,31 @@ const App = () => {
           frequency
         );
 
-        console.log('✅ Executive summary generated:', summary?.substring(0, 100) + '...');
+        logger.debug('✅ Executive summary generated:', summary?.substring(0, 100) + '...');
         setTrainingResult(prev => prev ? {
           ...prev,
           executiveSummary: summary
         } : null);
       } catch (error) {
-        console.error('❌ Failed to generate executive summary:', error);
+        logger.error('❌ Failed to generate executive summary:', error);
       } finally {
         setIsGeneratingSummary(false);
-        console.log('🔚 Executive summary generation finished');
+        logger.debug('🔚 Executive summary generation finished');
       }
 
       // Transition to results - using setTimeout to ensure state updates are processed
-      console.log('🚀 Transitioning to RESULTS step now');
+      logger.debug('🚀 Transitioning to RESULTS step now');
       setTimeout(() => {
         setIsTraining(false);
         setTrainingStatus('');
         setStep(AppStep.RESULTS);
-        console.log('✅ Step set to RESULTS');
+        logger.debug('✅ Step set to RESULTS');
       }, 100);
 
     } catch (error: any) {
       // Log the full error for debugging
-      console.error('❌❌❌ Training catch block error:', error);
-      console.error('❌❌❌ Error stack:', error.stack);
+      logger.error('❌❌❌ Training catch block error:', error);
+      logger.error('❌❌❌ Error stack:', error.stack);
 
       // Set detailed error message for display
       let errorMessage = error.message || 'Training failed due to an unknown error.';
@@ -1831,7 +1998,7 @@ const App = () => {
         errorMessage = 'Network error. Please check your connection and ensure the backend server is running.';
       }
 
-      console.error('❌❌❌ Setting training error and resetting to CONFIG:', errorMessage);
+      logger.error('❌❌❌ Setting training error and resetting to CONFIG:', errorMessage);
       setTrainingError(errorMessage);
       setIsTraining(false);
       setStep(AppStep.CONFIG);

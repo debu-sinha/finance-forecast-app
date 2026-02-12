@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 
@@ -150,6 +152,7 @@ class SQLiteJobStateStore(JobStateStore):
         self.db_path = db_path
         self._init_db()
 
+    @log_io
     def _init_db(self) -> None:
         """Initialize database schema."""
         conn = sqlite3.connect(self.db_path)
@@ -188,12 +191,14 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
+    @log_io
     async def save(self, job: TrainingJob) -> None:
         """Save or update a job."""
         conn = self._get_connection()
@@ -229,6 +234,7 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     async def get(self, job_id: str) -> Optional[TrainingJob]:
         """Get a job by ID."""
         conn = self._get_connection()
@@ -244,6 +250,7 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     async def list_jobs(
         self,
         user_id: Optional[str] = None,
@@ -277,6 +284,7 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     async def delete(self, job_id: str) -> None:
         """Delete a job."""
         conn = self._get_connection()
@@ -287,10 +295,12 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     async def get_running_jobs(self) -> List[TrainingJob]:
         """Get all jobs currently in running state."""
         return await self.list_jobs(status=JobStatus.RUNNING, limit=100)
 
+    @log_io
     async def count_running_jobs(self, user_id: Optional[str] = None) -> int:
         """Count jobs in running/submitting state, optionally filtered by user."""
         conn = self._get_connection()
@@ -311,6 +321,7 @@ class SQLiteJobStateStore(JobStateStore):
         finally:
             conn.close()
 
+    @log_io
     def _row_to_job(self, row: sqlite3.Row) -> TrainingJob:
         """Convert a database row to TrainingJob."""
         return TrainingJob(

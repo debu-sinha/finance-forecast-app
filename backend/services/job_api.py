@@ -11,6 +11,8 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from backend.utils.logging_utils import log_io
+
 from .job_delegation import get_job_service, is_delegation_enabled
 from .job_state_store import JobStatus
 
@@ -289,6 +291,7 @@ async def get_job_results(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@log_io
 def _job_to_response(job) -> JobResponse:
     """Convert TrainingJob to JobResponse."""
     return JobResponse(

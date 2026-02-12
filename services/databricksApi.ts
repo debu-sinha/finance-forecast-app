@@ -1,5 +1,6 @@
 
 import { DataRow, ForecastResult, ModelRunResult, BatchTrainingResult, BatchTrainingSummary, DataAnalysisResult } from "../types";
+import { logFunctionIO, logSyncFunctionIO, logger } from "../utils/logger";
 
 // When running as a Databricks App, the backend is on the same host/port usually,
 // or proxied. For local dev, you might need a proxy setup.
@@ -8,7 +9,7 @@ const API_BASE = "/api";
 /**
  * Analyze training data and get intelligent model/hyperparameter recommendations
  */
-export const analyzeTrainingData = async (
+const _analyzeTrainingData = async (
     data: DataRow[],
     timeCol: string,
     targetCol: string,
@@ -41,8 +42,9 @@ export const analyzeTrainingData = async (
 
     return response.json();
 };
+export const analyzeTrainingData = logFunctionIO('analyzeTrainingData', _analyzeTrainingData);
 
-export const trainModelOnBackend = async (
+const _trainModelOnBackend = async (
     data: DataRow[],
     timeCol: string,
     targetCol: string,
@@ -110,8 +112,9 @@ export const trainModelOnBackend = async (
 
     return await response.json();
 };
+export const trainModelOnBackend = logFunctionIO('trainModelOnBackend', _trainModelOnBackend);
 
-export const deployModel = async (modelName: string, version: string | null, endpointName: string, runId?: string) => {
+const _deployModel = async (modelName: string, version: string | null, endpointName: string, runId?: string) => {
     const response = await fetch(`${API_BASE}/deploy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -124,6 +127,7 @@ export const deployModel = async (modelName: string, version: string | null, end
     });
     return await response.json();
 };
+export const deployModel = logFunctionIO('deployModel', _deployModel);
 
 export interface ActualsComparisonSummary {
     overallMAPE: number;
@@ -138,7 +142,7 @@ export interface ActualsComparisonSummary {
     worstPeriods: Array<{ date: string; mape: number; error: number; predicted: number; actual: number }>;
 }
 
-export const generateExecutiveSummary = async (
+const _generateExecutiveSummary = async (
     bestModelName: string,
     bestModelMetrics: { rmse: number; mape: number; r2: number },
     allModels: Array<{ modelName: string; metrics: { rmse: string; mape: string; r2: string } }>,
@@ -180,6 +184,7 @@ export const generateExecutiveSummary = async (
     const data = await response.json();
     return data.summary || "";
 };
+export const generateExecutiveSummary = logFunctionIO('generateExecutiveSummary', _generateExecutiveSummary);
 
 // ==========================================
 // BATCH TRAINING API
@@ -208,7 +213,7 @@ export interface BatchTrainRequest {
     batchTotalSegments?: number;
 }
 
-export const trainBatchOnBackend = async (
+const _trainBatchOnBackend = async (
     requests: BatchTrainRequest[],
     maxWorkers: number = 4,
     onProgress?: (completed: number, total: number, latestResult?: any) => void,
@@ -220,7 +225,7 @@ export const trainBatchOnBackend = async (
     const batchId = `${new Date().toISOString().split('T')[0]}_${Date.now().toString(36)}`;
     const totalSegments = requests.length;
 
-    console.log(`Starting batch training: ${totalSegments} segments, batch_id=${batchId}, max_workers=${maxWorkers}`);
+    logger.debug(`Starting batch training: ${totalSegments} segments, batch_id=${batchId}, max_workers=${maxWorkers}`);
 
     // Prepare the payload for the parallel backend endpoint
     const trainRequests = requests.map((req, i) => {
@@ -345,7 +350,7 @@ export const trainBatchOnBackend = async (
             };
         }
 
-        console.log(`Batch training complete: ${backendResponse.successful}/${backendResponse.total_requests} successful`);
+        logger.debug(`Batch training complete: ${backendResponse.successful}/${backendResponse.total_requests} successful`);
 
         return {
             totalSegments: backendResponse.total_requests,
@@ -361,13 +366,14 @@ export const trainBatchOnBackend = async (
 
     } catch (error: any) {
         if (error.name === 'AbortError') {
-            console.log('Batch training cancelled by user');
+            logger.debug('Batch training cancelled by user');
             throw error;
         }
-        console.error('Batch training error:', error);
+        logger.error('Batch training error:', error);
         throw error;
     }
 };
+export const trainBatchOnBackend = logFunctionIO('trainBatchOnBackend', _trainBatchOnBackend);
 
 // ==========================================
 // BATCH DEPLOYMENT API
@@ -395,7 +401,7 @@ export interface BatchDeployResponse {
     routerModelVersion?: string;
 }
 
-export const deployBatchModels = async (
+const _deployBatchModels = async (
     batchResults: BatchTrainingSummary,
     endpointName: string,
     catalogName: string = 'main',
@@ -460,6 +466,7 @@ export const deployBatchModels = async (
 
     return await response.json();
 };
+export const deployBatchModels = logFunctionIO('deployBatchModels', _deployBatchModels);
 
 // ==========================================
 // SIMPLE MODE API (Autopilot for Finance Users)
@@ -532,7 +539,7 @@ export interface SimpleForecastResponse {
     excel_download_url: string;
 }
 
-export const profileDataForSimpleMode = async (file: File): Promise<SimpleProfileResponse> => {
+const _profileDataForSimpleMode = async (file: File): Promise<SimpleProfileResponse> => {
     const formData = new FormData();
     formData.append('file', file);
 
@@ -555,8 +562,9 @@ export const profileDataForSimpleMode = async (file: File): Promise<SimpleProfil
 
     return await response.json();
 };
+export const profileDataForSimpleMode = logFunctionIO('profileDataForSimpleMode', _profileDataForSimpleMode);
 
-export const runSimpleForecast = async (
+const _runSimpleForecast = async (
     file: File,
     horizon?: number
 ): Promise<SimpleForecastResponse> => {
@@ -585,8 +593,9 @@ export const runSimpleForecast = async (
 
     return await response.json();
 };
+export const runSimpleForecast = logFunctionIO('runSimpleForecast', _runSimpleForecast);
 
-export const downloadSimpleForecastExcel = async (runId: string): Promise<Blob> => {
+const _downloadSimpleForecastExcel = async (runId: string): Promise<Blob> => {
     const response = await fetch(`${API_BASE}/simple/export/${runId}/excel`);
 
     if (!response.ok) {
@@ -595,8 +604,9 @@ export const downloadSimpleForecastExcel = async (runId: string): Promise<Blob> 
 
     return await response.blob();
 };
+export const downloadSimpleForecastExcel = logFunctionIO('downloadSimpleForecastExcel', _downloadSimpleForecastExcel);
 
-export const downloadSimpleForecastCSV = async (runId: string): Promise<Blob> => {
+const _downloadSimpleForecastCSV = async (runId: string): Promise<Blob> => {
     const response = await fetch(`${API_BASE}/simple/export/${runId}/csv`);
 
     if (!response.ok) {
@@ -605,9 +615,10 @@ export const downloadSimpleForecastCSV = async (runId: string): Promise<Blob> =>
 
     return await response.blob();
 };
+export const downloadSimpleForecastCSV = logFunctionIO('downloadSimpleForecastCSV', _downloadSimpleForecastCSV);
 
 // Export batch results to CSV
-export const exportBatchResultsToCSV = (summary: BatchTrainingSummary, segmentCols: string[]): string => {
+const _exportBatchResultsToCSV = (summary: BatchTrainingSummary, segmentCols: string[]): string => {
     const headers = [
         ...segmentCols,
         'status',
@@ -637,3 +648,4 @@ export const exportBatchResultsToCSV = (summary: BatchTrainingSummary, segmentCo
 
     return [headers.join(','), ...rows].join('\n');
 };
+export const exportBatchResultsToCSV = logSyncFunctionIO('exportBatchResultsToCSV', _exportBatchResultsToCSV);

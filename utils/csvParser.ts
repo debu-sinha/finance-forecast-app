@@ -1,6 +1,7 @@
 import { DataRow } from '../types';
+import { logSyncFunctionIO } from './logger';
 
-export const parseCSV = (content: string): DataRow[] => {
+const _parseCSV = (content: string): DataRow[] => {
   const lines = content.trim().split('\n');
   if (lines.length < 2) return [];
 
@@ -93,3 +94,5 @@ export const parseCSV = (content: string): DataRow[] => {
   }
   return data;
 };
+
+export const parseCSV = logSyncFunctionIO('parseCSV', _parseCSV);

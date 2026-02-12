@@ -1,4 +1,5 @@
 import { DataRow, DatasetAnalysis, ForecastResult, ModelType, FutureRegressorMethod } from "../types";
+import { logFunctionIO, logger } from "../utils/logger";
 
 // Use backend proxy for analysis calls (avoids CORS issues)
 const API_BASE = "/api";
@@ -6,10 +7,10 @@ const API_BASE = "/api";
 /**
  * Call backend analysis endpoint (avoids CORS issues)
  */
-async function callBackendAnalysis(
+const _callBackendAnalysis = async (
   sampleData: DataRow[],
   columns: string[]
-): Promise<DatasetAnalysis> {
+): Promise<DatasetAnalysis> => {
   const response = await fetch(`${API_BASE}/analyze`, {
     method: 'POST',
     headers: {
@@ -26,12 +27,13 @@ async function callBackendAnalysis(
   }
 
   return await response.json();
-}
+};
+const callBackendAnalysis = logFunctionIO('callBackendAnalysis', _callBackendAnalysis);
 
 /**
  * Call backend insights endpoint
  */
-async function callBackendInsights(
+const _callBackendInsights = async (
   dataSummary: string,
   targetCol: string,
   timeCol: string,
@@ -40,7 +42,7 @@ async function callBackendInsights(
   seasonalityMode: string,
   winningModel: string,
   frequency: string
-): Promise<Partial<ForecastResult>> {
+): Promise<Partial<ForecastResult>> => {
   const response = await fetch(`${API_BASE}/insights`, {
     method: 'POST',
     headers: {
@@ -63,16 +65,17 @@ async function callBackendInsights(
   }
 
   return await response.json();
-}
+};
+const callBackendInsights = logFunctionIO('callBackendInsights', _callBackendInsights);
 
-export const analyzeDataset = async (sampleData: DataRow[], columns: string[]): Promise<DatasetAnalysis> => {
+const _analyzeDataset = async (sampleData: DataRow[], columns: string[]): Promise<DatasetAnalysis> => {
   try {
-    console.log('Calling backend for dataset analysis');
+    logger.debug('Calling backend for dataset analysis');
     const result = await callBackendAnalysis(sampleData, columns);
-    console.log('Analysis complete:', result);
+    logger.debug('Analysis complete:', result);
     return result;
   } catch (error: any) {
-    console.error("Backend Analysis Error:", error);
+    logger.error("Backend Analysis Error:", error);
     return {
       summary: "Could not analyze dataset. Please configure columns manually.",
       suggestedCovariates: [],
@@ -80,6 +83,7 @@ export const analyzeDataset = async (sampleData: DataRow[], columns: string[]): 
     };
   }
 };
+export const analyzeDataset = logFunctionIO('analyzeDataset', _analyzeDataset);
 
 interface SeasonalityConfig {
   mode: 'additive' | 'multiplicative';
@@ -87,7 +91,7 @@ interface SeasonalityConfig {
   weekly: boolean;
 }
 
-export const generateForecastInsights = async (
+const _generateForecastInsights = async (
   dataSummary: string,
   targetCol: string,
   timeCol: string,
@@ -101,7 +105,7 @@ export const generateForecastInsights = async (
   regressorMethod: FutureRegressorMethod
 ): Promise<Partial<ForecastResult>> => {
   try {
-    console.log('Calling backend for forecast insights');
+    logger.debug('Calling backend for forecast insights');
     const result = await callBackendInsights(
       dataSummary,
       targetCol,
@@ -112,14 +116,14 @@ export const generateForecastInsights = async (
       winningModel,
       frequency
     );
-    console.log('Insights generated');
+    logger.debug('Insights generated');
     return result;
   } catch (error) {
-    console.error("Backend Insights Error:", error);
+    logger.error("Backend Insights Error:", error);
     return {
       explanation: `Model trained successfully using ${winningModel}. The model used ${seasonality.mode} seasonality and incorporated ${covariates.length} covariates.`,
       pythonCode: `# Prophet model training example\nfrom prophet import Prophet\n\nmodel = Prophet(seasonality_mode='${seasonality.mode}')\nmodel.fit(df)\nforecast = model.predict(future)`
     };
   }
 };
-
+export const generateForecastInsights = logFunctionIO('generateForecastInsights', _generateForecastInsights);

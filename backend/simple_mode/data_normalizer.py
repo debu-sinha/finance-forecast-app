@@ -13,6 +13,8 @@ from dateutil import parser as dateutil_parser
 from dateutil.parser import ParserError
 import pandas as pd
 
+from backend.utils.logging_utils import log_io
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,7 @@ class DateNormalizer:
         self.dayfirst = dayfirst
         self._detected_format = None
 
+    @log_io
     def parse(self, date_str: str) -> Optional[datetime]:
         """
         Parse a date string to datetime.
@@ -100,6 +103,7 @@ class DateNormalizer:
         # Last resort: try common transformations
         return self._fuzzy_parse(date_str)
 
+    @log_io
     def _parse_with_format(self, date_str: str, fmt: str) -> datetime:
         """Parse with specific format, handling special cases."""
 
@@ -137,6 +141,7 @@ class DateNormalizer:
         # Standard strptime
         return datetime.strptime(date_str, fmt)
 
+    @log_io
     def _fuzzy_parse(self, date_str: str) -> Optional[datetime]:
         """Try fuzzy matching for unusual formats."""
 
@@ -153,6 +158,7 @@ class DateNormalizer:
 
         return None
 
+    @log_io
     def detect_format_from_column(
         self,
         values: List[str],
@@ -234,6 +240,7 @@ class ColumnNormalizer:
     BOOL_TRUE = {'true', 'yes', 'y', '1', 'on', 'active', 'enabled'}
     BOOL_FALSE = {'false', 'no', 'n', '0', 'off', 'inactive', 'disabled'}
 
+    @log_io
     def normalize_numeric(self, value: Any) -> Optional[float]:
         """
         Normalize numeric values handling various formats.
@@ -319,6 +326,7 @@ class ColumnNormalizer:
         except ValueError:
             return None
 
+    @log_io
     def normalize_boolean(self, value: Any) -> Optional[bool]:
         """Normalize boolean values from various representations."""
         if value is None or pd.isna(value):
@@ -333,6 +341,7 @@ class ColumnNormalizer:
 
         return None
 
+    @log_io
     def normalize_string(self, value: Any) -> Optional[str]:
         """Clean and normalize string values."""
         if value is None or pd.isna(value):
@@ -357,6 +366,7 @@ class ColumnNormalizer:
 
         return val_str.strip() if val_str.strip() else None
 
+    @log_io
     def detect_column_type(
         self,
         values: List[Any],
@@ -420,6 +430,7 @@ class DataFrameNormalizer:
         self.date_normalizer = DateNormalizer()
         self.column_normalizer = ColumnNormalizer()
 
+    @log_io
     def normalize(
         self,
         df: pd.DataFrame,
@@ -496,6 +507,7 @@ class DataFrameNormalizer:
         return df_normalized, report
 
 
+@log_io
 def normalize_dataframe(
     df: pd.DataFrame,
     date_columns: Optional[List[str]] = None,

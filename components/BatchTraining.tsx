@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { DataRow, BatchSegment, BatchTrainingSummary, BatchTrainingResult, MAPE_THRESHOLDS } from '../types';
 import { trainBatchOnBackend, BatchTrainRequest, exportBatchResultsToCSV } from '../services/databricksApi';
+import { logger } from '../utils/logger';
 
 interface BatchTrainingProps {
   data: DataRow[];
@@ -161,9 +162,9 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
 
   // Start batch training
   const handleBatchTrain = async () => {
-    console.log('🚀 handleBatchTrain called, activeSegments:', activeSegments.length);
+    logger.debug('🚀 handleBatchTrain called, activeSegments:', activeSegments.length);
     if (activeSegments.length === 0) {
-      console.log('❌ No active segments, returning early');
+      logger.debug('❌ No active segments, returning early');
       return;
     }
 
@@ -210,9 +211,9 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
       setTrainingSummary(summary);
     } catch (error: any) {
       if (error.name === 'AbortError') {
-        console.log('Batch training cancelled');
+        logger.debug('Batch training cancelled');
       } else {
-        console.error('Batch training failed:', error);
+        logger.error('Batch training failed:', error);
       }
     } finally {
       setIsTraining(false);

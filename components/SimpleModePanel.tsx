@@ -50,6 +50,7 @@ import {
   ResponsiveContainer,
   ReferenceLine,
 } from 'recharts';
+import { logger } from '../utils/logger';
 
 interface DataProfile {
   frequency: string;
@@ -825,7 +826,7 @@ export const SimpleModePanel: React.FC = () => {
             selectedCovariates: [...new Set([...s.selectedCovariates, ...holidayCols])],
             holidaysAutoSelected: true,
           }));
-          console.log(`🎄 Auto-selected ${holidayCols.length} holiday columns as covariates:`, holidayCols);
+          logger.debug(`🎄 Auto-selected ${holidayCols.length} holiday columns as covariates:`, holidayCols);
         } else {
           setState(s => ({ ...s, holidaysAutoSelected: true }));
         }
@@ -1091,17 +1092,17 @@ export const SimpleModePanel: React.FC = () => {
 
   // NEW: Toggle covariate category (select all in category)
   const toggleCovariateCategory = (category: CovariateCategory) => {
-    console.log(`🏷️ Category toggle clicked: "${category.label}"`);
+    logger.debug(`🏷️ Category toggle clicked: "${category.label}"`);
     setState(s => {
       const categoryColumns = category.columns;
       const allSelected = categoryColumns.every(c => s.selectedCovariates.includes(c));
-      console.log(`📊 Category "${category.label}": ${allSelected ? 'DESELECTING ALL' : 'SELECTING ALL'}`);
-      console.log(`📊 Columns in category: ${categoryColumns.join(', ')}`);
+      logger.debug(`📊 Category "${category.label}": ${allSelected ? 'DESELECTING ALL' : 'SELECTING ALL'}`);
+      logger.debug(`📊 Columns in category: ${categoryColumns.join(', ')}`);
 
       if (allSelected) {
         // Deselect all in category
         const newCovariates = s.selectedCovariates.filter(c => !categoryColumns.includes(c));
-        console.log(`📊 New covariate count: ${newCovariates.length}`);
+        logger.debug(`📊 New covariate count: ${newCovariates.length}`);
         return {
           ...s,
           selectedCovariates: newCovariates
@@ -1109,7 +1110,7 @@ export const SimpleModePanel: React.FC = () => {
       } else {
         // Select all in category
         const newSelection = new Set([...s.selectedCovariates, ...categoryColumns]);
-        console.log(`📊 New covariate count: ${newSelection.size}`);
+        logger.debug(`📊 New covariate count: ${newSelection.size}`);
         return { ...s, selectedCovariates: Array.from(newSelection) };
       }
     });
@@ -1325,8 +1326,8 @@ export const SimpleModePanel: React.FC = () => {
             const leakyCovariates = data.profile.leaky_covariates || [];
             // Log leakage warnings prominently
             if (leakyCovariates.length > 0) {
-              console.warn(`⚠️ DATA LEAKAGE DETECTED: Columns with >90% correlation: ${leakyCovariates.join(', ')}`);
-              console.warn(`⚠️ These have been auto-deselected. Re-selecting them may cause poor forecast accuracy.`);
+              logger.warn(`⚠️ DATA LEAKAGE DETECTED: Columns with >90% correlation: ${leakyCovariates.join(', ')}`);
+              logger.warn(`⚠️ These have been auto-deselected. Re-selecting them may cause poor forecast accuracy.`);
             }
             return {
               ...s,
@@ -1353,26 +1354,26 @@ export const SimpleModePanel: React.FC = () => {
   };
 
   const handleCovariateToggle = (col: string) => {
-    console.log(`🔄 Covariate toggle clicked: "${col}"`);
+    logger.debug(`🔄 Covariate toggle clicked: "${col}"`);
     setState(s => {
       // Don't allow selecting target as covariate
       if (col === s.selectedTargetCol) {
-        console.log(`⚠️ Blocked: "${col}" is the target column`);
+        logger.debug(`⚠️ Blocked: "${col}" is the target column`);
         return s;
       }
 
       // Warn if selecting a leaky covariate
       const isLeaky = s.profile?.leaky_covariates?.includes(col);
       if (isLeaky && !s.selectedCovariates.includes(col)) {
-        console.warn(`⚠️ WARNING: "${col}" has high correlation with target - potential data leakage!`);
+        logger.warn(`⚠️ WARNING: "${col}" has high correlation with target - potential data leakage!`);
       }
 
       const wasSelected = s.selectedCovariates.includes(col);
       const newCovariates = wasSelected
         ? s.selectedCovariates.filter(c => c !== col)
         : [...s.selectedCovariates, col];
-      console.log(`📊 Covariate "${col}": ${wasSelected ? 'REMOVING' : 'ADDING'}`);
-      console.log(`📊 New covariate count: ${newCovariates.length}`);
+      logger.debug(`📊 Covariate "${col}": ${wasSelected ? 'REMOVING' : 'ADDING'}`);
+      logger.debug(`📊 New covariate count: ${newCovariates.length}`);
       return {
         ...s,
         selectedCovariates: newCovariates,
@@ -1401,18 +1402,18 @@ export const SimpleModePanel: React.FC = () => {
     setState(s => ({ ...s, isLoading: true, error: null, step: 'forecasting' }));
 
     // ========== LOGGING: START FORECAST REQUEST ==========
-    console.log('========================================');
-    console.log('🚀 SIMPLE MODE FORECAST - REQUEST START');
-    console.log('========================================');
-    console.log('📋 Configuration:');
-    console.log('  - Date Column:', state.selectedDateCol);
-    console.log('  - Target Column:', state.selectedTargetCol);
-    console.log('  - Horizon:', state.horizon);
-    console.log('  - Covariates:', state.selectedCovariates);
-    console.log('  - Forecast Mode:', state.forecastMode);
-    console.log('  - Selected Slice Columns:', state.selectedSliceCols);
-    console.log('  - Selected Slice Values:', state.selectedSliceValues);
-    console.log('  - Number of slices selected:', state.selectedSliceValues.length);
+    logger.debug('========================================');
+    logger.debug('🚀 SIMPLE MODE FORECAST - REQUEST START');
+    logger.debug('========================================');
+    logger.debug('📋 Configuration:');
+    logger.debug('  - Date Column:', state.selectedDateCol);
+    logger.debug('  - Target Column:', state.selectedTargetCol);
+    logger.debug('  - Horizon:', state.horizon);
+    logger.debug('  - Covariates:', state.selectedCovariates);
+    logger.debug('  - Forecast Mode:', state.forecastMode);
+    logger.debug('  - Selected Slice Columns:', state.selectedSliceCols);
+    logger.debug('  - Selected Slice Values:', state.selectedSliceValues);
+    logger.debug('  - Number of slices selected:', state.selectedSliceValues.length);
 
     try {
       const formData = new FormData();
@@ -1441,23 +1442,23 @@ export const SimpleModePanel: React.FC = () => {
             allCombinations.add(combo);
           });
           sliceValuesToSend = Array.from(allCombinations);
-          console.log('📊 Default "all selected" - computed all combinations:', sliceValuesToSend.length);
+          logger.debug('📊 Default "all selected" - computed all combinations:', sliceValuesToSend.length);
         }
 
         const sliceValuesJoined = sliceValuesToSend.join('|||');
         params.set('slice_values', sliceValuesJoined);
 
-        console.log('📤 SENDING TO BACKEND:');
-        console.log('  - forecast_mode: by_slice');
-        console.log('  - slice_columns:', state.selectedSliceCols.join(','));
-        console.log('  - slice_values (raw):', sliceValuesJoined);
-        console.log('  - slice_values (count):', sliceValuesToSend.length);
+        logger.debug('📤 SENDING TO BACKEND:');
+        logger.debug('  - forecast_mode: by_slice');
+        logger.debug('  - slice_columns:', state.selectedSliceCols.join(','));
+        logger.debug('  - slice_values (raw):', sliceValuesJoined);
+        logger.debug('  - slice_values (count):', sliceValuesToSend.length);
       } else if (state.detectedSlices.length > 0) {
         params.set('forecast_mode', 'aggregate');
-        console.log('📤 SENDING TO BACKEND: forecast_mode: aggregate');
+        logger.debug('📤 SENDING TO BACKEND: forecast_mode: aggregate');
       }
 
-      console.log('🌐 Full URL:', `/api/simple/forecast?${params}`);
+      logger.debug('🌐 Full URL:', `/api/simple/forecast?${params}`);
 
       const response = await fetch(`/api/simple/forecast?${params}`, {
         method: 'POST',
@@ -1466,32 +1467,32 @@ export const SimpleModePanel: React.FC = () => {
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        console.error('❌ FORECAST FAILED:', errData);
+        logger.error('❌ FORECAST FAILED:', errData);
         throw new Error(errData.detail || `Forecast failed: ${response.statusText}`);
       }
 
       const data: ForecastResponse = await response.json();
 
       // ========== LOGGING: RESPONSE RECEIVED ==========
-      console.log('========================================');
-      console.log('📥 SIMPLE MODE FORECAST - RESPONSE');
-      console.log('========================================');
-      console.log('✅ Success:', data.success);
-      console.log('📊 Mode:', data.forecast_mode);
-      console.log('🏷️ Slice Columns:', data.slice_columns);
-      console.log('📈 Number of slice forecasts:', data.slice_forecasts?.length || 0);
+      logger.debug('========================================');
+      logger.debug('📥 SIMPLE MODE FORECAST - RESPONSE');
+      logger.debug('========================================');
+      logger.debug('✅ Success:', data.success);
+      logger.debug('📊 Mode:', data.forecast_mode);
+      logger.debug('🏷️ Slice Columns:', data.slice_columns);
+      logger.debug('📈 Number of slice forecasts:', data.slice_forecasts?.length || 0);
       if (data.slice_forecasts) {
-        console.log('📋 Slice Details:');
+        logger.debug('📋 Slice Details:');
         data.slice_forecasts.forEach((sf, idx) => {
-          console.log(`  [${idx}] slice_id: "${sf.slice_id}"`);
-          console.log(`       slice_filters:`, sf.slice_filters);
-          console.log(`       data_points: ${sf.data_points}`);
-          console.log(`       best_model: ${sf.best_model}`);
-          console.log(`       holdout_mape: ${sf.holdout_mape}`);
-          console.log(`       forecast length: ${sf.forecast?.length || 0}`);
+          logger.debug(`  [${idx}] slice_id: "${sf.slice_id}"`);
+          logger.debug(`       slice_filters:`, sf.slice_filters);
+          logger.debug(`       data_points: ${sf.data_points}`);
+          logger.debug(`       best_model: ${sf.best_model}`);
+          logger.debug(`       holdout_mape: ${sf.holdout_mape}`);
+          logger.debug(`       forecast length: ${sf.forecast?.length || 0}`);
         });
       }
-      console.log('========================================');
+      logger.debug('========================================');
 
       setState(s => ({
         ...s,
@@ -2132,10 +2133,10 @@ export const SimpleModePanel: React.FC = () => {
 
                               // Handle click for numeric columns (toggle covariate) or date columns
                               const handleChipClick = () => {
-                                console.log(`🔘 Chip clicked: "${col}", isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isCovariate=${isCovariate}`);
+                                logger.debug(`🔘 Chip clicked: "${col}", isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isCovariate=${isCovariate}`);
                                 if (isNumericGroup && !isTarget) {
                                   // Toggle covariate selection
-                                  console.log(`📊 Toggling covariate: "${col}" - currently ${isCovariate ? 'selected' : 'not selected'}`);
+                                  logger.debug(`📊 Toggling covariate: "${col}" - currently ${isCovariate ? 'selected' : 'not selected'}`);
                                   setState(s => ({
                                     ...s,
                                     selectedCovariates: isCovariate
@@ -2143,10 +2144,10 @@ export const SimpleModePanel: React.FC = () => {
                                       : [...s.selectedCovariates, col],
                                   }));
                                 } else if (isDateGroup && !isDate) {
-                                  console.log(`📅 Setting date column to: "${col}"`);
+                                  logger.debug(`📅 Setting date column to: "${col}"`);
                                   setState(s => ({ ...s, selectedDateCol: col }));
                                 } else {
-                                  console.log(`⚠️ Click ignored: isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isDateGroup=${isDateGroup}, isDate=${isDate}`);
+                                  logger.debug(`⚠️ Click ignored: isNumericGroup=${isNumericGroup}, isTarget=${isTarget}, isDateGroup=${isDateGroup}, isDate=${isDate}`);
                                 }
                               };
 
@@ -2918,7 +2919,7 @@ export const SimpleModePanel: React.FC = () => {
                                     key={col}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      console.log(`🎄 Holiday/Feature button clicked: "${col}"`);
+                                      logger.debug(`🎄 Holiday/Feature button clicked: "${col}"`);
                                       handleCovariateToggle(col);
                                     }}
                                     title={isLeakyCovariate(col) ? `⚠️ HIGH CORRELATION: This column has >90% correlation with target and may cause data leakage` : undefined}
@@ -2951,7 +2952,7 @@ export const SimpleModePanel: React.FC = () => {
                         key={col}
                         onClick={(e) => {
                           e.stopPropagation();
-                          console.log(`📊 Feature button clicked: "${col}"`);
+                          logger.debug(`📊 Feature button clicked: "${col}"`);
                           handleCovariateToggle(col);
                         }}
                         title={isLeakyCovariate(col) ? `⚠️ HIGH CORRELATION: This column has >90% correlation with target and may cause data leakage` : undefined}
@@ -3807,12 +3808,12 @@ export const SimpleModePanel: React.FC = () => {
 
                   // Debug: Log filtering results if many rows were filtered
                   if (filteredRows > 0 && matchedRows === 0) {
-                    console.warn(`Chart data: ALL ${filteredRows} rows filtered! No matches found.`);
-                    console.warn(`Forecasted slice IDs: ${Array.from(forecastedSliceIds).join(', ')}`);
+                    logger.warn(`Chart data: ALL ${filteredRows} rows filtered! No matches found.`);
+                    logger.warn(`Forecasted slice IDs: ${Array.from(forecastedSliceIds).join(', ')}`);
                     if (sliceColumns && state.rawData && state.rawData.length > 0) {
                       const sampleRow = state.rawData[0];
                       const sampleSliceId = normalizeSliceId(sliceColumns.map(col => sampleRow[col]));
-                      console.warn(`Sample raw data slice ID: "${sampleSliceId}"`);
+                      logger.warn(`Sample raw data slice ID: "${sampleSliceId}"`);
                     }
                   }
 

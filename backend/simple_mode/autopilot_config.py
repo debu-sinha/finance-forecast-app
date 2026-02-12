@@ -12,6 +12,7 @@ from datetime import datetime
 import logging
 
 from .data_profiler import DataProfile
+from backend.utils.logging_utils import log_io
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class ForecastConfig:
         if not self.config_hash:
             self.config_hash = self._compute_hash()
 
+    @log_io
     def _compute_hash(self) -> str:
         """Compute hash of this configuration."""
         config_str = (
@@ -69,6 +71,7 @@ class ForecastConfig:
         )
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
+    @log_io
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
 
@@ -117,6 +120,7 @@ class AutopilotConfig:
     User doesn't need to set any parameters.
     """
 
+    @log_io
     def generate(
         self,
         profile: DataProfile,
@@ -204,6 +208,7 @@ class AutopilotConfig:
 
         return config
 
+    @log_io
     def _get_optimal_params(
         self, model_type: str, profile: DataProfile
     ) -> ModelConfig:
@@ -222,6 +227,7 @@ class AutopilotConfig:
         else:
             return ModelConfig(model_type=model_type, params={})
 
+    @log_io
     def _get_prophet_params(self, profile: DataProfile) -> ModelConfig:
         """Optimal Prophet parameters based on data profile."""
 
@@ -250,6 +256,7 @@ class AutopilotConfig:
 
         return ModelConfig(model_type='prophet', params=params)
 
+    @log_io
     def _get_arima_params(self, profile: DataProfile) -> ModelConfig:
         """Optimal ARIMA parameters based on data profile."""
 
@@ -268,6 +275,7 @@ class AutopilotConfig:
 
         return ModelConfig(model_type='arima', params=params)
 
+    @log_io
     def _get_xgboost_params(self, profile: DataProfile) -> ModelConfig:
         """Optimal XGBoost parameters based on data profile."""
 
@@ -288,6 +296,7 @@ class AutopilotConfig:
 
         return ModelConfig(model_type='xgboost', params=params)
 
+    @log_io
     def _get_ets_params(self, profile: DataProfile) -> ModelConfig:
         """Optimal ETS parameters based on data profile."""
 
@@ -303,6 +312,7 @@ class AutopilotConfig:
 
         return ModelConfig(model_type='ets', params=params)
 
+    @log_io
     def _get_sarimax_params(self, profile: DataProfile) -> ModelConfig:
         """Optimal SARIMAX parameters based on data profile."""
 
@@ -318,6 +328,7 @@ class AutopilotConfig:
         return ModelConfig(model_type='sarimax', params=params)
 
 
+@log_io
 def generate_reproducibility_token(
     data_hash: str, config_hash: str, model_version: str = "1.0"
 ) -> str:
@@ -328,6 +339,7 @@ def generate_reproducibility_token(
     return f"{data_hash}:{config_hash}:{model_version}"
 
 
+@log_io
 def generate_hyperparameter_filters(profile: DataProfile, confidence_level: float = 0.95) -> Dict[str, Dict[str, Any]]:
     """
     Generate intelligent hyperparameter filters based on data profile.

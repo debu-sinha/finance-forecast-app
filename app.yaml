@@ -13,6 +13,10 @@ command:
 # NOTE: Databricks Apps has a hard limit of 4 vCPU / 12GB RAM
 # Heavy training is delegated to dedicated cluster via Databricks Jobs
 env:
+  # Logging Configuration
+  - name: LOG_LEVEL
+    value: "INFO"
+
   # MLflow Configuration
   - name: MLFLOW_TRACKING_URI
     value: "databricks"
