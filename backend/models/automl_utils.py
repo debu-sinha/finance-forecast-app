@@ -795,14 +795,19 @@ def calculate_ensemble_weights(
     # A model with very low eval MAPE (e.g., 0.69%) can get 53% weight via
     # inverse_mape, which contaminates the ensemble if the model over-extrapolates.
     if max_weight < 1.0 and len(weights) > 1:
-        capped = False
-        for name in weights:
-            if weights[name] > max_weight:
-                weights[name] = max_weight
-                capped = True
-        if capped and normalize:
-            total = sum(weights.values())
-            weights = {name: w / total for name, w in weights.items()}
+        # Iterate cap+normalize until stable — a single pass can push weights
+        # above the cap after renormalization redistributes the excess.
+        for _ in range(10):  # converges in 2-3 iterations
+            capped = False
+            for name in weights:
+                if weights[name] > max_weight:
+                    weights[name] = max_weight
+                    capped = True
+            if not capped:
+                break
+            if normalize:
+                total = sum(weights.values())
+                weights = {name: w / total for name, w in weights.items()}
 
     return weights
 

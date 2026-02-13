@@ -828,13 +828,35 @@ def train_arima_model(
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
         logger.info(f"📅 ARIMA forecast dates: {future_dates.min()} to {future_dates.max()}")
 
+        # Explosion guard — detect NaN/Inf/extreme values and fall back to naive
+        hist_max = np.max(np.abs(full_data['y'].values)) if len(full_data) > 0 else 1
+        hist_mean = np.mean(full_data['y'].values) if len(full_data) > 0 else 0
+        has_explosion = (
+            np.any(np.isnan(forecast_values)) or
+            np.any(np.isinf(forecast_values)) or
+            np.max(np.abs(forecast_values)) > 10 * hist_max
+        )
+        if has_explosion:
+            logger.error(f"ARIMA training: explosion detected (max={np.max(np.abs(forecast_values)):.2e}, hist_max={hist_max:,.0f}). Using naive fallback.")
+            naive_values = full_data['y'].values[-horizon:]
+            if len(naive_values) < horizon:
+                naive_values = np.full(horizon, hist_mean)
+            forecast_values = naive_values.copy()
+            forecast_lower = forecast_values * 0.9
+            forecast_upper = forecast_values * 1.1
+
+        # Clip negative forecasts — financial metrics cannot be negative
+        forecast_values = np.maximum(forecast_values, 0.0)
+        forecast_lower = np.maximum(forecast_lower, 0.0)
+        forecast_upper = np.maximum(forecast_upper, 0.0)
+
         forecast_data = pd.DataFrame({
             'ds': future_dates,
             'yhat': forecast_values,
             'yhat_lower': forecast_lower,
             'yhat_upper': forecast_upper
         })
-        
+
         # Log datasets
         try:
             train_data_actual = pd.DataFrame({'ds': train_df['ds'], 'y': train_df['y']})

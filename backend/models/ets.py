@@ -522,13 +522,18 @@ def train_exponential_smoothing_model(
         future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=pd_freq)[1:]
         logger.info(f"📅 ETS forecast dates: {future_dates.min()} to {future_dates.max()}")
 
+        # Clip negative forecasts — financial metrics cannot be negative
+        forecast_values = np.maximum(forecast_values, 0.0)
+        forecast_lower = np.maximum(forecast_lower, 0.0)
+        forecast_upper = np.maximum(forecast_upper, 0.0)
+
         forecast_data = pd.DataFrame({
             'ds': future_dates,
             'yhat': forecast_values,
             'yhat_lower': forecast_lower,
             'yhat_upper': forecast_upper
         })
-        
+
         # Log datasets
         try:
             train_data_actual = pd.DataFrame({'ds': train_df['ds'], 'y': train_df['y']})
