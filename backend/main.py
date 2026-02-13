@@ -361,7 +361,8 @@ async def health_check():
 
     try:
         import mlflow
-        mlflow.set_tracking_uri("databricks")
+        tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "databricks")
+        mlflow.set_tracking_uri(tracking_uri)
         status_data["mlflow_enabled"] = True
     except Exception as e:
         logger.debug(f"MLflow setup failed (expected in dev): {type(e).__name__}")
@@ -1443,6 +1444,167 @@ async def train_model(request: TrainRequest):
         })
 
         # ========================================
+        # SMART AUTO-OPTIMIZATION (Forecast Advisor)
+        # ========================================
+        # When auto_optimize=True (default), analyze data characteristics
+        # and automatically configure training window, model selection,
+        # log transform, and horizon guidance. Generic and dataset-agnostic.
+        auto_optimize_info = None
+        auto_optimize_enabled = getattr(request, 'auto_optimize', True)
+
+        if auto_optimize_enabled and len(df) >= 52:
+            try:
+                from backend.forecast_advisor import ForecastAdvisor
+                advisor = ForecastAdvisor()
+
+                # Run advisor on the prepared data
+                advisor_values = df['y'].dropna().values.astype(float)
+                advisor_dates = pd.to_datetime(df['ds'])
+                advisor_config = advisor.auto_configure_training(
+                    values=advisor_values,
+                    dates=advisor_dates,
+                    frequency=request.frequency,
+                    requested_horizon=request.horizon,
+                )
+
+                logger.info(f"")
+                logger.info(f"{'='*60}")
+                logger.info(f"AUTO-OPTIMIZE: Forecast Advisor Results")
+                logger.info(f"{'='*60}")
+                logger.info(f"   Forecastability: {advisor_config.grade} (score {advisor_config.forecastability_score}/100)")
+                logger.info(f"   Growth: {advisor_config.growth_pct:.1f}%")
+                logger.info(f"   Training window: {advisor_config.training_window_weeks or 'all'} weeks")
+                logger.info(f"   Log transform: {advisor_config.log_transform}")
+                logger.info(f"   Recommended models: {advisor_config.recommended_models}")
+                logger.info(f"   Recommended horizon: {advisor_config.recommended_horizon} (max reliable: {advisor_config.max_reliable_horizon})")
+                logger.info(f"   Expected MAPE: {advisor_config.expected_mape_range[0]:.1f}%-{advisor_config.expected_mape_range[1]:.1f}%")
+                if advisor_config.data_warnings:
+                    for w in advisor_config.data_warnings[:3]:
+                        logger.info(f"   Warning: {w}")
+                logger.info(f"{'='*60}")
+
+                # Apply training window: trim old data if advisor recommends
+                if advisor_config.from_date and not request.from_date:
+                    advisor_from = pd.Timestamp(advisor_config.from_date)
+                    before_count = len(df)
+                    df = df[df['ds'] >= advisor_from].reset_index(drop=True)
+                    logger.info(
+                        f"   Auto-optimize: trimmed training data from {before_count} to {len(df)} rows "
+                        f"(from_date={advisor_config.from_date}, window={advisor_config.training_window_weeks}w)"
+                    )
+
+                # Apply model selection: intersect advisor recommendations with user's list
+                # Only modify if user used defaults (didn't explicitly pick models)
+                user_models = request.models
+                default_models = ["prophet"]
+                if user_models == default_models or set(user_models) == set(default_models):
+                    # User used defaults — apply advisor's full recommendation
+                    request.models = advisor_config.recommended_models
+                    logger.info(f"   Auto-optimize: models set to {request.models} (advisor recommended)")
+                else:
+                    # User explicitly chose models — warn about excluded ones but respect choice
+                    excluded_in_user = [m for m in user_models if m in advisor_config.excluded_models]
+                    if excluded_in_user:
+                        logger.warning(
+                            f"   Auto-optimize: user selected {excluded_in_user} which advisor excludes. "
+                            f"Reasons: {', '.join(advisor_config.model_exclusion_reasons.get(m, '?') for m in excluded_in_user)}"
+                        )
+
+                # Apply log transform recommendation (only if user left it on 'auto')
+                user_log_transform = getattr(request, 'log_transform', 'auto') or 'auto'
+                if user_log_transform == 'auto':
+                    # Advisor provides more nuanced recommendation than the simple auto-detect
+                    request.log_transform = advisor_config.log_transform
+                    logger.info(f"   Auto-optimize: log_transform set to '{advisor_config.log_transform}' ({advisor_config.log_transform_reason})")
+
+                # Build auto_optimize_info for response
+                from backend.schemas import AutoOptimizeInfo
+                auto_optimize_info = AutoOptimizeInfo(
+                    enabled=True,
+                    forecastability_score=advisor_config.forecastability_score,
+                    grade=advisor_config.grade,
+                    training_window_weeks=advisor_config.training_window_weeks,
+                    from_date_applied=advisor_config.from_date if not request.from_date else None,
+                    log_transform=advisor_config.log_transform,
+                    models_selected=advisor_config.recommended_models,
+                    models_excluded=advisor_config.excluded_models,
+                    recommended_horizon=advisor_config.recommended_horizon,
+                    max_reliable_horizon=advisor_config.max_reliable_horizon,
+                    expected_mape_range=list(advisor_config.expected_mape_range),
+                    growth_pct=advisor_config.growth_pct,
+                    summary=advisor_config.summary,
+                )
+
+                # TRACE step
+                trace.add_step("AUTO_OPTIMIZE", df, "y", "ds", safe_covariates, {
+                    "forecastability_score": advisor_config.forecastability_score,
+                    "grade": advisor_config.grade,
+                    "growth_pct": advisor_config.growth_pct,
+                    "training_window": advisor_config.training_window_weeks,
+                    "from_date": advisor_config.from_date,
+                    "log_transform": advisor_config.log_transform,
+                    "models": advisor_config.recommended_models,
+                    "recommended_horizon": advisor_config.recommended_horizon,
+                    "max_reliable_horizon": advisor_config.max_reliable_horizon,
+                })
+
+            except Exception as e:
+                logger.warning(f"Auto-optimize failed (non-fatal, using defaults): {e}")
+                auto_optimize_info = AutoOptimizeInfo(enabled=False)
+
+        # ========================================
+        # LOG TRANSFORM FOR HIGH-GROWTH SERIES
+        # ========================================
+        # Log1p transform linearizes exponential growth, dramatically improving
+        # forecast accuracy on high-growth segments.
+        # All models train in log space; forecasts are inverse-transformed (expm1)
+        # back to original scale before returning to the user.
+        log_transform_applied = False
+        log_transform_mode = getattr(request, 'log_transform', 'auto') or 'auto'
+
+        if log_transform_mode != 'never' and len(df) >= 52:
+            should_transform = False
+            growth_pct = 0.0
+
+            if log_transform_mode == 'always':
+                should_transform = True
+                logger.info("Log transform: mode='always', applying log1p to target")
+            elif log_transform_mode == 'auto':
+                # Detect high growth: compare first 26 weeks vs last 26 weeks
+                sorted_y = df.sort_values('ds')['y']
+                first_half = sorted_y.head(len(sorted_y) // 2).mean()
+                second_half = sorted_y.tail(len(sorted_y) // 2).mean()
+                if first_half > 0:
+                    growth_pct = (second_half - first_half) / first_half * 100
+                    should_transform = growth_pct > 100  # >100% growth triggers transform
+                    if should_transform:
+                        logger.info(f"Log transform: auto-detected {growth_pct:.0f}% growth (>100% threshold), applying log1p")
+                    else:
+                        logger.info(f"Log transform: auto-detected {growth_pct:.0f}% growth (<100% threshold), skipping")
+
+            if should_transform:
+                # Validate: log1p requires non-negative values
+                if (df['y'] < 0).any():
+                    logger.warning("Log transform: skipped — negative values in target column")
+                else:
+                    df['y'] = np.log1p(df['y'])
+                    log_transform_applied = True
+                    logger.info(f"Log transform applied: y range [{df['y'].min():.2f}, {df['y'].max():.2f}] (log scale)")
+
+                    # Update historical stats to reflect log space
+                    historical_mean = df['y'].mean()
+                    historical_std = df['y'].std()
+
+                    # TRACE: Log transform step
+                    trace.add_step("LOG_TRANSFORM", df, "y", "ds", safe_covariates, {
+                        "transform": "log1p",
+                        "mode": log_transform_mode,
+                        "growth_pct": round(growth_pct, 1),
+                        "y_min_log": float(df['y'].min()),
+                        "y_max_log": float(df['y'].max()),
+                    })
+
+        # ========================================
         # CRITICAL: VALIDATE DATA IS SORTED BY DATE
         # ========================================
         # Time series splits REQUIRE chronologically sorted data.
@@ -1565,7 +1727,8 @@ async def train_model(request: TrainRequest):
 
         import mlflow
         from datetime import datetime
-        mlflow.set_tracking_uri("databricks")
+        tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "databricks")
+        mlflow.set_tracking_uri(tracking_uri)
         experiment_base = os.getenv("MLFLOW_EXPERIMENT_NAME", "/Shared/finance-forecasting")
 
         # For batch training, use a consistent experiment name based on batch_id
@@ -2192,15 +2355,24 @@ async def train_model(request: TrainRequest):
                             logger.info(f"      Matched rows after merge: {len(merged)}/{len(actual_df)}")
 
                             if len(merged) > 0:
+                                # Inverse transform holdout values if log transform was applied
+                                # so MAPE is computed in original scale (meaningful %)
+                                y_actual = merged['y'].values.copy()
+                                y_pred = merged['yhat'].values.copy()
+                                if log_transform_applied:
+                                    y_actual = np.expm1(y_actual)
+                                    y_pred = np.expm1(y_pred)
+
                                 # Use safe_mape from utils for robust calculation
                                 from backend.models.utils import safe_mape
-                                holdout_mape = safe_mape(merged['y'].values, merged['yhat'].values)
+                                holdout_mape = safe_mape(y_actual, y_pred)
 
                                 # Log per-point details for debugging
                                 logger.info(f"      Per-point comparison:")
-                                for _, row in merged.iterrows():
-                                    pct_err = abs(row['y'] - row['yhat']) / max(abs(row['y']), 1e-10) * 100
-                                    logger.info(f"         {row['ds'].strftime('%Y-%m-%d')}: actual={row['y']:,.0f}, pred={row['yhat']:,.0f}, error={pct_err:.1f}%")
+                                for idx in range(len(y_actual)):
+                                    dt = merged.iloc[idx]['ds']
+                                    pct_err = abs(y_actual[idx] - y_pred[idx]) / max(abs(y_actual[idx]), 1e-10) * 100
+                                    logger.info(f"         {dt.strftime('%Y-%m-%d')}: actual={y_actual[idx]:,.0f}, pred={y_pred[idx]:,.0f}, error={pct_err:.1f}%")
 
                                 # holdout_mape already computed by safe_mape above
                                 holdout_results.append({
@@ -2386,6 +2558,87 @@ async def train_model(request: TrainRequest):
         history_df = df.copy()
         history_df = history_df.rename(columns={'ds': request.time_col, 'y': request.target_col})
 
+        # ========================================
+        # INVERSE LOG TRANSFORM (expm1)
+        # ========================================
+        # If log transform was applied, convert everything back to original scale:
+        # - History data (for chart visualization)
+        # - All model forecasts (yhat, yhat_lower, yhat_upper)
+        # - All model validation predictions
+        if log_transform_applied:
+            logger.info(f"")
+            logger.info(f"{'='*60}")
+            logger.info(f"📐 INVERSE LOG TRANSFORM (expm1)")
+            logger.info(f"{'='*60}")
+
+            # 1. Inverse transform history data
+            target_col = request.target_col
+            if target_col in history_df.columns:
+                history_df[target_col] = np.expm1(history_df[target_col])
+                logger.info(f"   History: inverse-transformed {len(history_df)} rows back to original scale")
+
+            # 2. Inverse transform all model results (forecasts + validation)
+            for res in model_results:
+                model_label = res.model_name
+
+                # Transform forecast records
+                if res.forecast and isinstance(res.forecast, list):
+                    for record in res.forecast:
+                        for key in ('yhat', 'yhat_lower', 'yhat_upper'):
+                            if key in record and record[key] is not None:
+                                try:
+                                    record[key] = float(np.expm1(record[key]))
+                                except (ValueError, TypeError, OverflowError):
+                                    pass
+                    logger.info(f"   {model_label}: inverse-transformed {len(res.forecast)} forecast rows")
+
+                # Transform validation records and recompute eval metrics in original scale
+                if res.validation and isinstance(res.validation, list):
+                    for record in res.validation:
+                        for key in ('yhat', 'yhat_lower', 'yhat_upper', 'y'):
+                            if key in record and record[key] is not None:
+                                try:
+                                    record[key] = float(np.expm1(record[key]))
+                                except (ValueError, TypeError, OverflowError):
+                                    pass
+
+                    # Recompute eval MAPE in original scale
+                    try:
+                        from backend.models.utils import safe_mape
+                        val_y = np.array([r.get('y', 0) for r in res.validation if r.get('y') is not None])
+                        val_yhat = np.array([r.get('yhat', 0) for r in res.validation if r.get('yhat') is not None])
+                        if len(val_y) == len(val_yhat) and len(val_y) > 0:
+                            orig_mape = res.metrics.mape
+                            new_mape = safe_mape(val_y, val_yhat)
+                            res.metrics.mape = str(round(new_mape, 2))
+                            new_rmse = float(np.sqrt(np.mean((val_y - val_yhat) ** 2)))
+                            res.metrics.rmse = str(round(new_rmse, 2))
+                            logger.info(f"   {model_label}: MAPE recalculated {orig_mape}% (log) -> {new_mape:.2f}% (original scale)")
+                    except Exception as recomp_err:
+                        logger.debug(f"   {model_label}: could not recompute metrics: {recomp_err}")
+
+                    logger.info(f"   {model_label}: inverse-transformed {len(res.validation)} validation rows")
+
+            # 3. Log transform params to MLflow
+            try:
+                with mlflow.start_run(run_id=parent_run_id):
+                    mlflow.log_params({
+                        "log_transform_applied": True,
+                        "log_transform_mode": log_transform_mode,
+                    })
+            except Exception as mlflow_err:
+                logger.debug(f"   Could not log transform params to MLflow: {mlflow_err}")
+
+            # TRACE: Inverse transform step
+            trace.add_step("INVERSE_LOG_TRANSFORM", details={
+                "transform": "expm1",
+                "n_models_transformed": len(model_results),
+                "history_rows_transformed": len(history_df),
+            })
+
+            logger.info(f"   All values restored to original scale")
+            logger.info(f"{'='*60}")
+
         # Debug: Log date range and sample values to verify alignment
         if request.time_col in history_df.columns and len(history_df) > 0:
             logger.info(f"📅 History date range: {history_df[request.time_col].min()} to {history_df[request.time_col].max()}")
@@ -2471,7 +2724,7 @@ async def train_model(request: TrainRequest):
         # Store trace for retrieval via /api/debug/pipeline-trace
         store_trace(trace)
 
-        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data, trace_id=trace.trace_id)
+        return TrainResponse(models=[m.dict() for m in model_results], best_model=best_model_name, artifact_uri=artifact_uri_ref or "N/A", history=history_data, trace_id=trace.trace_id, auto_optimize_info=auto_optimize_info)
 
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

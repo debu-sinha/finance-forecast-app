@@ -24,7 +24,6 @@ from scipy import fft as scipy_fft
 from scipy.stats import entropy as scipy_entropy
 from statsmodels.tsa.seasonal import STL
 
-from backend.data_analyzer import _detect_trend
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +51,50 @@ class ForecastabilityGrade(str, Enum):
     FAIR = "fair"                  # 40-59
     POOR = "poor"                  # 20-39
     UNFORECASTABLE = "unforecastable"  # 0-19
+
+
+@dataclass
+class TrainingConfig:
+    """Auto-configured training settings based on data analysis.
+
+    Generic and dataset-agnostic — works with any time series data.
+    All recommendations are derived from statistical properties of the series,
+    not hardcoded to any specific dataset or domain.
+    """
+    # Training window
+    from_date: Optional[str]               # ISO date to start training from (None = use all)
+    training_window_weeks: Optional[int]    # Weeks of data to use (None = all)
+    training_window_reason: str
+
+    # Model selection
+    recommended_models: List[str]
+    excluded_models: List[str]
+    model_exclusion_reasons: Dict[str, str]
+
+    # Transform settings
+    log_transform: str                     # "auto", "always", "never"
+    log_transform_reason: str
+
+    # Horizon guidance
+    recommended_horizon: Optional[int]     # Suggested horizon (periods)
+    max_reliable_horizon: int              # Max horizon before accuracy degrades
+    horizon_reason: str
+
+    # Forecastability assessment
+    forecastability_score: float            # 0-100
+    grade: str                             # excellent/good/fair/poor/unforecastable
+    expected_mape_range: Tuple[float, float]
+
+    # Data characteristics detected
+    growth_pct: float
+    trend_strength: float
+    seasonal_strength: float
+    spectral_entropy: float
+    n_observations: int
+    data_warnings: List[str]
+
+    # Human-readable summary
+    summary: str
 
 
 @dataclass
@@ -922,5 +965,275 @@ class ForecastAdvisor:
                 f"{len(agg_recs)} aggregation recommendation(s) to improve forecastability "
                 f"of low-scoring slices."
             )
+
+        return " ".join(parts)
+
+    # =========================================================================
+    # AUTO-CONFIGURATION: Generic entry point for any dataset
+    # =========================================================================
+
+    def auto_configure_training(
+        self,
+        values: np.ndarray,
+        dates: pd.Series,
+        frequency: str = "weekly",
+        requested_horizon: Optional[int] = None,
+    ) -> TrainingConfig:
+        """
+        Analyze a single time series and return recommended training settings.
+
+        This is the generic auto-configuration entry point. It works with any
+        time series dataset — no domain-specific hardcoding. All recommendations
+        are derived from statistical properties of the series.
+
+        Args:
+            values: Target column values (numeric array, cleaned of NaN)
+            dates: Corresponding datetime Series
+            frequency: Data frequency ('daily', 'weekly', 'monthly')
+            requested_horizon: User's requested horizon (None = let advisor decide)
+
+        Returns:
+            TrainingConfig with all recommended settings
+        """
+        period = SEASONAL_PERIODS.get(frequency, 52)
+        n = len(values)
+
+        # Ensure dates is a pandas Series (not DatetimeIndex)
+        if not isinstance(dates, pd.Series):
+            dates = pd.Series(dates)
+        dates = pd.to_datetime(dates)
+
+        logger.info(
+            f"Auto-configure: {n} observations, frequency={frequency}, "
+            f"period={period}, requested_horizon={requested_horizon}"
+        )
+
+        # Compute growth
+        total_growth = self._compute_growth(values, n)
+        recent_growth = self._compute_recent_growth(values, period)
+
+        # Data quality (use self as peer for single-series)
+        mean_val = float(np.mean(values)) if n > 0 else 0.0
+        dq = self._data_quality_check(values, dates, [mean_val], frequency, period)
+
+        # Forecastability score
+        if n >= period * 2:
+            score, signals = self._compute_forecastability_score(values, period)
+        else:
+            score = max(10, min(30, n / (period * 2) * 40))
+            signals = {
+                "spectral_entropy": 0.8,
+                "trend_strength": 0.0,
+                "seasonal_strength": 0.0,
+                "linearity": 0.0,
+                "spikiness": 1.0,
+                "acf1_remainder": 0.0,
+            }
+
+        grade = self._score_to_grade(score)
+
+        # Model selection
+        rec_models, exc_models, exc_reasons = self._recommend_models(
+            score, total_growth, signals["spectral_entropy"],
+            signals["trend_strength"], n
+        )
+
+        # Training window
+        training_window, window_reason = self._recommend_training_window(total_growth, n)
+
+        # Compute from_date if window is recommended
+        from_date = None
+        if training_window is not None and n > training_window:
+            dates_sorted = dates.sort_values()
+            cutoff_idx = max(0, len(dates_sorted) - training_window)
+            from_date = dates_sorted.iloc[cutoff_idx].strftime("%Y-%m-%d")
+
+        # Log transform recommendation
+        log_transform, log_reason = self._recommend_log_transform(
+            values, total_growth, score
+        )
+
+        # Horizon recommendation
+        rec_horizon, max_horizon, horizon_reason = self._recommend_horizon(
+            score, n, period, frequency, requested_horizon
+        )
+
+        # Expected MAPE
+        mape_range = self._estimate_expected_mape(score, dq.volume_level)
+
+        # Build summary
+        summary = self._build_auto_config_summary(
+            score, grade, total_growth, training_window,
+            rec_models, log_transform, rec_horizon, max_horizon, dq.warnings
+        )
+
+        return TrainingConfig(
+            from_date=from_date,
+            training_window_weeks=training_window,
+            training_window_reason=window_reason,
+            recommended_models=rec_models,
+            excluded_models=exc_models,
+            model_exclusion_reasons=exc_reasons,
+            log_transform=log_transform,
+            log_transform_reason=log_reason,
+            recommended_horizon=rec_horizon,
+            max_reliable_horizon=max_horizon,
+            horizon_reason=horizon_reason,
+            forecastability_score=round(score, 1),
+            grade=grade.value,
+            expected_mape_range=mape_range,
+            growth_pct=round(total_growth, 1),
+            trend_strength=round(signals["trend_strength"], 4),
+            seasonal_strength=round(signals["seasonal_strength"], 4),
+            spectral_entropy=round(signals["spectral_entropy"], 4),
+            n_observations=n,
+            data_warnings=dq.warnings,
+            summary=summary,
+        )
+
+    def _recommend_log_transform(
+        self, values: np.ndarray, growth_pct: float, score: float
+    ) -> Tuple[str, str]:
+        """
+        Recommend log transform strategy based on data characteristics.
+
+        Generic rules:
+        - High growth (>100%) with non-negative data -> 'always'
+        - Moderate growth or high variance ratio -> 'auto' (let runtime decide)
+        - Negative values present -> 'never'
+        - Low/flat growth -> 'never'
+        """
+        if (values < 0).any():
+            return "never", "Data contains negative values; log transform not applicable."
+
+        if growth_pct > 200:
+            return "always", (
+                f"Very high growth ({growth_pct:.0f}%). Log transform linearizes "
+                f"exponential patterns for much better model fit."
+            )
+        elif growth_pct > 100:
+            return "always", (
+                f"High growth ({growth_pct:.0f}%). Log transform recommended to "
+                f"stabilize variance and improve trend capture."
+            )
+        elif growth_pct > 50:
+            return "auto", (
+                f"Moderate growth ({growth_pct:.0f}%). Auto-detect will apply "
+                f"log transform if warranted by recent trend acceleration."
+            )
+        else:
+            return "never", (
+                f"Growth is moderate or low ({growth_pct:.0f}%). "
+                f"Log transform not needed."
+            )
+
+    def _recommend_horizon(
+        self,
+        score: float,
+        n_observations: int,
+        period: int,
+        frequency: str,
+        requested_horizon: Optional[int],
+    ) -> Tuple[Optional[int], int, str]:
+        """
+        Recommend forecast horizon based on forecastability and data volume.
+
+        Generic rules based on time series theory:
+        - More forecastable series support longer horizons
+        - Horizon should not exceed ~25% of training data length
+        - Low forecastability -> shorter horizon more reliable
+        - Never exceed one full seasonal cycle for poor series
+
+        Returns:
+            (recommended_horizon, max_reliable_horizon, reason)
+        """
+        # Max reliable horizon: ~25% of data, capped by forecastability
+        data_based_max = max(1, n_observations // 4)
+
+        if score >= 80:
+            # Excellent: can forecast up to a full seasonal cycle
+            max_horizon = min(data_based_max, period)
+            default = min(period // 4, max_horizon)  # ~13 for weekly
+            reason_prefix = "Highly forecastable series"
+        elif score >= 60:
+            max_horizon = min(data_based_max, period // 2)
+            default = min(period // 4, max_horizon)  # ~13 for weekly
+            reason_prefix = "Good forecastability"
+        elif score >= 40:
+            max_horizon = min(data_based_max, period // 4)
+            default = min(8, max_horizon)  # ~8 for weekly
+            reason_prefix = "Fair forecastability"
+        elif score >= 20:
+            max_horizon = min(data_based_max, period // 6)
+            default = min(4, max_horizon)  # ~4 for weekly
+            reason_prefix = "Poor forecastability — shorter horizon more reliable"
+        else:
+            max_horizon = min(data_based_max, 4)
+            default = min(4, max_horizon)
+            reason_prefix = "Very low forecastability — keep horizon short"
+
+        max_horizon = max(1, max_horizon)
+        default = max(1, default)
+
+        # If user requested a specific horizon, validate it
+        if requested_horizon is not None:
+            if requested_horizon <= max_horizon:
+                return (
+                    requested_horizon, max_horizon,
+                    f"{reason_prefix}. Requested horizon of {requested_horizon} "
+                    f"{frequency} periods is within reliable range (max {max_horizon})."
+                )
+            else:
+                return (
+                    requested_horizon, max_horizon,
+                    f"{reason_prefix}. Requested horizon of {requested_horizon} "
+                    f"exceeds reliable range (max {max_horizon} {frequency} periods). "
+                    f"Accuracy will degrade beyond {max_horizon} periods."
+                )
+
+        return (
+            default, max_horizon,
+            f"{reason_prefix}. Recommended {default} {frequency} periods "
+            f"(max reliable: {max_horizon})."
+        )
+
+    def _build_auto_config_summary(
+        self,
+        score: float,
+        grade: ForecastabilityGrade,
+        growth_pct: float,
+        training_window: Optional[int],
+        models: List[str],
+        log_transform: str,
+        rec_horizon: Optional[int],
+        max_horizon: int,
+        warnings: List[str],
+    ) -> str:
+        """Build human-readable summary of auto-configuration decisions."""
+        parts = []
+
+        parts.append(
+            f"Forecastability: {grade.value} (score {score:.0f}/100)."
+        )
+
+        if abs(growth_pct) > 50:
+            direction = "growth" if growth_pct > 0 else "decline"
+            parts.append(f"Detected {abs(growth_pct):.0f}% {direction} in the series.")
+
+        if training_window:
+            parts.append(f"Using last {training_window} weeks for training (recent data is more representative).")
+        else:
+            parts.append("Using all available data for training.")
+
+        parts.append(f"Models: {', '.join(models)}.")
+
+        if log_transform in ("always", "auto"):
+            parts.append(f"Log transform: {log_transform} (stabilizes high-growth variance).")
+
+        if rec_horizon:
+            parts.append(f"Recommended horizon: {rec_horizon} periods (max reliable: {max_horizon}).")
+
+        if warnings:
+            parts.append(f"Warnings: {'; '.join(warnings[:3])}")
 
         return " ".join(parts)

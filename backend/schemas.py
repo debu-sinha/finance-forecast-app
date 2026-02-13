@@ -85,6 +85,24 @@ class TrainRequest(BaseModel):
         default=None,
         description="Data-driven hyperparameter filters per model. Keys are model names (Prophet, ARIMA, ETS, XGBoost), values are dicts of param_name -> allowed_values."
     )
+    # Log transform for high-growth series
+    log_transform: Optional[str] = Field(
+        default="auto",
+        description="Log transform strategy for the target column. "
+                    "'auto' = detect high-growth series (>100% growth) and apply automatically, "
+                    "'always' = always apply log1p transform, "
+                    "'never' = never apply. Log transform linearizes exponential growth, "
+                    "improving accuracy on fast-growing segments."
+    )
+    # Smart auto-optimization
+    auto_optimize: bool = Field(
+        default=True,
+        description="When true, automatically analyze data characteristics and optimize "
+                    "training settings before model fitting. Uses spectral entropy, "
+                    "STL decomposition, and growth analysis to select optimal training "
+                    "window, models, log transform, and horizon. Set to false to use "
+                    "your explicit settings without modification."
+    )
     
     class Config:
         json_schema_extra = {
@@ -184,6 +202,23 @@ class ModelResult(BaseModel):
     test_result: Optional[ModelTestResult] = Field(None, description="Pre-deployment test result. Only deploy models where test_passed=True")
 
 
+class AutoOptimizeInfo(BaseModel):
+    """Information about auto-optimization decisions applied before training."""
+    enabled: bool = Field(..., description="Whether auto-optimization was applied")
+    forecastability_score: Optional[float] = Field(default=None, description="Forecastability score 0-100")
+    grade: Optional[str] = Field(default=None, description="Forecastability grade")
+    training_window_weeks: Optional[int] = Field(default=None, description="Training window applied (weeks)")
+    from_date_applied: Optional[str] = Field(default=None, description="Training start date applied")
+    log_transform: Optional[str] = Field(default=None, description="Log transform setting applied")
+    models_selected: Optional[List[str]] = Field(default=None, description="Models selected by advisor")
+    models_excluded: Optional[List[str]] = Field(default=None, description="Models excluded by advisor")
+    recommended_horizon: Optional[int] = Field(default=None, description="Recommended horizon")
+    max_reliable_horizon: Optional[int] = Field(default=None, description="Max reliable horizon")
+    expected_mape_range: Optional[List[float]] = Field(default=None, description="Expected MAPE range [low, high]")
+    growth_pct: Optional[float] = Field(default=None, description="Detected growth percentage")
+    summary: Optional[str] = Field(default=None, description="Human-readable summary of decisions")
+
+
 class TrainResponse(BaseModel):
     """Response model for training endpoint"""
     models: List[ModelResult] = Field(..., description="Results for each trained model")
@@ -191,6 +226,7 @@ class TrainResponse(BaseModel):
     artifact_uri: str = Field(..., description="MLflow artifact location")
     history: List[Dict[str, Any]] = Field(default=[], description="Historical data (actuals) used for training")
     trace_id: Optional[str] = Field(default=None, description="Pipeline trace ID for debugging")
+    auto_optimize_info: Optional[AutoOptimizeInfo] = Field(default=None, description="Auto-optimization decisions applied before training. None if auto_optimize was disabled.")
     
     class Config:
         json_schema_extra = {
