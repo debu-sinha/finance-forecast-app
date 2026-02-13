@@ -113,9 +113,15 @@ class HolidayAnalyzer:
 
         df = df.copy()
         df[time_col] = pd.to_datetime(df[time_col])
+        # Clean target column — handle string-formatted numbers ("29,031" etc.)
+        if df[target_col].dtype == "object" or df[target_col].dtype.name == "string":
+            cleaned = df[target_col].astype(str).str.replace(",", "", regex=False)
+            cleaned = cleaned.str.replace("$", "", regex=False)
+            cleaned = cleaned.str.replace(" ", "", regex=False)
+            df[target_col] = pd.to_numeric(cleaned, errors="coerce")
         df = df.sort_values(time_col).reset_index(drop=True)
 
-        values = df[target_col].values.astype(float)
+        values = df[target_col].dropna().values.astype(float)
         dates = df[time_col]
 
         # Get seasonal period

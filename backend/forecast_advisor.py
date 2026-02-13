@@ -27,6 +27,22 @@ from statsmodels.tsa.seasonal import STL
 
 logger = logging.getLogger(__name__)
 
+
+def _clean_numeric_column(series: pd.Series) -> pd.Series:
+    """
+    Clean a column that may contain string-formatted numbers.
+
+    Handles CSV exports from Excel with comma separators, currency symbols,
+    whitespace, etc.  Returns a numeric Series with non-parseable values as NaN.
+    """
+    if series.dtype == "object" or series.dtype.name == "string":
+        cleaned = series.astype(str).str.replace(",", "", regex=False)
+        cleaned = cleaned.str.replace("$", "", regex=False)
+        cleaned = cleaned.str.replace(" ", "", regex=False)
+        return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(series, errors="coerce")
+
+
 # Seasonal period by frequency
 SEASONAL_PERIODS = {
     "daily": 7,
@@ -223,6 +239,8 @@ class ForecastAdvisor:
 
         df = df.copy()
         df[time_col] = pd.to_datetime(df[time_col])
+        # Clean target column — handle string-formatted numbers ("29,031" etc.)
+        df[target_col] = _clean_numeric_column(df[target_col])
         df = df.sort_values(time_col).reset_index(drop=True)
 
         period = SEASONAL_PERIODS.get(frequency, 52)

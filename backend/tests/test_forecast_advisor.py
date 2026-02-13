@@ -870,3 +870,96 @@ class TestRecommendHorizon:
             frequency="weekly", requested_horizon=10
         )
         assert rec == 10
+
+
+# ==============================================================================
+# String-Formatted Numeric Column Tests
+# ==============================================================================
+
+
+class TestStringFormattedColumns:
+    """Test that string-formatted numbers (from Excel CSV exports) are handled."""
+
+    def test_comma_separated_target_column(self):
+        """Target column with commas like '29,031' should be cleaned automatically."""
+        n = 156
+        dates = _make_weekly_dates(n)
+        raw_values = _make_sine_wave(n, baseline=29000, amplitude=5000)
+
+        # Simulate Excel CSV export with comma-formatted numbers
+        df = pd.DataFrame({
+            "WEEK": dates,
+            "TOT_VOL": [f"{int(v):,}" for v in raw_values],  # "29,031" format
+        })
+
+        assert df["TOT_VOL"].dtype == "object"  # String column
+
+        advisor = ForecastAdvisor()
+        result = advisor.analyze_all_slices(
+            df=df,
+            time_col="WEEK",
+            target_col="TOT_VOL",
+            dimension_cols=[],
+        )
+
+        assert result.total_slices == 1
+        sa = result.slice_analyses[0]
+        assert sa.forecastability_score > 0
+        assert sa.data_quality.n_observations == n
+        assert sa.data_quality.weekly_mean > 20000  # Should parse large numbers correctly
+
+    def test_currency_formatted_target_column(self):
+        """Target column with '$1,234' format should be cleaned."""
+        n = 156
+        dates = _make_weekly_dates(n)
+        raw_values = _make_sine_wave(n, baseline=1000, amplitude=200)
+
+        df = pd.DataFrame({
+            "WEEK": dates,
+            "TOT_VOL": [f"${int(v):,}" for v in raw_values],  # "$1,234" format
+        })
+
+        advisor = ForecastAdvisor()
+        result = advisor.analyze_all_slices(
+            df=df,
+            time_col="WEEK",
+            target_col="TOT_VOL",
+            dimension_cols=[],
+        )
+
+        assert result.total_slices == 1
+        assert result.slice_analyses[0].data_quality.n_observations == n
+
+    def test_auto_configure_with_string_values(self):
+        """auto_configure_training should work when given pre-cleaned numeric arrays."""
+        advisor = ForecastAdvisor()
+        n = 200
+        dates = pd.date_range("2021-01-04", periods=n, freq="W-MON")
+        values = _make_sine_wave(n)
+
+        # auto_configure_training takes np.ndarray, not strings
+        # This verifies the contract: caller must pass numeric values
+        config = advisor.auto_configure_training(
+            values=values, dates=dates, frequency="weekly"
+        )
+
+        assert isinstance(config, TrainingConfig)
+        assert config.n_observations == n
+
+    def test_holiday_analyzer_with_string_target(self):
+        """Holiday analyzer should handle string-formatted target columns."""
+        n = 156
+        dates = _make_weekly_dates(n, start="2021-01-04")
+        raw_values = _make_sine_wave(n, baseline=5000, amplitude=500)
+
+        df = pd.DataFrame({
+            "WEEK": dates,
+            "TOT_VOL": [f"{int(v):,}" for v in raw_values],  # "5,123" format
+        })
+
+        analyzer = HolidayAnalyzer()
+        result = analyzer.analyze(df, time_col="WEEK", target_col="TOT_VOL")
+
+        # Should not crash, and should produce a valid result
+        assert result.summary is not None
+        assert isinstance(result.holiday_impacts, list)
