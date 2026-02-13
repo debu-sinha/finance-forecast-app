@@ -671,11 +671,12 @@ const App = () => {
     logger.debug('  filteredData.length:', filteredData.length);
 
     // Detect if target column is an average-type column (should use mean instead of sum)
-    const isAverageColumn = targetCol.toLowerCase().includes('avg') ||
-                            targetCol.toLowerCase().includes('average') ||
-                            targetCol.toLowerCase().includes('mean') ||
-                            targetCol.toLowerCase().includes('rate') ||
-                            targetCol.toLowerCase().includes('ue');
+    const lowerTarget = targetCol.toLowerCase();
+    const isAverageColumn = lowerTarget.includes('avg') ||
+                            lowerTarget.includes('average') ||
+                            lowerTarget.includes('mean') ||
+                            lowerTarget.includes('rate') ||
+                            lowerTarget.includes('per_');
     logger.debug('  isAverageColumn:', isAverageColumn, '(target:', targetCol, ')');
 
     // Track both sum and count for proper averaging
@@ -683,9 +684,9 @@ const App = () => {
 
     filteredData.forEach(row => {
       const rawDate = row[timeCol];
-      const dateObj = new Date(String(rawDate));
+      const dateObj = parseFlexibleDateUtil(String(rawDate));
 
-      if (isNaN(dateObj.getTime())) return;
+      if (!dateObj || isNaN(dateObj.getTime())) return;
 
       const dateKey = dateObj.toISOString().split('T')[0];
       const val = Number(row[targetCol]) || 0;
@@ -748,11 +749,12 @@ const App = () => {
     if (frequency === 'daily') return aggregatedData;
 
     // Detect if target column is an average-type column (should use mean instead of sum)
-    const isAverageColumn = targetCol.toLowerCase().includes('avg') ||
-                            targetCol.toLowerCase().includes('average') ||
-                            targetCol.toLowerCase().includes('mean') ||
-                            targetCol.toLowerCase().includes('rate') ||
-                            targetCol.toLowerCase().includes('ue');
+    const lowerTarget2 = targetCol.toLowerCase();
+    const isAverageColumn = lowerTarget2.includes('avg') ||
+                            lowerTarget2.includes('average') ||
+                            lowerTarget2.includes('mean') ||
+                            lowerTarget2.includes('rate') ||
+                            lowerTarget2.includes('per_');
 
     const groups = new Map<string, { row: DataRow; sum: number; count: number }>();
 
@@ -3131,7 +3133,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                               </div>
                             </div>
                           )}
-                          {trainingResult.autoOptimizeInfo.expected_mape_range != null && (
+                          {trainingResult.autoOptimizeInfo.expected_mape_range != null && trainingResult.autoOptimizeInfo.expected_mape_range.length >= 2 && (
                             <div className="bg-green-50 p-2 rounded border border-green-100">
                               <div className="text-green-600 font-semibold text-[10px]">Expected MAPE</div>
                               <div className="text-gray-800 font-medium">
