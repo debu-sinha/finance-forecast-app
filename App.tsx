@@ -37,7 +37,7 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { parseCSV } from './utils/csvParser';
-import { AppStep, DataRow, DatasetAnalysis, ForecastResult, CovariateImpact, ModelType, ModelRunResult, FutureRegressorMethod, Hyperparameters, TuningLog, ActualsComparisonResult, ActualsComparisonRow, MAPE_THRESHOLDS, DataAnalysisResult } from './types';
+import { AppStep, DataRow, DatasetAnalysis, ForecastResult, CovariateImpact, ModelType, ModelRunResult, FutureRegressorMethod, Hyperparameters, TuningLog, ActualsComparisonResult, ActualsComparisonRow, MAPE_THRESHOLDS, DataAnalysisResult, AutoOptimizeInfo } from './types';
 import { analyzeDataset, generateForecastInsights } from './services/analysisService';
 import { trainModelOnBackend, deployModel, generateExecutiveSummary, ActualsComparisonSummary, BatchTrainRequest, trainBatchOnBackend, analyzeTrainingData } from './services/databricksApi';
 import { BatchTraining } from './components/BatchTraining';
@@ -299,6 +299,19 @@ const detectFrequency = (data: DataRow[], dateCol: string): 'daily' | 'weekly' |
   return 'monthly';
 };
 
+// Color palette for model comparison charts — one distinct color per model type
+const MODEL_COLORS: Record<string, string> = {
+  prophet: '#3b82f6',          // blue
+  arima: '#10b981',            // emerald
+  exponential_smoothing: '#f59e0b',  // amber
+  sarimax: '#ec4899',          // pink
+  xgboost: '#8b5cf6',         // violet
+  statsforecast: '#06b6d4',    // cyan
+  chronos: '#f97316',          // orange
+  ensemble: '#6366f1',         // indigo
+  default: '#9ca3af',          // gray fallback
+};
+
 const App = () => {
   const [step, setStep] = useState<AppStep>(AppStep.UPLOAD);
 
@@ -334,6 +347,9 @@ const App = () => {
 
   const [regressorMethod, setRegressorMethod] = useState<FutureRegressorMethod>('last_value');
   const [selectedModels, setSelectedModels] = useState<ModelType[]>(['prophet']);
+
+  // Auto-Optimization State
+  const [autoOptimize, setAutoOptimize] = useState<boolean>(true);
 
   // Seasonality State
   const [seasonalityMode, setSeasonalityMode] = useState<'additive' | 'multiplicative'>('multiplicative');
@@ -387,6 +403,7 @@ const App = () => {
   const [filteredActualsForComparison, setFilteredActualsForComparison] = useState<DataRow[]>([]); // Store filtered actuals used in comparison
   const [comparisonSeverityFilter, setComparisonSeverityFilter] = useState<string[]>([]); // Filter by severity: 'excellent', 'good', 'acceptable', 'review', 'significant_deviation'
   const actualsFileInputRef = useRef<HTMLInputElement>(null);
+  const [autoCompareAfterTraining, setAutoCompareAfterTraining] = useState(false);
 
   // Deployment State
   const [isDeploying, setIsDeploying] = useState(false);
@@ -444,6 +461,20 @@ const App = () => {
       }
     }
   }, [batchTrainingSummary, batchSegmentCols]);
+
+  // Auto-recompute actuals comparison after training completes.
+  // Uses useEffect instead of setTimeout to avoid stale closure over trainingResult.
+  // Dependency array intentionally limited to [autoCompareAfterTraining, trainingResult] —
+  // we only want this to fire when the flag is set after training, not on actuals data changes.
+  useEffect(() => {
+    if (autoCompareAfterTraining && trainingResult && actualsData.length > 0 && actualsDateCol && actualsValueCol) {
+      logger.debug('📊 Auto-recomputing actuals comparison with fresh trainingResult');
+      const dataToCompare = filteredActualsForComparison.length > 0 ? filteredActualsForComparison : actualsData;
+      compareActualsWithForecast(dataToCompare, actualsDateCol, actualsValueCol, 0);
+      setAutoCompareAfterTraining(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoCompareAfterTraining, trainingResult]);
 
   const resetApp = () => {
     setStep(AppStep.UPLOAD);
@@ -1053,7 +1084,10 @@ const App = () => {
             }
             // Sum values for duplicate dates (aggregate behavior)
             const existingValue = actualsMap.get(dateKey) || 0;
-            actualsMap.set(dateKey, existingValue + Number(row[valueCol]));
+            const parsedValue = Number(row[valueCol]);
+            if (!isNaN(parsedValue)) {
+              actualsMap.set(dateKey, existingValue + parsedValue);
+            }
             parsedActualDates.push(dateKey);
           }
         }
@@ -1226,8 +1260,14 @@ const App = () => {
         return;
       }
 
-      // Calculate overall metrics
-      const overallMAPE = comparisonRows.reduce((sum, r) => sum + r.mape, 0) / comparisonRows.length;
+      // Calculate overall metrics using volume-weighted MAPE
+      // Simple mean MAPE is distorted by low-volume outlier weeks (e.g., partial weeks
+      // with very small actuals produce 500%+ MAPE that dominates the average).
+      // Weighted MAPE = sum(|actual - predicted|) / sum(|actual|) * 100
+      // gives proportional weight to each period based on its volume.
+      const totalAbsActual = comparisonRows.reduce((sum, r) => sum + Math.abs(r.actual), 0);
+      const totalAbsError = comparisonRows.reduce((sum, r) => sum + Math.abs(r.error), 0);
+      const overallMAPE = totalAbsActual > 0 ? (totalAbsError / totalAbsActual) * 100 : 0;
       const overallRMSE = Math.sqrt(comparisonRows.reduce((sum, r) => sum + r.error * r.error, 0) / comparisonRows.length);
       const overallBias = comparisonRows.reduce((sum, r) => sum + r.error, 0) / comparisonRows.length;
 
@@ -1622,6 +1662,9 @@ const App = () => {
     setStep(AppStep.TRAINING);
     setIsTraining(true);
     setTrainingResult(null);
+    setActualsComparison(null); // Clear stale comparison — old predictions no longer valid
+    setComparisonModelIndex(0); // Reset model selection for next comparison
+    setIsGeneratingSummary(false); // Clear stale summary state from prior run
     setTrainingProgress(10);
     setTrainingStatus('Sending data to Databricks Cluster (Python Backend)...');
     setTuningLogs([]);
@@ -1793,7 +1836,9 @@ const App = () => {
         trainingEndDate || undefined,     // to_date
         randomSeed,                        // random_seed
         futureFeatures.length > 0 ? futureFeatures : undefined,  // future_features
-        hyperparameterFilters  // hyperparameter_filters from data analysis
+        hyperparameterFilters,  // hyperparameter_filters from data analysis
+        autoOptimize,           // auto-optimization toggle
+        'auto'                  // log_transform mode
       );
 
       setTrainingProgress(80);
@@ -1920,12 +1965,30 @@ const App = () => {
       logger.debug('Covariate Impacts:', covariateImpacts);
       logger.debug('🏆 Best Model:', bestModel.modelName);
 
+      // Extract auto-optimization info from backend response
+      const autoOptimizeInfo: AutoOptimizeInfo | undefined = backendResponse.auto_optimize_info ? {
+        enabled: backendResponse.auto_optimize_info.enabled ?? false,
+        forecastability_score: backendResponse.auto_optimize_info.forecastability_score ?? null,
+        grade: backendResponse.auto_optimize_info.grade ?? null,
+        training_window_weeks: backendResponse.auto_optimize_info.training_window_weeks ?? null,
+        from_date_applied: backendResponse.auto_optimize_info.from_date_applied ?? null,
+        log_transform: backendResponse.auto_optimize_info.log_transform ?? null,
+        models_selected: backendResponse.auto_optimize_info.models_selected ?? null,
+        models_excluded: backendResponse.auto_optimize_info.models_excluded ?? null,
+        recommended_horizon: backendResponse.auto_optimize_info.recommended_horizon ?? null,
+        max_reliable_horizon: backendResponse.auto_optimize_info.max_reliable_horizon ?? null,
+        expected_mape_range: backendResponse.auto_optimize_info.expected_mape_range ?? null,
+        growth_pct: backendResponse.auto_optimize_info.growth_pct ?? null,
+        summary: backendResponse.auto_optimize_info.summary ?? null,
+      } : undefined;
+
       setTrainingResult({
         history: sortedData,
         results: modelResults,
         explanation: aiResult.explanation || '',
         pythonCode: aiResult.pythonCode || '',
-        covariateImpacts: covariateImpacts
+        covariateImpacts: covariateImpacts,
+        autoOptimizeInfo: autoOptimizeInfo
       });
 
       // Set active model to best model
@@ -1972,6 +2035,13 @@ const App = () => {
       } finally {
         setIsGeneratingSummary(false);
         logger.debug('🔚 Executive summary generation finished');
+      }
+
+      // Flag for auto-recompute — the useEffect below handles the actual comparison
+      // after trainingResult state is committed, avoiding stale closure issues
+      if (actualsData.length > 0 && actualsDateCol && actualsValueCol) {
+        logger.debug('📊 Actuals data available — flagging for auto-recompute after state update');
+        setAutoCompareAfterTraining(true);
       }
 
       // Transition to results - using setTimeout to ensure state updates are processed
@@ -2491,6 +2561,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                           {/* Model Recommendations */}
                           <div className="mb-2">
                             <span className="text-[10px] font-bold text-gray-600 block mb-1">Model Recommendations:</span>
+                            <p className="text-[9px] text-gray-400 mb-1 italic">Based on aggregate data characteristics. Suitability may vary by slice.</p>
                             <div className="space-y-1.5 max-h-48 overflow-y-auto">
                               {dataAnalysis.modelRecommendations.map((rec) => (
                                 <div
@@ -2506,7 +2577,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                       {rec.recommended ? '✓' : '✗'} {rec.model}
                                     </span>
                                     <span className={`text-[9px] px-1 py-0.5 rounded ${
-                                      rec.confidence >= 0.7 ? 'bg-green-200 text-green-800' :
+                                      rec.recommended ? 'bg-green-200 text-green-800' :
                                       rec.confidence >= 0.5 ? 'bg-yellow-200 text-yellow-800' :
                                       'bg-gray-200 text-gray-600'
                                     }`}>
@@ -2537,6 +2608,44 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                           >
                             Hide Analysis
                           </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Auto-Optimize Toggle */}
+                    <div className="pt-4 border-t border-gray-100">
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="block text-xs font-bold text-gray-500 uppercase">Auto-Optimization</label>
+                        <button
+                          onClick={() => setAutoOptimize(!autoOptimize)}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                            autoOptimize ? 'bg-green-500' : 'bg-gray-300'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                              autoOptimize ? 'translate-x-4.5' : 'translate-x-0.5'
+                            }`}
+                          />
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-gray-500 mb-2">
+                        {autoOptimize
+                          ? 'Enabled: Training window, model selection, and log transform will be auto-configured based on data characteristics.'
+                          : 'Disabled: Manual configuration will be used as-is.'}
+                      </p>
+                      {autoOptimize && (
+                        <div className="bg-green-50 border border-green-200 rounded-md p-2 text-[10px] text-green-700">
+                          <div className="flex items-center space-x-1 mb-1">
+                            <BrainCircuit className="w-3 h-3" />
+                            <span className="font-semibold">Smart defaults applied at training time</span>
+                          </div>
+                          <ul className="ml-4 space-y-0.5 text-green-600">
+                            <li>Training window trimmed for high-growth data</li>
+                            <li>Unreliable models (ARIMA, SARIMAX, XGBoost) auto-excluded</li>
+                            <li>Log transform applied when data shows high skewness</li>
+                            <li>Your manual selections are respected as overrides</li>
+                          </ul>
                         </div>
                       )}
                     </div>
@@ -2576,12 +2685,17 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                     className="rounded text-[#1b57b1]"
                                   />
                                   <span className="text-sm text-gray-700 font-medium">{model.name}</span>
-                                  <span className={`text-[10px] font-semibold px-1 py-0.5 rounded ${
-                                    model.badgeColor === 'green' ? 'text-green-600 bg-green-50' :
-                                    model.badgeColor === 'blue' ? 'text-blue-600 bg-blue-50' :
-                                    model.badgeColor === 'purple' ? 'text-purple-600 bg-purple-50' :
-                                    'text-orange-600 bg-orange-50'
-                                  }`}>{model.badge}</span>
+                                  {/* Dim capability badge when model is not recommended to avoid conflicting signals */}
+                                  {(!rec || rec.recommended) ? (
+                                    <span className={`text-[10px] font-semibold px-1 py-0.5 rounded ${
+                                      model.badgeColor === 'green' ? 'text-green-600 bg-green-50' :
+                                      model.badgeColor === 'blue' ? 'text-blue-600 bg-blue-50' :
+                                      model.badgeColor === 'purple' ? 'text-purple-600 bg-purple-50' :
+                                      'text-orange-600 bg-orange-50'
+                                    }`}>{model.badge}</span>
+                                  ) : (
+                                    <span className="text-[10px] font-semibold px-1 py-0.5 rounded text-gray-400 bg-gray-100">{model.badge}</span>
+                                  )}
                                   {rec && (
                                     <span className={`ml-auto text-[9px] px-1 py-0.5 rounded ${
                                       rec.recommended ? 'bg-green-200 text-green-800' : 'bg-gray-200 text-gray-600'
@@ -2925,6 +3039,93 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       )}
                     </div>
 
+                    {/* Auto-Optimization Decisions */}
+                    {trainingResult?.autoOptimizeInfo?.enabled && (
+                      <div className="mt-4 pt-4 border-t border-gray-200">
+                        <div className="flex items-center space-x-2 mb-2">
+                          <BrainCircuit className="w-4 h-4 text-green-600" />
+                          <span className="text-xs font-semibold text-gray-700">Auto-Optimization Applied</span>
+                          {trainingResult.autoOptimizeInfo.grade && (
+                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                              trainingResult.autoOptimizeInfo.grade === 'excellent' ? 'bg-green-100 text-green-700' :
+                              trainingResult.autoOptimizeInfo.grade === 'good' ? 'bg-blue-100 text-blue-700' :
+                              trainingResult.autoOptimizeInfo.grade === 'fair' ? 'bg-yellow-100 text-yellow-700' :
+                              trainingResult.autoOptimizeInfo.grade === 'poor' ? 'bg-orange-100 text-orange-700' :
+                              'bg-red-100 text-red-700'
+                            }`}>
+                              {trainingResult.autoOptimizeInfo.grade.toUpperCase()}
+                              {trainingResult.autoOptimizeInfo.forecastability_score != null &&
+                                ` (${trainingResult.autoOptimizeInfo.forecastability_score.toFixed(0)}/100)`}
+                            </span>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                          {trainingResult.autoOptimizeInfo.training_window_weeks != null && (
+                            <div className="bg-green-50 p-2 rounded border border-green-100">
+                              <div className="text-green-600 font-semibold text-[10px]">Training Window</div>
+                              <div className="text-gray-800 font-medium">
+                                {trainingResult.autoOptimizeInfo.training_window_weeks} weeks
+                              </div>
+                              {trainingResult.autoOptimizeInfo.from_date_applied && (
+                                <div className="text-gray-500 text-[9px]">
+                                  From: {trainingResult.autoOptimizeInfo.from_date_applied}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {trainingResult.autoOptimizeInfo.log_transform != null && (
+                            <div className="bg-green-50 p-2 rounded border border-green-100">
+                              <div className="text-green-600 font-semibold text-[10px]">Log Transform</div>
+                              <div className="text-gray-800 font-medium capitalize">
+                                {trainingResult.autoOptimizeInfo.log_transform}
+                              </div>
+                            </div>
+                          )}
+                          {trainingResult.autoOptimizeInfo.growth_pct != null && (
+                            <div className="bg-green-50 p-2 rounded border border-green-100">
+                              <div className="text-green-600 font-semibold text-[10px]">Data Growth</div>
+                              <div className="text-gray-800 font-medium">
+                                {trainingResult.autoOptimizeInfo.growth_pct > 0 ? '+' : ''}
+                                {trainingResult.autoOptimizeInfo.growth_pct.toFixed(1)}%
+                              </div>
+                            </div>
+                          )}
+                          {trainingResult.autoOptimizeInfo.expected_mape_range != null && (
+                            <div className="bg-green-50 p-2 rounded border border-green-100">
+                              <div className="text-green-600 font-semibold text-[10px]">Expected MAPE</div>
+                              <div className="text-gray-800 font-medium">
+                                {trainingResult.autoOptimizeInfo.expected_mape_range[0].toFixed(0)}%
+                                {' - '}
+                                {trainingResult.autoOptimizeInfo.expected_mape_range[1].toFixed(0)}%
+                              </div>
+                            </div>
+                          )}
+                          {trainingResult.autoOptimizeInfo.models_selected != null && (
+                            <div className="bg-green-50 p-2 rounded border border-green-100 col-span-2">
+                              <div className="text-green-600 font-semibold text-[10px]">Models Selected</div>
+                              <div className="text-gray-800 font-medium">
+                                {trainingResult.autoOptimizeInfo.models_selected.join(', ')}
+                              </div>
+                            </div>
+                          )}
+                          {trainingResult.autoOptimizeInfo.models_excluded != null &&
+                           trainingResult.autoOptimizeInfo.models_excluded.length > 0 && (
+                            <div className="bg-orange-50 p-2 rounded border border-orange-100 col-span-2">
+                              <div className="text-orange-600 font-semibold text-[10px]">Models Excluded</div>
+                              <div className="text-gray-700 font-medium">
+                                {trainingResult.autoOptimizeInfo.models_excluded.join(', ')}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        {trainingResult.autoOptimizeInfo.summary && (
+                          <p className="mt-2 text-[10px] text-gray-600 italic">
+                            {trainingResult.autoOptimizeInfo.summary}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {/* Preprocessing Applied Section */}
                     {covariates.length > 0 && (
                       <div className="mt-4 pt-4 border-t border-gray-200">
@@ -2967,14 +3168,14 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         <h4 className="text-sm font-bold text-emerald-900">Forecast Quality Summary</h4>
                       </div>
                       <div className={`text-xs font-bold px-2 py-1 rounded ${
-                        activeResult.metrics?.mape < 5 ? 'bg-green-100 text-green-700' :
-                        activeResult.metrics?.mape < 10 ? 'bg-yellow-100 text-yellow-700' :
-                        activeResult.metrics?.mape < 15 ? 'bg-orange-100 text-orange-700' :
+                        parseFloat(activeResult.metrics?.mape) < 5 ? 'bg-green-100 text-green-700' :
+                        parseFloat(activeResult.metrics?.mape) < 10 ? 'bg-yellow-100 text-yellow-700' :
+                        parseFloat(activeResult.metrics?.mape) < 15 ? 'bg-orange-100 text-orange-700' :
                         'bg-red-100 text-red-700'
                       }`}>
-                        {activeResult.metrics?.mape < 5 ? 'EXCELLENT' :
-                         activeResult.metrics?.mape < 10 ? 'GOOD' :
-                         activeResult.metrics?.mape < 15 ? 'FAIR' : 'NEEDS REVIEW'}
+                        {parseFloat(activeResult.metrics?.mape) < 5 ? 'EXCELLENT' :
+                         parseFloat(activeResult.metrics?.mape) < 10 ? 'GOOD' :
+                         parseFloat(activeResult.metrics?.mape) < 15 ? 'FAIR' : 'NEEDS REVIEW'}
                       </div>
                     </div>
 
@@ -3324,7 +3525,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                             .map(r => ({
                               name: r.modelType,
                               data: r.forecast,
-                              color: r.modelType === 'arima' ? '#10b981' : '#ec4899'
+                              color: MODEL_COLORS[r.modelType] || MODEL_COLORS['default']
                             }))
                           : []
                       }
@@ -3607,7 +3808,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                 {trainingResult?.results.map((model, idx) => (
                                   <option key={idx} value={idx}>
                                     {model.modelName} (MAPE: {model.metrics.mape}%, RMSE: {model.metrics.rmse})
-                                    {idx === 0 ? ' - Best Model' : ''}
+                                    {model.isBest ? ' - Best Model' : ''}
                                   </option>
                                 ))}
                               </select>
@@ -3635,8 +3836,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                             </div>
                             <div className="text-[10px] text-gray-400">Forecast vs Actuals</div>
                             <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity w-64 pointer-events-none z-10 text-left">
-                              <strong>Actuals Comparison MAPE</strong><br />
-                              Error calculated by comparing the model's predictions against actual values you uploaded. This shows real-world forecast accuracy.
+                              <strong>Volume-Weighted MAPE</strong><br />
+                              Error weighted by volume: high-volume weeks count more than low-volume outliers. Calculated as sum(|errors|) / sum(|actuals|). Individual row MAPEs show per-period accuracy.
                               <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
                             </div>
                           </div>

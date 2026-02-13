@@ -11,7 +11,7 @@ import glob as glob_module
 import hashlib
 import json
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -209,17 +209,17 @@ def cleanup_temp_files_and_memory():
     """Clean up temp files and free memory to prevent 'too many open files' errors."""
     try:
         # Clean up temp files that may have been created during MLflow logging
+        # Only clean up files created by this process (prefixed with 'ffa_')
         temp_patterns = [
-            '/tmp/*.csv',
-            '/tmp/*.pkl',
-            '/tmp/*.json',
-            '/tmp/tmp*',
+            '/tmp/ffa_*.csv',
+            '/tmp/ffa_*.pkl',
+            '/tmp/ffa_*.json',
         ]
         for pattern in temp_patterns:
             for f in glob_module.glob(pattern):
                 try:
                     os.remove(f)
-                except:
+                except Exception:
                     pass
 
         # Force garbage collection to release file handles
@@ -389,7 +389,7 @@ async def list_pipeline_traces():
 
 
 @app.get("/api/debug/training-log")
-async def get_training_log(lines: int = 500):
+async def get_training_log(lines: int = Query(default=500, ge=1, le=5000)):
     """Return the last N lines of the training log file."""
     try:
         with open(LOG_FILE, 'r') as f:
@@ -1299,6 +1299,9 @@ async def train_model(request: TrainRequest):
             raise ValueError("Invalid data or horizon")
         
         # Set random seeds for reproducibility
+        # Note: global seeds are acceptable here because Databricks Apps runs
+        # with MLFLOW_MAX_WORKERS=1 and requests are processed sequentially.
+        # For true concurrent multi-user, use np.random.default_rng(seed) per-request.
         import random
         import numpy as np
         seed = request.random_seed if request.random_seed is not None else 42
@@ -1570,17 +1573,26 @@ async def train_model(request: TrainRequest):
                 should_transform = True
                 logger.info("Log transform: mode='always', applying log1p to target")
             elif log_transform_mode == 'auto':
-                # Detect high growth: compare first 26 weeks vs last 26 weeks
+                # Dual-gate detection aligned with forecast_advisor._recommend_log_transform():
+                # Require BOTH extreme growth (>500%) AND multi-order magnitude (>10x)
+                # to prevent log transform from compressing genuine growth signals.
                 sorted_y = df.sort_values('ds')['y']
-                first_half = sorted_y.head(len(sorted_y) // 2).mean()
-                second_half = sorted_y.tail(len(sorted_y) // 2).mean()
+                n = len(sorted_y)
+                recent_n = min(n, 52)
+                recent_mean = float(sorted_y.tail(recent_n).mean())
+                early_mean = float(sorted_y.head(recent_n).mean()) if n > recent_n else recent_mean
+                magnitude_ratio = max(recent_mean, early_mean) / max(min(recent_mean, early_mean), 1)
+
+                first_half = sorted_y.head(n // 2).mean()
+                second_half = sorted_y.tail(n // 2).mean()
                 if first_half > 0:
                     growth_pct = (second_half - first_half) / first_half * 100
-                    should_transform = growth_pct > 100  # >100% growth triggers transform
-                    if should_transform:
-                        logger.info(f"Log transform: auto-detected {growth_pct:.0f}% growth (>100% threshold), applying log1p")
-                    else:
-                        logger.info(f"Log transform: auto-detected {growth_pct:.0f}% growth (<100% threshold), skipping")
+
+                should_transform = magnitude_ratio > 10 and growth_pct > 500
+                if should_transform:
+                    logger.info(f"Log transform: auto-detected {growth_pct:.0f}% growth + {magnitude_ratio:.1f}x magnitude, applying log1p")
+                else:
+                    logger.info(f"Log transform: auto-detect skipped (growth={growth_pct:.0f}%, magnitude={magnitude_ratio:.1f}x, need >500% + >10x)")
 
             if should_transform:
                 # Validate: log1p requires non-negative values
@@ -1765,18 +1777,18 @@ async def train_model(request: TrainRequest):
             try:
                 import json
                 original_data_df = pd.DataFrame(request.data)
-                original_data_df.to_csv("/tmp/original_uploaded_data.csv", index=False)
-                mlflow.log_artifact("/tmp/original_uploaded_data.csv", "input_data")  # Changed to input_data folder
+                original_data_df.to_csv("/tmp/ffa_original_uploaded_data.csv", index=False)
+                mlflow.log_artifact("/tmp/ffa_original_uploaded_data.csv", "input_data")  # Changed to input_data folder
                 logger.info(f"Logged original uploaded data to input_data/: {len(original_data_df)} rows with columns: {list(original_data_df.columns)}")
 
                 # Log pre-filter data (after type conversion but before date filtering)
-                pre_filter_df.to_csv("/tmp/pre_filter_data.csv", index=False)
-                mlflow.log_artifact("/tmp/pre_filter_data.csv", "datasets/raw")
+                pre_filter_df.to_csv("/tmp/ffa_pre_filter_data.csv", index=False)
+                mlflow.log_artifact("/tmp/ffa_pre_filter_data.csv", "datasets/raw")
                 logger.info(f"Logged pre-filter data to datasets/raw/: {len(pre_filter_df)} rows")
 
                 # Log post-filter data (after date range filtering)
-                df.to_csv("/tmp/post_filter_data.csv", index=False)
-                mlflow.log_artifact("/tmp/post_filter_data.csv", "datasets/processed")
+                df.to_csv("/tmp/ffa_post_filter_data.csv", index=False)
+                mlflow.log_artifact("/tmp/ffa_post_filter_data.csv", "datasets/processed")
                 logger.info(f"Logged post-filter data to datasets/processed/: {len(df)} rows")
                 
                 # Add train/eval/holdout split metadata
@@ -1803,9 +1815,9 @@ async def train_model(request: TrainRequest):
                         "end": str(holdout_df['ds'].max())
                     } if holdout_size > 0 else None
                 }
-                with open("/tmp/train_eval_holdout_split.json", "w") as f:
+                with open("/tmp/ffa_train_eval_holdout_split.json", "w") as f:
                     json.dump(split_metadata, f, indent=2)
-                mlflow.log_artifact("/tmp/train_eval_holdout_split.json", "metadata")
+                mlflow.log_artifact("/tmp/ffa_train_eval_holdout_split.json", "metadata")
                 logger.info(f"Logged train/eval/holdout split metadata: train={len(train_df)}, eval={len(eval_df)}, holdout={len(holdout_df) if holdout_size > 0 else 0}")
             except Exception as e:
                 logger.warning(f"Could not log original uploaded data or metadata: {e}")
@@ -2255,8 +2267,26 @@ async def train_model(request: TrainRequest):
                                 local_path = client.download_artifacts(res.run_id, "model_backup")
                                 backup_files = [f for f in os.listdir(local_path) if f.endswith('.pkl')]
                                 if backup_files:
+                                    import io
+                                    # Restricted unpickler: only allow safe types to prevent
+                                    # arbitrary code execution from malicious pickle files
+                                    class RestrictedUnpickler(pickle.Unpickler):
+                                        _SAFE_MODULES = {
+                                            'numpy', 'numpy.core', 'numpy.core.multiarray',
+                                            'pandas', 'pandas.core', 'pandas.core.frame',
+                                            'sklearn', 'prophet', 'statsmodels', 'xgboost',
+                                            'builtins', 'collections', 'copy', 'datetime',
+                                            'backend.models', 'backend.models.utils',
+                                            '__main__',
+                                        }
+                                        def find_class(self, module, name):
+                                            if any(module.startswith(safe) for safe in self._SAFE_MODULES):
+                                                return super().find_class(module, name)
+                                            raise pickle.UnpicklingError(
+                                                f"Blocked unpickling of {module}.{name} — not in allowlist"
+                                            )
                                     with open(os.path.join(local_path, backup_files[0]), 'rb') as f:
-                                        backup_data = pickle.load(f)
+                                        backup_data = RestrictedUnpickler(f).load()
                                     logger.info(f"   {res.model_name}: Loaded model from backup")
                                     # Use the wrapper from backup if available
                                     if 'wrapper' in backup_data:
@@ -2690,9 +2720,9 @@ async def train_model(request: TrainRequest):
         if best_model_name is None:
             # Check if any models were trained at all
             if model_results:
-                # Pick the first model that succeeded as fallback
+                # Pick the first model that actually succeeded (has valid metrics)
                 for result in model_results:
-                    if result.model_name:
+                    if result.run_id and result.metrics and result.metrics.mape != "N/A":
                         best_model_name = result.model_name
                         logger.warning(f"No best model selected via holdout - falling back to: {best_model_name}")
                         break
@@ -2700,7 +2730,7 @@ async def train_model(request: TrainRequest):
             if best_model_name is None:
                 # No models succeeded - raise meaningful error
                 error_msgs = [f"{r.model_name}: {r.test_result.message if r.test_result else 'Unknown error'}"
-                             for r in model_results if r.test_result and not r.test_result.passed]
+                             for r in model_results if r.test_result and not r.test_result.test_passed]
                 error_detail = f"All models failed training. Details: {'; '.join(error_msgs) if error_msgs else 'Unknown error'}"
                 logger.error(error_detail)
                 raise HTTPException(status_code=500, detail=error_detail)

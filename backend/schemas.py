@@ -45,7 +45,7 @@ class TrainRequest(BaseModel):
     time_col: str = Field(..., description="Name of the time/date column")
     target_col: str = Field(..., description="Name of the target column to forecast")
     covariates: List[str] = Field(default=[], description="List of covariate column names")
-    horizon: int = Field(default=12, description="Number of periods to forecast")
+    horizon: int = Field(default=12, ge=1, le=104, description="Number of periods to forecast (1-104)")
     frequency: Literal['daily', 'weekly', 'monthly'] = Field(default="monthly", description="Data frequency: 'daily', 'weekly', or 'monthly'")
     seasonality_mode: Literal['additive', 'multiplicative'] = Field(default="multiplicative", description="Seasonality mode: 'additive' or 'multiplicative'")
     # Data aggregation options for multi-dimensional data
@@ -348,7 +348,7 @@ class HealthResponse(BaseModel):
 class BatchTrainRequest(BaseModel):
     """Request model for batch training endpoint"""
     requests: List[TrainRequest] = Field(..., description="List of training requests to process in parallel")
-    max_workers: int = Field(default=4, description="Maximum number of parallel workers")
+    max_workers: int = Field(default=4, ge=1, le=16, description="Maximum number of parallel workers (1-16)")
 
     class Config:
         json_schema_extra = {
@@ -671,7 +671,7 @@ class TrainAsyncRequest(BaseModel):
     time_col: str = Field(..., description="Name of the time/date column")
     target_col: str = Field(..., description="Name of the target column to forecast")
     covariates: List[str] = Field(default=[], description="List of covariate column names")
-    horizon: int = Field(default=12, description="Number of periods to forecast")
+    horizon: int = Field(default=12, ge=1, le=104, description="Number of periods to forecast (1-104)")
     frequency: Literal['daily', 'weekly', 'monthly'] = Field(default="monthly", description="Data frequency")
     seasonality_mode: Literal['additive', 'multiplicative'] = Field(default="multiplicative", description="Seasonality mode")
     models: List[str] = Field(default=["prophet"], description="Models to train")

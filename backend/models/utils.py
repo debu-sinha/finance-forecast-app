@@ -658,7 +658,12 @@ def compute_prediction_intervals(
     else:
         critical_value = _get_z_critical_value(confidence_level)
 
-    margin = critical_value * residual_std
+    # Horizon-dependent widening: intervals grow with sqrt(h) to reflect
+    # increasing uncertainty over the forecast horizon.
+    h = len(forecast_values)
+    horizon_steps = np.arange(1, h + 1)
+    widening_factor = np.sqrt(1.0 + horizon_steps / max(n, 1))
+    margin = critical_value * residual_std * widening_factor
 
     # Vectorized bounds computation
     lower_bounds = forecast_values - margin

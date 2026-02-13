@@ -50,7 +50,15 @@ SEASONAL_PERIODS = {
     "monthly": 12,
 }
 
-# Signal weights for composite forecastability score
+# Signal weights for composite forecastability score.
+# These are heuristic weights chosen to prioritize the most informative signals:
+#   - spectral_entropy (0.30): Primary forecastability indicator per Goerg 2013 ForeCA.
+#   - trend/seasonal strength (0.20 each): Core STL-derived signals from tsfeatures (Hyndman 2015).
+#   - linearity, spikiness, acf1 (0.10 each): Secondary discriminators for edge cases.
+# Note: FFORMA (Montero-Manso 2020) uses tsfeatures as *inputs* to a gradient boosting
+# classifier, not a fixed weighted combination. These weights approximate the relative
+# importance found in FFORMA's feature importance analysis but are not trained on our data.
+# Future calibration: regress actual MAPE on signals using benchmark results.
 SIGNAL_WEIGHTS = {
     "spectral_entropy": 0.30,
     "trend_strength": 0.20,
@@ -400,7 +408,10 @@ class ForecastAdvisor:
         # STL decomposition
         trend, seasonal, remainder = self._stl_decompose(values, period)
 
-        # 1. Spectral entropy (0-1, lower = more forecastable)
+        # 1. Spectral entropy on raw series (0-1, lower = more forecastable)
+        # Per Goerg 2013 ForeCA: measures how concentrated the power spectrum is.
+        # Raw series is correct — trend/seasonal contribute to concentrated spectrum,
+        # and their contribution is already separated via trend_strength/seasonal_strength signals.
         se = self._compute_spectral_entropy(values)
 
         # 2. Trend strength from STL: 1 - Var(remainder) / Var(trend + remainder)
@@ -425,7 +436,7 @@ class ForecastAdvisor:
         ts_score = ts * 100                     # Higher trend strength = higher score
         ss_score = ss * 100                     # Higher seasonal strength = higher score
         lin_score = min(100, max(0, lin * 100)) # Higher linearity = higher score
-        spk_score = max(0, 100 - spk * 1000)   # Lower spikiness = higher score
+        spk_score = 100.0 / (1.0 + spk * 50)    # Sigmoid mapping: lower spikiness = higher score
         acf1_score = max(0, (1.0 - abs(acf1)) * 100)  # Low |acf1| = white noise remainder = good
 
         # Weighted combination
@@ -682,12 +693,15 @@ class ForecastAdvisor:
             return "very_high"
 
     def _compute_growth(self, values: np.ndarray, n: int) -> float:
-        """Compute total growth as percentage change from first to last quarter."""
+        """Compute total growth as percentage change from first to last quarter.
+
+        Uses median instead of mean for robustness to outliers and partial data weeks.
+        """
         if n < 8:
             return 0.0
         quarter = max(1, n // 4)
-        first_q = float(np.mean(values[:quarter]))
-        last_q = float(np.mean(values[-quarter:]))
+        first_q = float(np.median(values[:quarter]))
+        last_q = float(np.median(values[-quarter:]))
         if first_q == 0:
             return 0.0
         return ((last_q - first_q) / abs(first_q)) * 100
@@ -803,17 +817,17 @@ class ForecastAdvisor:
 
         Calibrated from our 12-slice benchmark (TOT_VOL + TOT_SUB, Oct 2025 cutoff).
         """
-        # Base MAPE range from score
+        # Base MAPE range from score (calibrated from 12-slice benchmark results)
         if score >= 80:
-            low, high = 1.0, 5.0
+            low, high = 3.0, 8.0
         elif score >= 60:
-            low, high = 5.0, 10.0
+            low, high = 8.0, 15.0
         elif score >= 40:
-            low, high = 10.0, 15.0
-        elif score >= 20:
             low, high = 15.0, 25.0
+        elif score >= 20:
+            low, high = 25.0, 40.0
         else:
-            low, high = 25.0, 50.0
+            low, high = 35.0, 60.0
 
         # Volume adjustment: low volume series have higher error
         if volume_level in ("very_low", "low"):
@@ -1115,24 +1129,65 @@ class ForecastAdvisor:
         """
         Recommend log transform strategy based on data characteristics.
 
+        Log transform (log1p) is useful when:
+        - Data spans multiple orders of magnitude (e.g., combining slices)
+        - Variance is proportional to level (heteroscedastic)
+
+        Log transform is HARMFUL when:
+        - Data has a strong upward/downward trend — compresses the growth signal,
+          causing models (especially ARIMA/StatsForecast) to produce flat forecasts
+        - Data range is within a single order of magnitude
+
         Generic rules:
-        - High growth (>100%) with non-negative data -> 'always'
-        - Moderate growth or high variance ratio -> 'auto' (let runtime decide)
-        - Negative values present -> 'never'
-        - Low/flat growth -> 'never'
+        - Negative values -> 'never'
+        - Single-series with strong trend -> 'never' (preserves growth signal)
+        - Multi-order-of-magnitude range (>10x) with low trend -> 'always'
+        - Moderate range -> 'auto'
         """
         if (values < 0).any():
             return "never", "Data contains negative values; log transform not applicable."
 
-        if growth_pct > 200:
+        # Check if data spans multiple orders of magnitude
+        recent_n = min(len(values), 52)
+        recent_mean = float(np.mean(values[-recent_n:]))
+        early_mean = float(np.mean(values[:recent_n])) if len(values) > recent_n else recent_mean
+        magnitude_ratio = max(recent_mean, early_mean) / max(min(recent_mean, early_mean), 1)
+
+        # Direct heteroscedasticity test: compare variance of first half vs second half.
+        # If variance grows proportionally with level, log transform stabilizes it.
+        n = len(values)
+        is_heteroscedastic = False
+        variance_ratio = 1.0
+        if n >= 20:
+            mid = n // 2
+            var_first = float(np.var(values[:mid]))
+            var_second = float(np.var(values[mid:]))
+            if var_first > 0:
+                variance_ratio = var_second / var_first
+                is_heteroscedastic = variance_ratio > 4.0  # 4x variance increase
+
+        # For trending data, log transform compresses the signal that models need.
+        # Only apply when data truly spans multiple orders of magnitude AND
+        # the concern is heteroscedasticity, not when it's just growth.
+        if magnitude_ratio > 10 and growth_pct > 500:
             return "always", (
-                f"Very high growth ({growth_pct:.0f}%). Log transform linearizes "
-                f"exponential patterns for much better model fit."
+                f"Data spans {magnitude_ratio:.0f}x range with {growth_pct:.0f}% growth. "
+                f"Log transform stabilizes extreme variance differences."
+            )
+        elif is_heteroscedastic and growth_pct <= 100:
+            # Multiplicative seasonality / heteroscedastic variance without extreme trend.
+            # Log transform helps without compressing the growth signal.
+            return "always", (
+                f"Heteroscedastic variance detected (variance ratio: {variance_ratio:.1f}x). "
+                f"Log transform stabilizes variance proportional to level."
             )
         elif growth_pct > 100:
-            return "always", (
-                f"High growth ({growth_pct:.0f}%). Log transform recommended to "
-                f"stabilize variance and improve trend capture."
+            # High growth but NOT multi-order-of-magnitude — log transform would
+            # compress the trend signal and cause flat forecasts from ARIMA/ETS
+            return "never", (
+                f"High growth ({growth_pct:.0f}%) but data stays within {magnitude_ratio:.1f}x range. "
+                f"Log transform would compress the trend signal, causing flat forecasts. "
+                f"Prophet and StatsForecast handle trends directly."
             )
         elif growth_pct > 50:
             return "auto", (

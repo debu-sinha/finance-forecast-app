@@ -109,11 +109,14 @@ class StatsForecastModelWrapper(mlflow.pyfunc.PythonModel):
         # Generate forecast using the fitted model
         try:
             # StatsForecast models are already fitted - use predict
-            forecast_df = self.fitted_model.predict(h=periods, level=[int(self.confidence_level * 100)])
+            forecast_df = self.fitted_model.predict(h=periods, level=[round(self.confidence_level * 100)])
 
             # Extract forecast values - column name varies by model
+            # Use dynamic confidence level suffix (e.g., -lo-95, -hi-80) instead of hardcoded -lo-90
+            conf_int = round(self.confidence_level * 100)
             forecast_cols = [c for c in forecast_df.columns if c not in ['unique_id', 'ds']]
-            main_col = [c for c in forecast_cols if not c.endswith('-lo-90') and not c.endswith('-hi-90')]
+            main_col = [c for c in forecast_cols
+                        if not c.endswith(f'-lo-{conf_int}') and not c.endswith(f'-hi-{conf_int}')]
 
             if main_col:
                 forecast_values = forecast_df[main_col[0]].values
@@ -121,8 +124,8 @@ class StatsForecastModelWrapper(mlflow.pyfunc.PythonModel):
                 forecast_values = forecast_df.iloc[:, -1].values
 
             # Get prediction intervals
-            lo_cols = [c for c in forecast_cols if c.endswith('-lo-90')]
-            hi_cols = [c for c in forecast_cols if c.endswith('-hi-90')]
+            lo_cols = [c for c in forecast_cols if c.endswith(f'-lo-{conf_int}')]
+            hi_cols = [c for c in forecast_cols if c.endswith(f'-hi-{conf_int}')]
 
             if lo_cols and hi_cols:
                 lower_bounds = forecast_df[lo_cols[0]].values
@@ -295,13 +298,15 @@ def train_statsforecast_model(
 
                 # Predict on test set length for validation
                 test_len = len(test_df)
-                val_forecast = sf.predict(h=test_len, level=[int(confidence_level * 100)])
+                val_forecast = sf.predict(h=test_len, level=[round(confidence_level * 100)])
 
                 # Extract predictions
+                # Dynamically match confidence level columns (e.g., -lo-95, -hi-80)
+                conf_int = round(confidence_level * 100)
                 pred_cols = [c for c in val_forecast.columns
                              if c not in ['unique_id', 'ds']
-                             and not c.endswith('-lo-90')
-                             and not c.endswith('-hi-90')]
+                             and not c.endswith(f'-lo-{conf_int}')
+                             and not c.endswith(f'-hi-{conf_int}')]
 
                 if pred_cols:
                     predictions = val_forecast[pred_cols[0]].values
@@ -380,14 +385,15 @@ def train_statsforecast_model(
 
         # Generate validation data
         test_len = len(test_df)
-        val_forecast = best_sf.predict(h=test_len, level=[int(confidence_level * 100)])
+        val_forecast = best_sf.predict(h=test_len, level=[round(confidence_level * 100)])
 
+        conf_int = round(confidence_level * 100)
         pred_cols = [c for c in val_forecast.columns
                      if c not in ['unique_id', 'ds']
-                     and not c.endswith('-lo-90')
-                     and not c.endswith('-hi-90')]
-        lo_cols = [c for c in val_forecast.columns if c.endswith('-lo-90')]
-        hi_cols = [c for c in val_forecast.columns if c.endswith('-hi-90')]
+                     and not c.endswith(f'-lo-{conf_int}')
+                     and not c.endswith(f'-hi-{conf_int}')]
+        lo_cols = [c for c in val_forecast.columns if c.endswith(f'-lo-{conf_int}')]
+        hi_cols = [c for c in val_forecast.columns if c.endswith(f'-hi-{conf_int}')]
 
         val_predictions = val_forecast[pred_cols[0]].values if pred_cols else val_forecast.iloc[:, -1].values
         val_lower = val_forecast[lo_cols[0]].values if lo_cols else val_predictions * 0.9
@@ -399,7 +405,7 @@ def train_statsforecast_model(
         validation_data['yhat_upper'] = val_upper[:len(validation_data)]
 
         # Generate future forecast
-        fcst_result = best_sf.predict(h=horizon, level=[int(confidence_level * 100)])
+        fcst_result = best_sf.predict(h=horizon, level=[round(confidence_level * 100)])
 
         fcst_predictions = fcst_result[pred_cols[0]].values if pred_cols else fcst_result.iloc[:, -1].values
         fcst_lower = fcst_result[lo_cols[0]].values if lo_cols else fcst_predictions * 0.9

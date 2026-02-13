@@ -254,12 +254,13 @@ class HolidayAnalyzer:
             anomaly_date = pd.Timestamp(date_str)
             found_holiday = None
 
-            # Check if any holiday falls within ±7 days of this week
+            # Match to the closest holiday within ±4 days (tighter for weekly data)
+            best_diff = float('inf')
             for holiday_date, holiday_name in holiday_lookup.items():
                 day_diff = abs((anomaly_date - holiday_date).days)
-                if day_diff <= 7:
+                if day_diff <= 4 and day_diff < best_diff:
+                    best_diff = day_diff
                     found_holiday = holiday_name
-                    break
 
             if found_holiday:
                 if found_holiday not in matched:
@@ -298,10 +299,10 @@ class HolidayAnalyzer:
         else:
             consistency = 0.5  # Unknown with single observation
 
-        # Confidence based on years observed
-        if n_years >= 3:
+        # Confidence based on years observed AND consistency
+        if n_years >= 3 and consistency >= 0.5:
             confidence = "high"
-        elif n_years == 2:
+        elif n_years >= 2 and consistency >= 0.3:
             confidence = "medium"
         else:
             confidence = "low"
@@ -415,7 +416,8 @@ class HolidayAnalyzer:
                 day = date.day
                 days_in_month = pd.Timestamp(year=date.year, month=date.month, day=1).days_in_month
 
-                is_near_boundary = day <= 7 or day >= days_in_month - 6
+                # Relaxed boundary: day <= 10 catches cases like Dec 8 2025
+                is_near_boundary = day <= 10 or day >= days_in_month - 6
 
                 if is_near_boundary:
                     drop_pct = ((values[i] / surrounding_mean) - 1) * 100

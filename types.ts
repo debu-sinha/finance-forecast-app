@@ -110,6 +110,22 @@ export interface TuningLog {
   status: 'testing' | 'complete';
 }
 
+export interface AutoOptimizeInfo {
+  enabled: boolean;
+  forecastability_score: number | null;
+  grade: string | null;                   // "excellent" | "good" | "fair" | "poor" | "unforecastable"
+  training_window_weeks: number | null;
+  from_date_applied: string | null;
+  log_transform: string | null;           // "always" | "auto" | "never"
+  models_selected: string[] | null;
+  models_excluded: string[] | null;
+  recommended_horizon: number | null;
+  max_reliable_horizon: number | null;
+  expected_mape_range: number[] | null;   // [low, high]
+  growth_pct: number | null;
+  summary: string | null;
+}
+
 export interface ForecastResult {
   history: DataRow[];     // The data used for training
   results: ModelRunResult[]; // Results for each trained model
@@ -117,6 +133,7 @@ export interface ForecastResult {
   pythonCode: string;
   covariateImpacts?: CovariateImpact[]; // Feature importance analysis
   executiveSummary?: string; // AI-generated executive summary
+  autoOptimizeInfo?: AutoOptimizeInfo; // Auto-optimization decisions
 }
 
 // Finance industry best practice MAPE thresholds

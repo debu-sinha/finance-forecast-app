@@ -304,9 +304,12 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
         });
       });
 
-      // Calculate overall stats
-      const mapes = comparisonRows.map(r => r.actualMAPE);
-      const overallMAPE = mapes.length > 0 ? mapes.reduce((a, b) => a + b, 0) / mapes.length : 0;
+      // Calculate overall stats using period-weighted MAPE
+      // Weights by number of matched forecast periods per segment, preventing
+      // low-coverage segments from skewing the overall accuracy metric
+      const totalAbsError = comparisonRows.reduce((sum, r) => sum + (r.actualMAPE * r.periodsCompared), 0);
+      const totalPeriods = comparisonRows.reduce((sum, r) => sum + r.periodsCompared, 0);
+      const overallMAPE = totalPeriods > 0 ? totalAbsError / totalPeriods : 0;
 
       const segmentsByStatus = {
         excellent: comparisonRows.filter(r => r.status === 'excellent').length,
@@ -727,7 +730,7 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
 
                 <div className="mt-3 text-center">
                   <span className="text-sm text-gray-600">
-                    Overall MAPE: <strong className={`text-lg ${
+                    Overall MAPE (weighted): <strong className={`text-lg ${
                       comparisonResult.overallMAPE <= 10 ? 'text-green-600' :
                       comparisonResult.overallMAPE <= 15 ? 'text-yellow-600' : 'text-red-600'
                     }`}>{comparisonResult.overallMAPE.toFixed(2)}%</strong>

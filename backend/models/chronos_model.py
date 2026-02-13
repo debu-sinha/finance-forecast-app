@@ -233,7 +233,7 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
                 forecast = pipeline.predict(
                     context_tensor.unsqueeze(0),
                     prediction_length=periods,
-                    num_samples=20  # Generate samples for uncertainty
+                    num_samples=200  # Generate samples for reliable prediction intervals
                 )
 
                 # Extract median forecast and quantiles
@@ -387,7 +387,7 @@ def train_chronos_model(
                 forecast_samples = pipeline.predict(
                     context_tensor.unsqueeze(0),
                     prediction_length=test_len,
-                    num_samples=20
+                    num_samples=200
                 )
 
                 forecast_np = forecast_samples[0].numpy()
@@ -416,8 +416,8 @@ def train_chronos_model(
         logger.info(f"  ✓ Chronos {model_size}: MAPE={metrics['mape']:.2f}%, RMSE={metrics['rmse']:.2f}")
 
         # No cross-validation for zero-shot model
-        metrics["cv_mape"] = 0.0  # Use 0.0 instead of None for type safety
-        metrics["cv_mape_std"] = 0.0
+        metrics["cv_mape"] = None  # Zero-shot model: no cross-validation performed
+        metrics["cv_mape_std"] = None
 
         # Create validation DataFrame
         validation_data = pd.DataFrame({
@@ -439,7 +439,7 @@ def train_chronos_model(
                 forecast_samples = pipeline.predict(
                     context_tensor.unsqueeze(0),
                     prediction_length=horizon,
-                    num_samples=20
+                    num_samples=200
                 )
 
                 forecast_np = forecast_samples[0].numpy()

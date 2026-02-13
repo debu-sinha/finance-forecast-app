@@ -421,6 +421,40 @@ class TestAggregationRecommendations:
         if poor_count < 2:
             assert len(result.aggregation_recommendations) == 0
 
+    def test_recommends_merging_poor_siblings(self):
+        """Two noisy sibling slices that share dimensions should recommend merging."""
+        np.random.seed(42)
+        n = 156
+        # Two very noisy slices (white noise) sharing CGNA=1 and Pickup
+        # When combined, the noise partially cancels out,
+        # potentially improving the forecastability score.
+        slices = {
+            ("1", "Pickup", "Ent"): _make_white_noise(n, mean=50, std=40),
+            ("1", "Pickup", "SMB"): _make_white_noise(n, mean=50, std=40),
+            # Add a good slice so the advisor has something to compare
+            ("0", "Classic", "Ent"): _make_sine_wave(n, baseline=5000),
+        }
+        df = _make_multislice_df(n_weeks=n, slices=slices)
+        advisor = ForecastAdvisor()
+
+        result = advisor.analyze_all_slices(
+            df=df,
+            time_col="WEEK",
+            target_col="TOT_VOL",
+            dimension_cols=["IS_CGNA", "ORDER_PROTOCOL", "BIZ_SIZE"],
+        )
+
+        # The two noisy slices should score poorly
+        noisy_analyses = [
+            sa for sa in result.slice_analyses
+            if sa.filters.get("ORDER_PROTOCOL") == "Pickup"
+        ]
+        assert len(noisy_analyses) == 2
+        for sa in noisy_analyses:
+            assert sa.forecastability_score < 50, (
+                f"Noisy slice {sa.slice_name} should score poorly, got {sa.forecastability_score:.1f}"
+            )
+
 
 # ==============================================================================
 # Holiday Analyzer Tests
@@ -466,24 +500,29 @@ class TestHolidayAnalyzer:
         assert "Insufficient" in result.summary
 
     def test_partial_data_detection(self):
-        """Week with sudden drop should be flagged as potential partial data."""
-        dates = _make_weekly_dates(156)
-        values = np.full(156, 1000.0)
+        """Week with sudden drop should be flagged as anomalous or partial data."""
+        # Use enough data for STL decomposition (>= 2 * period + 1)
+        n = 156
+        dates = _make_weekly_dates(n)
+        # Add some noise so STL decomposition works properly
+        np.random.seed(42)
+        values = 1000.0 + np.random.normal(0, 20, n)
 
-        # Inject a partial data week (sharp drop at month boundary)
-        # Week index ~100 — pick a date near month end
-        values[100] = 300  # 70% drop
+        # Inject a sharp drop that should be detected as anomalous
+        values[100] = 300  # 70% drop from ~1000 to 300
 
         df = pd.DataFrame({"WEEK": dates, "TOT_VOL": values})
         analyzer = HolidayAnalyzer()
         result = analyzer.analyze(df, time_col="WEEK", target_col="TOT_VOL")
 
-        # The partial week detection checks if the week is near a month boundary
-        # and has < 50% of surrounding mean. With constant values and a sharp drop,
-        # it may or may not trigger depending on the date alignment.
-        # At minimum, it should detect it as anomalous.
+        # The 70% drop should be detected as an anomalous event by STL remainder.
+        # It may additionally be flagged as partial data if the date is near a boundary.
         total_detected = len(result.anomalous_events) + len(result.detected_partial_weeks)
-        assert total_detected >= 0  # Non-negative (defensive)
+        assert total_detected > 0, (
+            f"Expected at least 1 anomaly for 70% drop, got 0. "
+            f"anomalous_events={len(result.anomalous_events)}, "
+            f"partial_weeks={len(result.detected_partial_weeks)}"
+        )
 
     def test_summary_is_populated(self):
         """Summary should describe findings."""
@@ -809,10 +848,24 @@ class TestAutoConfigureTraining:
 class TestRecommendLogTransform:
     """Test log transform recommendation logic."""
 
-    def test_very_high_growth_recommends_always(self):
+    def test_very_high_growth_without_extreme_range_recommends_never(self):
+        """High growth that stays within a few orders of magnitude should NOT
+        use log transform — it compresses the trend signal and causes flat forecasts."""
         advisor = ForecastAdvisor()
         values = _make_explosive_growth(200)
         transform, reason = advisor._recommend_log_transform(values, 300.0, 50.0)
+        assert transform == "never"
+        assert "compress" in reason.lower() or "trend" in reason.lower()
+
+    def test_extreme_range_with_high_growth_recommends_always(self):
+        """Only when data spans 10x+ range AND has 500%+ growth should log transform apply."""
+        advisor = ForecastAdvisor()
+        # Create data that spans multiple orders of magnitude (10 -> 10000)
+        values = np.concatenate([
+            np.full(100, 10.0),
+            np.linspace(10, 10000, 100)
+        ])
+        transform, reason = advisor._recommend_log_transform(values, 600.0, 30.0)
         assert transform == "always"
 
     def test_moderate_growth_recommends_auto(self):

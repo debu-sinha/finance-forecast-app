@@ -1,5 +1,5 @@
 
-import { DataRow, ForecastResult, ModelRunResult, BatchTrainingResult, BatchTrainingSummary, DataAnalysisResult } from "../types";
+import { DataRow, ForecastResult, ModelRunResult, BatchTrainingResult, BatchTrainingSummary, DataAnalysisResult, AutoOptimizeInfo } from "../types";
 import { logFunctionIO, logSyncFunctionIO, logger } from "../utils/logger";
 
 // When running as a Databricks App, the backend is on the same host/port usually,
@@ -63,7 +63,9 @@ const _trainModelOnBackend = async (
     toDate?: string,
     randomSeed?: number,
     futureFeatures?: DataRow[],
-    hyperparameterFilters?: Record<string, Record<string, any>>
+    hyperparameterFilters?: Record<string, Record<string, any>>,
+    autoOptimize: boolean = true,
+    logTransform: string = 'auto'
 ): Promise<any> => {
 
     const payload = {
@@ -85,7 +87,9 @@ const _trainModelOnBackend = async (
         to_date: toDate || null,
         random_seed: randomSeed || 42,
         future_features: futureFeatures || null,
-        hyperparameter_filters: hyperparameterFilters || null
+        hyperparameter_filters: hyperparameterFilters || null,
+        auto_optimize: autoOptimize,
+        log_transform: logTransform
     };
 
     const response = await fetch(`${API_BASE}/train`, {

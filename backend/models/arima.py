@@ -47,7 +47,7 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
     - frequency: Optional - uses training frequency if not specified
     """
 
-    def __init__(self, fitted_model, order, frequency, weekly_freq_code=None):
+    def __init__(self, fitted_model, order, frequency, weekly_freq_code=None, historical_max=None, historical_mean=None):
         self.fitted_model = fitted_model
         self.order = order
         # Store frequency in human-readable format for consistency
@@ -56,6 +56,9 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
         self.frequency = freq_to_human.get(frequency, frequency)
         # Store the exact weekly frequency code (e.g., 'W-MON') for date alignment
         self.weekly_freq_code = weekly_freq_code or 'W-MON'
+        # Store historical bounds for explosion detection at inference time
+        self.historical_max = historical_max or 0
+        self.historical_mean = historical_mean or 0
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         import pandas as pd
@@ -93,6 +96,17 @@ class ARIMAModelWrapper(mlflow.pyfunc.PythonModel):
 
         # Generate future dates starting from start_date
         future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
+
+        # CRITICAL: Detect numerical explosion (e.g., ARIMA producing extreme values)
+        # Replace with naive forecast if values exceed 10x the historical max
+        if np.any(np.isnan(forecast_values)) or np.any(np.isinf(forecast_values)):
+            fallback = max(self.historical_mean, 0.0) if self.historical_mean else 0.0
+            logger.error(f"ARIMA wrapper: NaN/Inf detected in forecast. Using fallback={fallback:,.0f}.")
+            forecast_values = np.full(len(forecast_values), fallback)
+        elif self.historical_max > 0 and np.max(np.abs(forecast_values)) > 10 * self.historical_max:
+            fallback = max(self.historical_mean, 0.0)
+            logger.error(f"ARIMA wrapper: numerical explosion detected (max={np.max(np.abs(forecast_values)):.2e}, hist_max={self.historical_max:,.0f}). Using fallback={fallback:,.0f}.")
+            forecast_values = np.full(len(forecast_values), fallback)
 
         # CRITICAL: Clip negative forecasts - financial metrics cannot be negative
         forecast_values = np.maximum(forecast_values, 0.0)
@@ -876,7 +890,11 @@ def train_arima_model(
             sample_output = forecast_data[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].head(1).copy()
             signature = infer_signature(input_example, sample_output)
             weekly_freq_code = detect_weekly_freq_code(train_df, frequency)
-            model_wrapper = ARIMAModelWrapper(final_fitted_model, best_order, frequency, weekly_freq_code)
+            model_wrapper = ARIMAModelWrapper(
+                final_fitted_model, best_order, frequency, weekly_freq_code,
+                historical_max=float(np.max(np.abs(full_data['y'].values))),
+                historical_mean=float(np.mean(full_data['y'].values))
+            )
             
             mlflow.pyfunc.log_model(
                 artifact_path="model",

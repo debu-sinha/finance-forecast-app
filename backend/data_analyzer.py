@@ -287,14 +287,14 @@ def _detect_trend(values: np.ndarray) -> Tuple[TrendType, float]:
 
     # Use polyfit for trend
     try:
-        slope, _ = np.polyfit(x, values, 1)
+        slope, intercept = np.polyfit(x, values, 1)
 
         # Normalize slope by mean value to get relative trend
         mean_val = np.mean(np.abs(values)) + 1e-10
         relative_slope = slope * len(values) / mean_val
 
         # Calculate R² for trend strength
-        y_pred = slope * x + _
+        y_pred = slope * x + intercept
         ss_res = np.sum((values - y_pred) ** 2)
         ss_tot = np.sum((values - np.mean(values)) ** 2) + 1e-10
         r2 = 1 - (ss_res / ss_tot)
@@ -606,9 +606,13 @@ def _recommend_prophet(chars: DataCharacteristics) -> ModelRecommendation:
 
     # Trend handling
     if chars.trend_type in [TrendType.STRONG_UP, TrendType.STRONG_DOWN]:
-        reasons.append("Prophet can model the detected trend")
+        confidence += 0.1
+        reasons.append("Prophet excels at modeling the detected trend")
 
-    recommended = confidence >= 0.5
+    # Prophet is recommended in most cases as the universal baseline model.
+    # Handles trends, seasonality, holidays, and covariates. Only excluded
+    # when confidence is extremely low (very limited data).
+    recommended = confidence >= 0.3
 
     return ModelRecommendation(
         model_name="Prophet",
@@ -692,7 +696,7 @@ def _recommend_sarimax(chars: DataCharacteristics) -> ModelRecommendation:
 @log_io
 def _recommend_ets(chars: DataCharacteristics) -> ModelRecommendation:
     """Generate ETS (Exponential Smoothing) recommendation."""
-    confidence = 0.6  # Base confidence
+    confidence = 0.65  # Base confidence (0.65 so seasonal bonus +0.15 reaches 0.80 threshold)
     reasons = []
     hp_filter = {}
 
@@ -722,7 +726,7 @@ def _recommend_ets(chars: DataCharacteristics) -> ModelRecommendation:
         hp_filter['seasonal'] = [None, 'add']
         reasons.append("Negative values - using additive components only")
 
-    recommended = confidence >= 0.5
+    recommended = confidence >= 0.8
 
     return ModelRecommendation(
         model_name="ETS",
@@ -813,7 +817,7 @@ def _recommend_statsforecast(chars: DataCharacteristics) -> ModelRecommendation:
     if chars.trend_type != TrendType.FLAT:
         reasons.append("Automatic differencing for non-stationary trends")
 
-    recommended = confidence >= 0.5
+    recommended = confidence >= 0.8
 
     return ModelRecommendation(
         model_name="StatsForecast",
@@ -837,16 +841,21 @@ def _recommend_chronos(chars: DataCharacteristics) -> ModelRecommendation:
     # Works well as a baseline for any data
     reasons.append("Pre-trained on diverse time series - generalizes well")
 
-    # Small datasets are fine - Chronos doesn't need training
-    if chars.n_observations < 52:
-        confidence += 0.1
-        reasons.append("Excellent for limited data - leverages pre-training")
-        hp_filter['model_size'] = 'small'  # Use smaller model for speed
-    elif chars.n_observations >= 104:
-        # With more data, trained models may outperform zero-shot
-        confidence -= 0.1
-        reasons.append("Sufficient data for trained models - use Chronos as baseline")
-        hp_filter['model_size'] = 'base'  # Use larger model for accuracy
+    # Chronos needs sufficient context for accurate forecasts.
+    # Aligned with forecast_advisor.py: requires 2+ years (104 weeks) of weekly data.
+    if chars.n_observations >= 104:
+        confidence += 0.15
+        reasons.append("Sufficient history for Chronos context window")
+        hp_filter['model_size'] = 'base'
+    elif chars.n_observations >= 52:
+        # 1-2 years: marginal, keep neutral
+        reasons.append("Moderate history - Chronos may underperform trained models")
+        hp_filter['model_size'] = 'small'
+    else:
+        # <52 observations: insufficient context
+        confidence -= 0.15
+        reasons.append("Limited history reduces Chronos accuracy - use trained models instead")
+        hp_filter['model_size'] = 'small'
 
     # Handles various patterns without explicit configuration
     if chars.seasonality_type in [SeasonalityType.STRONG, SeasonalityType.MODERATE]:
@@ -870,7 +879,7 @@ def _recommend_chronos(chars: DataCharacteristics) -> ModelRecommendation:
     else:
         hp_filter['model_size'] = 'small'  # Default to small for balance
 
-    recommended = confidence >= 0.5
+    recommended = confidence >= 0.8
 
     return ModelRecommendation(
         model_name="Chronos",

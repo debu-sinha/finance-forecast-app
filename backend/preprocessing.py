@@ -153,8 +153,11 @@ def validate_data_quality(
             logger.warning(f"      ⚠️ {msg}")
 
         if auto_fix and null_pct <= 20:
-            df[target_col] = df[target_col].fillna(method='ffill').fillna(method='bfill')
-            report.transformations_applied.append(f"Filled {null_count} missing values with forward/backward fill")
+            df[target_col] = df[target_col].ffill()
+            remaining_nulls = df[target_col].isnull().sum()
+            if remaining_nulls > 0:
+                df[target_col] = df[target_col].fillna(0)
+            report.transformations_applied.append(f"Filled {null_count} missing values with forward fill")
             logger.info(f"      🔧 Auto-fixed: filled {null_count} missing values")
     else:
         logger.info(f"      ✅ No missing values")

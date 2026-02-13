@@ -81,11 +81,16 @@ class ExponentialSmoothingModelWrapper(mlflow.pyfunc.PythonModel):
         # Generate future dates starting from start_date
         future_dates = pd.date_range(start=start_date, periods=periods + 1, freq=pandas_freq)[1:]
 
+        # Clip negative forecasts - financial metrics cannot be negative
+        forecast_values = np.maximum(forecast_values, 0.0)
+        lower_bounds = np.maximum(forecast_values * 0.9, 0.0)
+        upper_bounds = forecast_values * 1.1
+
         return pd.DataFrame({
             'ds': future_dates,
             'yhat': forecast_values,
-            'yhat_lower': forecast_values * 0.9,
-            'yhat_upper': forecast_values * 1.1
+            'yhat_lower': lower_bounds,
+            'yhat_upper': upper_bounds
         })
 
 @log_io
