@@ -511,7 +511,7 @@ def train_chronos_model(
         mlflow.log_param("random_seed", random_seed)
         mlflow.log_param("zero_shot", True)
         mlflow.log_param("confidence_level", confidence_level)
-        mlflow.log_metrics(metrics)
+        mlflow.log_metrics({k: v for k, v in metrics.items() if v is not None})
 
         # Log model as MLflow pyfunc
         try:
