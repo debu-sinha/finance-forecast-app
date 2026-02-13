@@ -501,12 +501,36 @@ const App = () => {
     setModelProgress([]);
     setActiveModelType('prophet');
     setDeployStatus('');
+    setRandomSeed(42);
+    setCountry('US');
+    setRegressorMethod('last_value');
+    setSelectedModels(['prophet']);
+    setAutoOptimize(true);
+    setSeasonalityMode('multiplicative');
+    setEnableYearly(true);
+    setEnableWeekly(false);
+    setIsAnalyzingData(false);
+    setDataAnalysis(null);
+    setShowDataAnalysis(false);
+    setIsTraining(false);
+    setTrainingStatus('');
+    setTrainingProgress(0);
+    setIsGeneratingSummary(false);
+    setTrainingError(null);
+    setValidationErrors([]);
+    setCompareAllModels(false);
+    setComparisonModelIndex(0);
+    setIsDeploying(false);
+    setCatalogName('main');
+    setSchemaName('default');
+    setModelName('finance_forecast_model');
     setActualsData([]);
     setActualsColumns([]);
     setActualsDateCol('');
     setActualsValueCol('');
     setActualsFilters({});
     setActualsComparison(null);
+    setIsComparingActuals(false);
     setFilteredActualsForComparison([]);
     setComparisonSeverityFilter([]);
     setShowActualsColumnSelector(false);
@@ -860,6 +884,8 @@ const App = () => {
           return lower.includes('date') || lower === 'ds' || lower.includes('time') || lower === 'week' || lower === 'year' || lower === 'month' || lower === 'day' || lower.includes('timestamp');
         });
         if (probableDate) setMainDateCol(probableDate);
+      } else {
+        setTrainingError(`Could not parse any data rows from "${file.name}". Please check that the file is a valid CSV with headers and data rows.`);
       }
     };
     reader.readAsText(file);
@@ -902,6 +928,8 @@ const App = () => {
           return lower.includes('date') || lower === 'ds' || lower.includes('time') || lower.includes('week') || lower === 'year' || lower === 'month' || lower === 'day' || lower.includes('timestamp');
         });
         if (probableDate) setFeatureDateCol(probableDate);
+      } else {
+        setTrainingError(`Could not parse any data rows from feature file "${file.name}". Please check that it is a valid CSV.`);
       }
     };
     reader.readAsText(file);
@@ -1209,7 +1237,8 @@ const App = () => {
 
           const error = actual - predicted;
           const absoluteError = Math.abs(error);
-          const percentageError = actual !== 0 ? ((error) / actual) * 100 : 0;
+          // When actual is 0, percentage error is undefined — use absolute error as fallback
+          const percentageError = actual !== 0 ? ((error) / actual) * 100 : (predicted !== 0 ? 100 : 0);
           const mape = Math.abs(percentageError);
 
           // Determine status based on MAPE thresholds
@@ -1381,7 +1410,7 @@ const App = () => {
         parseFloat(String(row.error)).toFixed(2),
         parseFloat(String(row.mape)).toFixed(2),
         parseFloat(String(row.error)) >= 0 ? 'Under-forecast' : 'Over-forecast',
-        row.status.replace('_', ' '),
+        row.status.replaceAll('_', ' '),
         `"${(row.contextFlags || []).join(', ')}"`
       ].join(','))
     ].join('\n');
@@ -1412,6 +1441,7 @@ const App = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   // Download executive summary as markdown
@@ -1427,6 +1457,7 @@ const App = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const mergeAndAnalyze = async () => {
@@ -2869,7 +2900,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                       {modelProgress.map((mp, idx) => (
                         <div
                           key={mp.model}
-                          className={`relative p-3 rounded-lg border transition-all duration-300 ${mp.status === 'completed' ? 'bg-green-50 border-green-200' :
+                          className={`group relative p-3 rounded-lg border transition-all duration-300 ${mp.status === 'completed' ? 'bg-green-50 border-green-200' :
                               mp.status === 'training' ? 'bg-blue-50 border-blue-300 ring-2 ring-blue-200' :
                                 mp.status === 'failed' ? 'bg-red-50 border-red-200' :
                                   'bg-gray-50 border-gray-200'

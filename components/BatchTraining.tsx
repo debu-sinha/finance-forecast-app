@@ -638,7 +638,7 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
                             className={`px-2 py-1 rounded text-xs font-medium border transition-all ${filterStatus === status
                               ? status === 'error'
                                 ? 'bg-gray-800 text-white border-gray-800'
-                                : getStatusColor(status).replace('100', '500').replace('800', 'white')
+                                : getStatusColor(status).replace(/bg-(\w+)-100/, 'bg-$1-500').replace(/text-(\w+)-800/, 'text-white').replace(/border-(\w+)-200/, 'border-$1-500')
                               : status === 'error'
                                 ? 'bg-gray-100 text-gray-600 border-gray-200'
                                 : getStatusColor(status)

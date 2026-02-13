@@ -851,7 +851,7 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
                             onClick={() => setFilterStatus(filterStatus === status ? null : status)}
                             className={`px-2 py-1 rounded text-xs font-medium border transition-all ${
                               filterStatus === status
-                                ? getStatusColor(status).replace('100', '500').replace('800', 'white')
+                                ? getStatusColor(status).replace(/bg-(\w+)-100/, 'bg-$1-500').replace(/text-(\w+)-800/, 'text-white').replace(/border-(\w+)-200/, 'border-$1-500')
                                 : getStatusColor(status)
                             }`}
                           >

@@ -2,7 +2,9 @@ import { DataRow } from '../types';
 import { logSyncFunctionIO } from './logger';
 
 const _parseCSV = (content: string): DataRow[] => {
-  const lines = content.trim().split('\n');
+  // Strip UTF-8 BOM (common in Excel-exported CSVs on Windows)
+  const cleaned = content.charCodeAt(0) === 0xFEFF ? content.slice(1) : content;
+  const lines = cleaned.trim().split('\n');
   if (lines.length < 2) return [];
 
   // Auto-detect delimiter based on the first line (header)
