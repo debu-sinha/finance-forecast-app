@@ -569,19 +569,25 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             valid_covariates.append(cov)
     covariates = valid_covariates
 
-    # Fill NaN values in lag features with 0 - Prophet cannot handle NaN in regressors
-    # This is safe because lag features are derived and NaN simply means "no prior year data"
+    # Fill NaN values in lag features using train-only statistics
+    # Consistent with evaluate_param_set which also uses train mean for lag imputation
     lag_cols = [c for c in covariates if c.startswith('lag_')]
+    lag_fill_values = {}
     for col in lag_cols:
         if col in train_df.columns:
-            train_df[col] = train_df[col].fillna(0)
+            train_mean = train_df[col].mean()
+            fill_val = train_mean if not np.isnan(train_mean) else 0.0
+            lag_fill_values[col] = fill_val
+            train_df[col] = train_df[col].fillna(fill_val)
         if col in test_df.columns:
-            test_df[col] = test_df[col].fillna(0)
+            fill_val = lag_fill_values.get(col, 0.0)
+            test_df[col] = test_df[col].fillna(fill_val)
         if col in history_df.columns:
-            history_df[col] = history_df[col].fillna(0)
+            fill_val = lag_fill_values.get(col, 0.0)
+            history_df[col] = history_df[col].fillna(fill_val)
 
     if lag_cols:
-        logger.info(f"Filled NaN values with 0 in lag features: {lag_cols}")
+        logger.info(f"Filled NaN values in lag features using train mean: {lag_cols}")
 
     # TRACE: Train data as fed to Prophet
     if pipeline_trace:
@@ -1187,11 +1193,12 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             logger.info(f"   ✅ Prophet model logged successfully to: {artifact_uri}")
 
             # Also save a pickle backup for robustness
+            # Use final_model (trained on full history) rather than best_model (train-only)
             import pickle
             model_backup_path = "/tmp/prophet_model_backup.pkl"
             with open(model_backup_path, 'wb') as f:
                 pickle.dump({
-                    'model': best_model,
+                    'model': final_model,
                     'wrapper': model_wrapper,
                     'signature': signature,
                     'covariates': covariates,
@@ -1208,7 +1215,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
                 model_path = "/tmp/prophet_model.pkl"
                 with open(model_path, 'wb') as f:
                     pickle.dump({
-                        'model': best_model,
+                        'model': final_model,
                         'wrapper': model_wrapper,
                         'signature': signature,
                         'covariates': covariates,
@@ -1234,9 +1241,9 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
         
         best_artifact_uri = mlflow.get_artifact_uri("model")
     
-    # Validation data - use the model's actual extra_regressors, not the covariates list
+    # Validation data - use the final_model's actual extra_regressors (trained on full history)
     # This ensures all regressors the model expects are present in test_future
-    model_regressors = list(best_model.extra_regressors.keys()) if hasattr(best_model, 'extra_regressors') else []
+    model_regressors = list(final_model.extra_regressors.keys()) if hasattr(final_model, 'extra_regressors') else []
     test_future = test_df[['ds']].copy()
     for reg in model_regressors:
         if reg in test_df.columns:
@@ -1250,7 +1257,7 @@ def train_prophet_model(data, time_col, target_col, covariates, horizon, frequen
             # Fallback to 0 for binary event flags
             test_future[reg] = 0.0
             logger.warning(f"⚠️ Regressor '{reg}' missing from both test_df and history_df, using 0")
-    validation_forecast = best_model.predict(test_future)
+    validation_forecast = final_model.predict(test_future)
     val_cols = ['ds', 'y'] + [c for c in model_regressors if c in test_df.columns]
     validation_data = test_df[val_cols].merge(validation_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], on='ds', how='left').rename(columns={'ds': time_col})
 

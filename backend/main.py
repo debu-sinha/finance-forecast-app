@@ -1299,9 +1299,9 @@ async def train_model(request: TrainRequest):
             raise ValueError("Invalid data or horizon")
         
         # Set random seeds for reproducibility
-        # Note: global seeds are acceptable here because Databricks Apps runs
-        # with MLFLOW_MAX_WORKERS=1 and requests are processed sequentially.
-        # For true concurrent multi-user, use np.random.default_rng(seed) per-request.
+        # Note: global seeds are used for single-worker mode (MLFLOW_MAX_WORKERS=1).
+        # For batch training with max_workers > 1, each segment uses seed + index
+        # to avoid thread contention on global state.
         import random
         import numpy as np
         seed = request.random_seed if request.random_seed is not None else 42

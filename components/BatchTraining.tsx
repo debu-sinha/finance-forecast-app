@@ -532,7 +532,7 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
               <div className="w-full bg-indigo-200 rounded-full h-2">
                 <div
                   className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
-                  style={{ width: `${(trainingProgress.completed / trainingProgress.total) * 100}%` }}
+                  style={{ width: `${trainingProgress.total > 0 ? (trainingProgress.completed / trainingProgress.total) * 100 : 0}%` }}
                 />
               </div>
               {trainingProgress.current && (
@@ -742,7 +742,7 @@ export const BatchTraining: React.FC<BatchTrainingProps> = ({
               <>Models: {selectedModels.join(', ')} | Horizon: {horizon} {frequency}</>
             )}
             {trainingSummary && (
-              <>Duration: {((trainingSummary.endTime! - trainingSummary.startTime) / 1000).toFixed(1)}s</>
+              <>Duration: {trainingSummary.endTime ? ((trainingSummary.endTime - trainingSummary.startTime) / 1000).toFixed(1) : '...'}s</>
             )}
           </div>
           <div className="flex items-center space-x-3">

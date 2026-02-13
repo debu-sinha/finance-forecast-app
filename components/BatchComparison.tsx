@@ -128,6 +128,15 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
     }
 
     // For date-only strings, try various formats and add noon time
+    // Check MM/DD/YY format (2-digit year) - common in DoorDash CSV data
+    const mmddyyMatch = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+    if (mmddyyMatch) {
+      const [, month, day, yearStr] = mmddyyMatch;
+      const year = 2000 + parseInt(yearStr);
+      const d = new Date(year, parseInt(month) - 1, parseInt(day), 12, 0, 0);
+      if (!isNaN(d.getTime())) return d;
+    }
+
     // Check YYYY-MM-DD format
     const isoMatch = dateStr.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
     if (isoMatch) {
@@ -187,10 +196,12 @@ export const BatchComparison: React.FC<BatchComparisonProps> = ({
           actualsMap.set(segmentKey, new Map());
         }
 
-        // Sum values for duplicate dates
+        // Sum values for duplicate dates - skip non-numeric values
         const segmentData = actualsMap.get(segmentKey)!;
+        const rawVal = Number(row[actualsValueCol]);
+        if (isNaN(rawVal)) return;
         const existingVal = segmentData.get(dateKey) || 0;
-        segmentData.set(dateKey, existingVal + Number(row[actualsValueCol]));
+        segmentData.set(dateKey, existingVal + rawVal);
       });
 
       // Debug: Log all actuals segment keys and batch result segment keys

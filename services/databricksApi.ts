@@ -85,7 +85,7 @@ const _trainModelOnBackend = async (
         filters: filters || null,
         from_date: fromDate || null,
         to_date: toDate || null,
-        random_seed: randomSeed || 42,
+        random_seed: randomSeed ?? 42,
         future_features: futureFeatures || null,
         hyperparameter_filters: hyperparameterFilters || null,
         auto_optimize: autoOptimize,
@@ -129,6 +129,17 @@ const _deployModel = async (modelName: string, version: string | null, endpointN
             endpoint_name: endpointName
         })
     });
+    if (!response.ok) {
+        const text = await response.text();
+        let errDetail = "Deployment failed";
+        try {
+            const json = JSON.parse(text);
+            errDetail = json.detail || errDetail;
+        } catch {
+            errDetail = text || `Error ${response.status}: ${response.statusText}`;
+        }
+        throw new Error(errDetail);
+    }
     return await response.json();
 };
 export const deployModel = logFunctionIO('deployModel', _deployModel);
@@ -252,7 +263,7 @@ const _trainBatchOnBackend = async (
             model_name: req.modelName || 'finance_forecast_model',
             country: req.country || 'US',
             filters: req.filters,
-            random_seed: req.randomSeed || 42,
+            random_seed: req.randomSeed ?? 42,
             // Batch context for MLflow tracking
             batch_id: batchId,
             batch_segment_id: segmentId,

@@ -648,7 +648,7 @@ def create_ensemble_forecast(
     logger.info(f"  Ensemble MAPE: {ensemble_metrics['mape']:.2f}%")
 
     # Compare to individual models
-    best_individual_mape = min(r['metrics']['mape'] for r in model_results if r['metrics'].get('mape'))
+    best_individual_mape = min(r['metrics']['mape'] for r in model_results if r['metrics'].get('mape') is not None)
     if ensemble_metrics['mape'] < best_individual_mape:
         logger.info(f"  ✨ Ensemble beats best individual model ({best_individual_mape:.2f}%)")
     else:

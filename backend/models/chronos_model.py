@@ -166,6 +166,12 @@ class ChronosModelWrapper(mlflow.pyfunc.PythonModel):
         self.confidence_level = confidence_level
         self._pipeline = None
 
+    def __getstate__(self):
+        """Exclude loaded pipeline from pickling to avoid serializing 180MB+ model."""
+        state = self.__dict__.copy()
+        state['_pipeline'] = None
+        return state
+
     @log_io
     def _load_pipeline(self):
         """Lazy load the Chronos pipeline."""

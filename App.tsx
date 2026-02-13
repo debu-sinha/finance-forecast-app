@@ -630,13 +630,14 @@ const App = () => {
     if (!timeCol) return filteredByCategories;
 
     const result = filteredByCategories.filter(row => {
-      const rowDate = new Date(String(row[timeCol]));
+      const rowDate = parseFlexibleDateUtil(String(row[timeCol]));
+      if (!rowDate) return false;
       if (trainingStartDate) {
-        const startDate = new Date(trainingStartDate);
+        const startDate = new Date(trainingStartDate + 'T00:00:00');
         if (rowDate < startDate) return false;
       }
       if (trainingEndDate) {
-        const endDate = new Date(trainingEndDate);
+        const endDate = new Date(trainingEndDate + 'T23:59:59');
         if (rowDate > endDate) return false;
       }
       return true;
@@ -765,7 +766,8 @@ const App = () => {
         // Get Monday of the week
         const day = date.getDay();
         const diff = date.getDate() - day + (day === 0 ? -6 : 1); // adjust when day is sunday
-        const monday = new Date(date.setDate(diff));
+        const monday = new Date(date);
+        monday.setDate(diff);
         key = monday.toISOString().split('T')[0];
       }
 
@@ -818,12 +820,16 @@ const App = () => {
     }
   }, [dateRange.min, dateRange.max]);
 
-  // Smart Horizon Defaults
+  // Smart Horizon Defaults - only set when frequency changes AND user hasn't manually adjusted
+  const prevFrequencyRef = useRef(frequency);
   useEffect(() => {
-    if (frequency === 'daily') {
-      setHorizon(90);
-    } else {
-      setHorizon(12);
+    if (frequency !== prevFrequencyRef.current) {
+      prevFrequencyRef.current = frequency;
+      if (frequency === 'daily') {
+        setHorizon(90);
+      } else {
+        setHorizon(12);
+      }
     }
   }, [frequency]);
 
@@ -2108,6 +2114,10 @@ const App = () => {
 
   const handleDeploy = async () => {
     if (isDeploying) return;
+    if (!activeResult?.hyperparameters?.mlflow_run_id) {
+      setDeployStatus('No model run available to deploy. Train a model first.');
+      return;
+    }
     setIsDeploying(true);
     setDeployStatus('Initializing Serving Endpoint...');
     try {
@@ -2340,7 +2350,7 @@ df = spark.read.csv(path, header=True)`}
                     <div className="w-full">
                       <div className="flex justify-between items-center text-xs mb-2">
                         <span className="text-green-700 font-medium flex items-center"><Check className="w-3 h-3 mr-1" /> {mainData.length} rows loaded</span>
-                        <button onClick={() => { setMainData([]); setMainColumns([]); }} className="text-red-500 hover:underline">Remove</button>
+                        <button onClick={() => { setMainData([]); setMainColumns([]); setMainDateCol(''); }} className="text-red-500 hover:underline">Remove</button>
                       </div>
                       <div className="mb-2">
                         <select value={mainDateCol} onChange={(e) => setMainDateCol(e.target.value)} className="w-full text-xs bg-white border border-gray-300 rounded px-2 py-1">
@@ -2365,7 +2375,7 @@ df = spark.read.csv(path, header=True)`}
                     <div className="w-full">
                       <div className="flex justify-between items-center text-xs mb-2">
                         <span className="text-purple-700 font-medium flex items-center"><Check className="w-3 h-3 mr-1" /> {featureData.length} rows</span>
-                        <button onClick={() => { setFeatureData([]); setFeatureColumns([]); }} className="text-red-500 hover:underline">Remove</button>
+                        <button onClick={() => { setFeatureData([]); setFeatureColumns([]); setFeatureDateCol(''); }} className="text-red-500 hover:underline">Remove</button>
                       </div>
                       <div className="mb-2">
                         <select value={featureDateCol} onChange={(e) => setFeatureDateCol(e.target.value)} className="w-full text-xs bg-white border border-gray-300 rounded px-2 py-1">
@@ -3199,14 +3209,14 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         <h4 className="text-sm font-bold text-emerald-900">Forecast Quality Summary</h4>
                       </div>
                       <div className={`text-xs font-bold px-2 py-1 rounded ${
-                        parseFloat(activeResult.metrics?.mape) < 5 ? 'bg-green-100 text-green-700' :
-                        parseFloat(activeResult.metrics?.mape) < 10 ? 'bg-yellow-100 text-yellow-700' :
-                        parseFloat(activeResult.metrics?.mape) < 15 ? 'bg-orange-100 text-orange-700' :
+                        parseFloat(activeResult.metrics?.mape || '999') < 5 ? 'bg-green-100 text-green-700' :
+                        parseFloat(activeResult.metrics?.mape || '999') < 10 ? 'bg-yellow-100 text-yellow-700' :
+                        parseFloat(activeResult.metrics?.mape || '999') < 15 ? 'bg-orange-100 text-orange-700' :
                         'bg-red-100 text-red-700'
                       }`}>
-                        {parseFloat(activeResult.metrics?.mape) < 5 ? 'EXCELLENT' :
-                         parseFloat(activeResult.metrics?.mape) < 10 ? 'GOOD' :
-                         parseFloat(activeResult.metrics?.mape) < 15 ? 'FAIR' : 'NEEDS REVIEW'}
+                        {parseFloat(activeResult.metrics?.mape || '999') < 5 ? 'EXCELLENT' :
+                         parseFloat(activeResult.metrics?.mape || '999') < 10 ? 'GOOD' :
+                         parseFloat(activeResult.metrics?.mape || '999') < 15 ? 'FAIR' : 'NEEDS REVIEW'}
                       </div>
                     </div>
 
@@ -3225,33 +3235,29 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                         <div className="text-emerald-600 text-[10px] font-semibold uppercase">Data Quality</div>
                         <div className="flex items-center space-x-1">
                           <div className="text-gray-900 font-bold text-sm">
-                            {dataAnalysis?.qualityScore !== undefined ? `${dataAnalysis.qualityScore}%` : '100%'}
+                            {dataAnalysis?.dataQuality?.score !== undefined ? `${dataAnalysis.dataQuality.score.toFixed(0)}%` : '100%'}
                           </div>
                           <div className="flex">
-                            {[1,2,3,4,5].map(i => (
-                              <div key={i} className={`w-2 h-2 rounded-full mr-0.5 ${
-                                (dataAnalysis?.qualityScore || 100) >= i * 20 ? 'bg-emerald-500' : 'bg-gray-200'
-                              }`} />
-                            ))}
+                            {[1,2,3,4,5].map(i => {
+                              const qualityScore = dataAnalysis?.dataQuality?.score ?? 100;
+                              return (
+                                <div key={i} className={`w-2 h-2 rounded-full mr-0.5 ${
+                                  qualityScore >= i * 20 ? 'bg-emerald-500' : 'bg-gray-200'
+                                }`} />
+                              );
+                            })}
                           </div>
                         </div>
-                        <div className="text-gray-500 text-[10px]">No missing values</div>
+                        <div className="text-gray-500 text-[10px]">{dataAnalysis?.dataQuality?.level === 'excellent' ? 'No missing values' : (dataAnalysis?.dataQuality?.description || 'Data completeness')}</div>
                       </div>
                       <div className="bg-white p-3 rounded-md border border-emerald-100">
-                        <div className="text-emerald-600 text-[10px] font-semibold uppercase">Holiday Coverage</div>
+                        <div className="text-emerald-600 text-[10px] font-semibold uppercase">Observations</div>
                         <div className="flex items-center space-x-1">
                           <div className="text-gray-900 font-bold text-sm">
-                            {dataAnalysis?.holidayCoverage !== undefined ? `${Math.round(dataAnalysis.holidayCoverage)}%` : '83%'}
-                          </div>
-                          <div className="flex">
-                            {[1,2,3,4,5].map(i => (
-                              <div key={i} className={`w-2 h-2 rounded-full mr-0.5 ${
-                                (dataAnalysis?.holidayCoverage || 83) >= i * 20 ? 'bg-emerald-500' : 'bg-gray-200'
-                              }`} />
-                            ))}
+                            {dataAnalysis?.dataStats?.observations ?? filteredData.length}
                           </div>
                         </div>
-                        <div className="text-gray-500 text-[10px]">Major US holidays</div>
+                        <div className="text-gray-500 text-[10px]">Training data points</div>
                       </div>
                     </div>
 
@@ -3403,7 +3409,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                               <div className="text-xs text-blue-700 mt-1">
                                 {deployStatus && deployStatus.includes('successfully') ? (
                                   <a
-                                    href={activeResult.experimentUrl ? `${new URL(activeResult.experimentUrl).origin}/ml/endpoints/${modelName}-endpoint` : undefined}
+                                    href={activeResult.experimentUrl ? (() => { try { return `${new URL(activeResult.experimentUrl).origin}/ml/endpoints/${modelName}-endpoint`; } catch { return undefined; } })() : undefined}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="underline hover:text-blue-900 flex items-center"

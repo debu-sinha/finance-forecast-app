@@ -173,7 +173,7 @@ def check_data_quality(
 
         if auto_fix and null_pct <= 20:
             # Forward fill for small gaps (best practice from Nixtla)
-            df[target_col] = df[target_col].fillna(method='ffill').fillna(method='bfill')
+            df[target_col] = df[target_col].ffill().bfill()
             report.transformations_applied.append(f"Filled {null_count} missing values with forward/backward fill")
 
     # 3. Check for duplicates

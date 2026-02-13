@@ -760,7 +760,7 @@ def sanitize_forecast_output(
             if df[col].isna().any() or np.isinf(df[col]).any():
                 logger.warning(f"Replacing NaN/Inf values in {col}")
                 df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-                df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
+                df[col] = df[col].ffill().bfill().fillna(0)
 
             # Clip negative values
             if clip_negative:

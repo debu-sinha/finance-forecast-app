@@ -915,15 +915,15 @@ def get_all_key_holiday_dates(year: int) -> Dict[str, pd.Timestamp]:
     for name, month, day in KEY_HOLIDAYS_FIXED:
         try:
             holidays_dict[name] = pd.Timestamp(year=year, month=month, day=day)
-        except:
-            pass
+        except ValueError as e:
+            logger.warning(f"Invalid holiday date {name} for {year}: {e}")
 
     # Fiscal quarter-end dates - critical for finance forecasting
     for name, month, day in FISCAL_QUARTER_ENDS:
         try:
             holidays_dict[name] = pd.Timestamp(year=year, month=month, day=day)
-        except:
-            pass
+        except ValueError as e:
+            logger.warning(f"Invalid fiscal date {name} for {year}: {e}")
 
     # Variable-date holidays
     try:
@@ -1234,15 +1234,15 @@ def _add_weekly_holiday_features(df: pd.DataFrame, date_col: str) -> List[str]:
             if bf_mask.any():
                 df.loc[bf_mask, 'is_black_friday_week'] = 1
 
-    # Vectorized Super Bowl week detection (first Sunday of February)
+    # Vectorized Super Bowl week detection using get_super_bowl_date()
+    # which correctly handles the 2022+ move to the second Sunday of February
     february_mask = dates.dt.month == 2
     if february_mask.any():
         feb_dates = dates[february_mask]
         feb_years = feb_dates.dt.year.unique()
         for year in feb_years:
-            first_day = pd.Timestamp(year=year, month=2, day=1)
-            first_sunday = first_day + pd.Timedelta(days=(6 - first_day.dayofweek) % 7)
-            super_bowl_week_start = first_sunday - pd.Timedelta(days=first_sunday.dayofweek)
+            sb_date = get_super_bowl_date(int(year))
+            super_bowl_week_start = sb_date - pd.Timedelta(days=sb_date.dayofweek)
             sb_mask = (week_starts == super_bowl_week_start)
             if sb_mask.any():
                 df.loc[sb_mask, 'is_super_bowl_week'] = 1
@@ -1764,9 +1764,14 @@ def _add_future_yoy_lags(
 
     future_df[lag_col] = future_df[date_col].apply(get_lag_value)
 
-    # Fill missing with historical mean as fallback
-    hist_mean = hist[target_col].mean() if target_col in hist.columns else 0
-    future_df[lag_col] = future_df[lag_col].fillna(hist_mean)
+    # Fill missing with recent historical mean as fallback (last lag_periods observations)
+    # Using recent mean avoids bias from older data on trending series
+    if target_col in hist.columns:
+        recent_mean = hist[target_col].tail(lag_periods).mean()
+        fill_val = recent_mean if not np.isnan(recent_mean) else 0
+    else:
+        fill_val = 0
+    future_df[lag_col] = future_df[lag_col].fillna(fill_val)
     future_df[f'{lag_col}_avg'] = future_df[lag_col]  # Same as lag for future
 
     non_null = future_df[lag_col].notna().sum()

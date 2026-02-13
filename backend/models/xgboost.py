@@ -283,8 +283,11 @@ class XGBoostModelWrapper(mlflow.pyfunc.PythonModel):
 
         # CRITICAL: Clip negative forecasts - financial metrics cannot be negative
         forecast_values = np.maximum(forecast_values, 0.0)
-        lower_bounds = np.maximum(forecast_values * 0.9, 0.0)
-        upper_bounds = forecast_values * 1.1
+        # Scale interval width based on confidence level (default 0.95)
+        confidence_level = getattr(self, 'confidence_level', 0.95)
+        half_width = (1 - confidence_level) + 0.05  # 0.10 at 95%, 0.15 at 90%, 0.25 at 80%
+        lower_bounds = np.maximum(forecast_values * (1 - half_width), 0.0)
+        upper_bounds = forecast_values * (1 + half_width)
 
         return pd.DataFrame({
             'ds': future_df['ds'],
@@ -357,7 +360,7 @@ def create_xgboost_features(df: pd.DataFrame, target_col: str = 'y', covariates:
         # Short-term lags
         df['lag_1'] = df[target_col].shift(1)
         df['lag_7'] = df[target_col].shift(7)
-        df['rolling_mean_7'] = df[target_col].rolling(window=7, min_periods=1).mean()
+        df['rolling_mean_7'] = df[target_col].shift(1).rolling(window=7, min_periods=1).mean()
 
         # YoY lag features (CRITICAL for holiday patterns)
         # Same day/week/month last year is the best predictor for holidays

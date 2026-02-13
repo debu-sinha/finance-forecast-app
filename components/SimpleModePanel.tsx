@@ -487,9 +487,29 @@ export const SimpleModePanel: React.FC = () => {
     const lines = text.trim().split('\n');
     if (lines.length === 0) return { headers: [], rows: [] };
 
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^["']|["']$/g, ''));
+    // Quote-aware CSV field splitter
+    const splitCSVLine = (text: string): string[] => {
+      const result: string[] = [];
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '"') {
+          inQuotes = !inQuotes;
+        } else if (ch === ',' && !inQuotes) {
+          result.push(current.trim().replace(/^["']|["']$/g, ''));
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+      result.push(current.trim().replace(/^["']|["']$/g, ''));
+      return result;
+    };
+
+    const headers = splitCSVLine(lines[0]);
     const rows = lines.slice(1).map(line => {
-      const values = line.split(',').map(v => v.trim().replace(/^["']|["']$/g, ''));
+      const values = splitCSVLine(line);
       const row: Record<string, any> = {};
       headers.forEach((h, i) => {
         row[h] = values[i];
@@ -1363,7 +1383,7 @@ export const SimpleModePanel: React.FC = () => {
       }
 
       // Warn if selecting a leaky covariate
-      const isLeaky = s.profile?.leaky_covariates?.includes(col);
+      const isLeaky = (s.profile?.profile as any)?.leaky_covariates?.includes(col);
       if (isLeaky && !s.selectedCovariates.includes(col)) {
         logger.warn(`⚠️ WARNING: "${col}" has high correlation with target - potential data leakage!`);
       }
@@ -1383,7 +1403,7 @@ export const SimpleModePanel: React.FC = () => {
 
   // Helper to check if a column is leaky (high correlation with target)
   const isLeakyCovariate = (col: string): boolean => {
-    return state.profile?.leaky_covariates?.includes(col) ?? false;
+    return (state.profile?.profile as any)?.leaky_covariates?.includes(col) ?? false;
   };
 
   const handleForecast = async () => {
@@ -1592,11 +1612,13 @@ export const SimpleModePanel: React.FC = () => {
 
       // Normal toggle behavior
       const isCurrentlySelected = s.selectedSliceValues.includes(value);
+      const newSliceValues = isCurrentlySelected
+        ? s.selectedSliceValues.filter(v => v !== value)
+        : [...s.selectedSliceValues, value];
       return {
         ...s,
-        selectedSliceValues: isCurrentlySelected
-          ? s.selectedSliceValues.filter(v => v !== value)
-          : [...s.selectedSliceValues, value],
+        selectedSliceValues: newSliceValues,
+        selectedSliceCombinations: newSliceValues,
         sliceSelectionExplicit: true,
         forecast: null,
         step: 'configure',
