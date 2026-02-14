@@ -1940,7 +1940,8 @@ const App = () => {
             validation: m.validation || [],
             forecast: m.forecast || [],
             experimentUrl: m.experiment_url,
-            runUrl: m.run_url
+            runUrl: m.run_url,
+            holdoutMape: m.holdout_mape ?? null
           };
         });
 
@@ -3344,6 +3345,9 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing`}
                                 <span className="text-gray-400 ml-1">(CV: {result.metrics.cv_mape}%)</span>
                               )}
                             </div>
+                            {result.holdoutMape != null && (
+                              <div>Holdout: <span className={`font-mono ${result.holdoutMape > 20 ? 'text-red-600' : result.holdoutMape > 10 ? 'text-orange-600' : 'text-green-600'}`}>{result.holdoutMape}%</span></div>
+                            )}
                             <div>R²: <span className="font-mono">{result.metrics.r2}</span></div>
                           </div>
                           {/* Show covariate support indicator */}

@@ -101,6 +101,7 @@ export interface ModelRunResult {
   forecast: DataRow[];
   experimentUrl?: string; // MLflow experiment URL
   runUrl?: string; // MLflow run URL
+  holdoutMape?: number | null; // MAPE on holdout set (used for best model selection)
 }
 
 export interface TuningLog {

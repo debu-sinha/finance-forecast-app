@@ -196,6 +196,7 @@ class ModelResult(BaseModel):
     experiment_url: Optional[str] = Field(None, description="URL to MLflow experiment")
     run_url: Optional[str] = Field(None, description="URL to MLflow run")
     error: Optional[str] = Field(None, description="Error message if model failed")
+    holdout_mape: Optional[float] = Field(None, description="MAPE on holdout set (unseen data, used for best model selection)")
     # Model version registered in Unity Catalog
     registered_version: Optional[str] = Field(None, description="Version registered in Unity Catalog")
     # Pre-deployment test results - only models with test_result.test_passed=True should be deployed

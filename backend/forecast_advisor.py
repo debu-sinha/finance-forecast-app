@@ -791,20 +791,20 @@ class ForecastAdvisor:
         Based on empirical finding: high-growth slices perform better with recent
         data only (older data is misleading due to regime change).
         """
-        if total_growth_pct > 500 and n_observations > 78:
-            return 52, (
-                f"Very high growth ({total_growth_pct:.0f}%). Using last 52 weeks only — "
-                f"older data reflects a different regime."
-            )
-        elif total_growth_pct > 200 and n_observations > 104:
+        if total_growth_pct > 500 and n_observations > 104:
             return 78, (
-                f"High growth ({total_growth_pct:.0f}%). Using last 78 weeks — "
-                f"balances recency with seasonal coverage."
+                f"Very high growth ({total_growth_pct:.0f}%). Using last 78 weeks — "
+                f"older data reflects a different regime but preserving 1.5 seasonal cycles."
             )
-        elif total_growth_pct > 100 and n_observations > 130:
+        elif total_growth_pct > 200 and n_observations > 130:
             return 104, (
-                f"Moderate growth ({total_growth_pct:.0f}%). Using last 104 weeks (2 years) — "
-                f"captures recent trend while preserving two seasonal cycles."
+                f"High growth ({total_growth_pct:.0f}%). Using last 104 weeks (2 years) — "
+                f"preserves full trend trajectory with two seasonal cycles."
+            )
+        elif total_growth_pct > 100 and n_observations > 156:
+            return 130, (
+                f"Moderate growth ({total_growth_pct:.0f}%). Using last 130 weeks (2.5 years) — "
+                f"captures recent trend while preserving seasonal patterns."
             )
         else:
             return None, "Growth is within normal range. Use all available data for training."

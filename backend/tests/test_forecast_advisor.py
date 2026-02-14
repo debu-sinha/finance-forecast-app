@@ -260,21 +260,21 @@ class TestModelSelection:
 class TestTrainingWindow:
     """Test training window recommendations."""
 
-    def test_very_high_growth_uses_52_weeks(self):
+    def test_very_high_growth_uses_78_weeks(self):
         advisor = ForecastAdvisor()
         window, reason = advisor._recommend_training_window(600, 200)
-        assert window == 52
-        assert "52 weeks" in reason
+        assert window == 78
+        assert "78 weeks" in reason
 
-    def test_high_growth_uses_78_weeks(self):
+    def test_high_growth_uses_104_weeks(self):
         advisor = ForecastAdvisor()
         window, reason = advisor._recommend_training_window(300, 200)
-        assert window == 78
+        assert window == 104
 
-    def test_moderate_growth_uses_104_weeks(self):
+    def test_moderate_growth_uses_130_weeks(self):
         advisor = ForecastAdvisor()
         window, reason = advisor._recommend_training_window(150, 200)
-        assert window == 104
+        assert window == 130
 
     def test_normal_growth_uses_all_data(self):
         advisor = ForecastAdvisor()
@@ -286,7 +286,7 @@ class TestTrainingWindow:
         """Even with high growth, if not enough data, use all."""
         advisor = ForecastAdvisor()
         window, _ = advisor._recommend_training_window(600, 50)
-        assert window is None  # 50 < 78, can't trim to 52
+        assert window is None  # 50 < 104, can't trim to 78
 
 
 # ==============================================================================

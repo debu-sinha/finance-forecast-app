@@ -1486,6 +1486,10 @@ async def train_model(request: TrainRequest):
                         logger.info(f"   Warning: {w}")
                 logger.info(f"{'='*60}")
 
+                # Save full dataset for chart history BEFORE any training window truncation.
+                # The chart should always show the complete history regardless of training window.
+                full_history_df = df.copy()
+
                 # Apply training window: trim old data if advisor recommends
                 if advisor_config.from_date and not request.from_date:
                     advisor_from = pd.Timestamp(advisor_config.from_date)
@@ -1758,6 +1762,7 @@ async def train_model(request: TrainRequest):
         best_run_id = None
         artifact_uri_ref = None
         parent_run_id = None
+        full_history_df = None  # Will hold full dataset before training window truncation
         experiment_id = None
 
         # Create descriptive run name
@@ -2478,8 +2483,17 @@ async def train_model(request: TrainRequest):
             experiment_url = None
             logger.warning("DATABRICKS_HOST not set, cannot generate MLflow URLs")
 
+        # Build holdout MAPE lookup for attaching to model results
+        holdout_mape_lookup = {}
+        if holdout_results:
+            for hr in holdout_results:
+                holdout_mape_lookup[hr['model_name']] = hr['holdout_mape']
+
         for res in model_results:
             if res.model_name == best_model_name: res.is_best = True
+            # Attach holdout MAPE so the UI can display it
+            if res.model_name in holdout_mape_lookup:
+                res.holdout_mape = round(holdout_mape_lookup[res.model_name], 2)
             # Add experiment and run URLs
             if databricks_host and res.run_id:
                 res.experiment_url = experiment_url
@@ -2584,8 +2598,14 @@ async def train_model(request: TrainRequest):
         logger.info(f"{'='*60}")
 
         # Prepare history data for chart visualization
-        # Convert df back to original column names for the frontend
-        history_df = df.copy()
+        # Use full_history_df (saved before training window truncation) so the chart
+        # shows the complete time series, not just the training window.
+        # This gives users full context to evaluate forecast quality.
+        if full_history_df is not None:
+            history_df = full_history_df.copy()
+            logger.info(f"📊 Using full history ({len(history_df)} rows) for chart (training used {len(df)} rows)")
+        else:
+            history_df = df.copy()
         history_df = history_df.rename(columns={'ds': request.time_col, 'y': request.target_col})
 
         # ========================================
